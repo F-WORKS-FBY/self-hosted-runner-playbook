@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# analysis 脚本的采样输出（CI_DATA_DIR 默认落在这里）
+data/
+*.csv
+*.log
