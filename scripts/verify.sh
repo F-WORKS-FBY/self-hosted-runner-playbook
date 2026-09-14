@@ -49,6 +49,26 @@ echo "$GC" | grep -q 'MinFreeSpace' && ok "BuildKit GC 有 Min Free 底线" || n
 
 hdr "清理与监控"
 [ -x "$RUNNER_HOME/hooks/ci-cleanup.sh" ] && ok "清理脚本就位" || no "缺 $RUNNER_HOME/hooks/ci-cleanup.sh"
+
+# ⚠️ 下面这条是本表里唯一**执行**钩子的检查，2026-09-07 事故后补。
+#
+# 那次事故里，上一行的「就位」、下一行的「两个钩子都挂了」、再下一行的
+# 「timer active」**三条全部 PASS**，整表 24 PASS / 0 FAIL，而机器上
+# 连续 7 天每个 job 都红。原因是这些检查只看**结构**：文件在不在、变量挂没挂、
+# timer 起没起 —— 没有一条问过「它到底能不能正常退出」。
+#
+# runner 调钩子时强加 `-e`，钩子非零退出就把 job 判失败。所以这里必须用
+# 完全相同的方式跑一次。这是「装上了」与「真能用」之间的唯一分界线。
+if sudo -u "$RUNNER_USER" /usr/bin/bash -e "$RUNNER_HOME/hooks/ci-cleanup.sh" >/dev/null 2>&1; then
+  ok "清理钩子按 runner 的调用方式（bash -e）可正常退出"
+else
+  no "清理钩子在 bash -e 下非零退出 —— 每个 job 都会红（2026-09-07 事故的完整形态）。复现：sudo -u $RUNNER_USER /usr/bin/bash -ex $RUNNER_HOME/hooks/ci-cleanup.sh"
+fi
+# 只看赋值行：守卫那行**故意**保留 __CI_ 前缀做判据，不是残留。
+grep -qE '^(L|APP_PORTS)=.*__CI_' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null \
+  && no "钩子赋值行仍含未替换的占位符 —— bootstrap 的 sed 没生效，按 label 过滤的清理全部落空" \
+  || ok "钩子占位符已全部替换"
+
 n=$(grep -c '^ACTIONS_RUNNER_HOOK_JOB_' "$RUNNER_HOME/.env" 2>/dev/null || echo 0)
 [ "$n" -ge 2 ] && ok "两个钩子都挂了（STARTED + COMPLETED）" || no "只挂了 $n 个钩子（JOB_COMPLETED 在 job 被取消时不执行，必须同时挂 JOB_STARTED）"
 [ "$(systemctl is-active ci-cleanup.timer 2>/dev/null)" = "active" ] && ok "ci-cleanup.timer active" || no "ci-cleanup.timer 未运行（钩子在 runner 被杀时也不执行，这是唯一兜底）"

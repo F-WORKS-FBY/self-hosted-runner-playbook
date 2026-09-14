@@ -14,6 +14,19 @@
 # ⚠️ 绝不裸 `docker system prune`、绝不用不带 label 的 `-a` —— 那会连基础镜像一起删，
 #    把「稳态 Docker Hub 消耗 ≈0」变回每次冷拉。
 set -uo pipefail
+# ⚠️ 下面两行是 2026-09-07 事故的修复，删任何一行都会让「每个 job 全红」复发。
+#
+# runner 调 job 钩子时**强加 `-e`**（Worker diag 原文：`Arguments: '-e <本脚本>'`；
+# 注意 GitHub 网页日志打印的 `bash --noprofile --norc -e -o pipefail {0}` 是装饰性
+# banner，与钩子的真实调用不符）。`-e` 叠上本脚本第 16 行自己设的 `pipefail` 之后，
+# 下面任何一条命令非零退出都会**当场中止全篇**，走不到末尾的 `exit 0`。
+#
+# 实际引爆点是第 7 步：机器上不存在 `bin.*` 时 `ls` 退出 2、`grep` 无输入退出 1，
+# pipefail 把管道判为 1 → 脚本中止 → 钩子非零 → job 判失败。
+# 且 JOB_STARTED 与 JOB_COMPLETED 指向同一个文件，后者带 always()，
+# **只修其中一个钩子，job 依然 100% 全红**。
+set +e                # 解除外部强加的 -e
+trap 'exit 0' EXIT    # 兜底：连 set -u 触发的中止也吃掉，让末尾那句承诺无条件成立
 L="${CI_LABEL:-__CI_LABEL__}"            # 由 bootstrap.sh 替换；必须与 workflow 给容器打的 --label 完全一致
 APP_PORTS="__CI_APP_PORTS__"             # 由 bootstrap.sh 替换；e2e 等在宿主上监听的端口
 
@@ -27,7 +40,11 @@ docker ps -aq --filter "name=^minio" 2>/dev/null | xargs -r docker rm -f >/dev/n
 #    不清的话，下一次 e2e 自己的 spawn 会 EADDRINUSE 死掉（只在 stderr 留一行、不失败），
 #    而就绪探测会连上孤儿 → 整套 e2e 跑在**上一次 run 的代码**上。
 #    实测过这个假绿：221 条里 220 条通过，唯一那条红叉还指向业务代码而非真实病因。
-if [ -n "${APP_PORTS// /}" ] && [ "$APP_PORTS" != "__CI_APP_PORTS__" ]; then
+# ⚠️ 守卫写法有讲究：不能拿 $APP_PORTS 和占位符字面量比。bootstrap.sh 的 sed 是逐行替换，
+#    18 行和这一行的占位符会被**一起**换掉，条件就退化成 [ "3100 3101" != "3100 3101" ]
+#    ——恒假，整个第 3 步静默失效（2026-09-07 与 -e 事故一并发现）。
+#    改为判「是否仍以 __CI_ 开头」，sed 换不到这个前缀，守卫才真正生效。
+if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
   for p in $APP_PORTS; do fuser -k "${p}/tcp" >/dev/null 2>&1 || true; done
 fi
 

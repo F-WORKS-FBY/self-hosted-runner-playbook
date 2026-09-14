@@ -222,6 +222,25 @@ else
 fi
 chmod 0755 "$RUNNER_HOME/hooks/ci-cleanup.sh"; chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME/hooks/ci-cleanup.sh"
 
+# ⚠️ 装完必须**按 runner 的真实调用方式跑一次**，跑不过就拒绝接线。
+#
+# 2026-09-07 的事故正是死在这里：钩子装好了、`.env` 挂好了、timer 起来了、
+# 文件也可执行 —— 但没有任何一处**执行过它**。runner 调钩子时强加 `-e`，
+# 脚本里一条管道返回非零就中止，于是每个 job 都红，连续 7 天 21 个 job 无一幸免，
+# 而 systemctl / verify.sh / ci-health.sh 三处全部显示正常。
+#
+# 这一道门禁的全部价值：把「装上了」和「真能用」区分开。多花 0.2 秒。
+if ! sudo -u "$RUNNER_USER" /usr/bin/bash -e "$RUNNER_HOME/hooks/ci-cleanup.sh"; then
+  echo "钩子以 runner 的真实调用方式（bash -e）执行失败，拒绝接线 —— 接了就是每个 job 全红" >&2
+  echo "复现：sudo -u $RUNNER_USER /usr/bin/bash -ex $RUNNER_HOME/hooks/ci-cleanup.sh" >&2
+  exit 1
+fi
+# 占位符必须全部替换掉。只看赋值行：守卫那行**故意**保留 __CI_ 前缀做判据，不是残留。
+if grep -qE '^(L|APP_PORTS)=.*__CI_' "$RUNNER_HOME/hooks/ci-cleanup.sh"; then
+  echo "钩子仍含未替换的占位符（赋值行），sed 替换失败" >&2; exit 1
+fi
+info "钩子已按 runner 的调用方式试跑通过"
+
 # 两个钩子都挂：JOB_STARTED 是主力（对「上一个 job 被 cancel-in-progress 取消」免疫），
 # JOB_COMPLETED 顺手。二者都不覆盖「runner 被杀」，所以还要一个每日 timer 兜底。
 touch "$RUNNER_HOME/.env"

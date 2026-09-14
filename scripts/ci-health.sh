@@ -33,7 +33,34 @@ ctr=$(du -sBM /var/lib/containerd 2>/dev/null | cut -f1 | tr -dc 0-9)
 vol=$(du -sBM /var/lib/docker/volumes 2>/dev/null | cut -f1 | tr -dc 0-9)
 run="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && run=$(systemctl is-active "$SVC" 2>/dev/null)
 
-echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run}" >> "$LOG"
+# ── job 产出采样（2026-09-07 事故后补）──────────────────────────────────
+#
+# ⚠️ 上面那个 `run=active` 是**存活**指标，不是**产出**指标。事故期间它连续
+#    170 个小时报 active —— 完全正确，服务确实活着，只是它接到的每个 job 都红。
+#    「服务活着」和「CI 可用」是两件事，只测前者就是又一盏假绿灯。
+#
+# 判据取最近 10 次 run 的 conclusion：连续 3 次及以上 failure 才告警。
+# 单次红是正常的开发活动，连续三次红一定是机器侧或流水线塌了。
+#
+# 没有 token 就记 jobs=skip —— **不伪装成绿**。查不到 ≠ 没问题。
+jobs="skip"
+if [ -n "${GH_REPO:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
+  concl=$(curl -fsSL --max-time 20 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/actions/runs?per_page=10&status=completed" 2>/dev/null \
+          | python3 -c "import sys,json;print(' '.join(r['conclusion'] or '?' for r in json.load(sys.stdin).get('workflow_runs',[])))" 2>/dev/null)
+  if [ -n "$concl" ]; then
+    # 从最近一次往回数连续 failure
+    streak=0
+    for c in $concl; do
+      [ "$c" = "failure" ] && streak=$((streak+1)) || break
+    done
+    jobs="streak=${streak}"
+  fi
+fi
+
+echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs}" >> "$LOG"
 
 warn(){ echo "$(date -Is) $*" >> "$LOG"; logger -t ci-health "$*" 2>/dev/null || true; }
 # 争抢：超过基线 1.4 倍
@@ -42,4 +69,9 @@ awk -v t="${t:-0}" -v b="$BASELINE_S" 'BEGIN{ if (b+0 > 0 && t+0 > b*1.4) exit 1
 [ "${avail:-999999}" -lt 40000 ] && warn "WARN 根分区可用 ${avail}MB < 40G"
 [ "${avail:-999999}" -lt 20000 ] && warn "CRIT 根分区可用 ${avail}MB < 20G"
 [ "$run" != "n/a" ] && [ "$run" != "active" ] && warn "CRIT runner 服务不是 active（当前 $run）"
+# 产出告警：服务 active 但 job 连红，正是 2026-09-07 那种「假绿」的唯一信号
+case "$jobs" in
+  streak=[3-9]|streak=[0-9][0-9]*)
+    warn "CRIT 最近 ${jobs#streak=} 次 run 连续 failure —— 服务 active 不代表 CI 可用，先跑 verify.sh 看清理钩子那条" ;;
+esac
 exit 0
