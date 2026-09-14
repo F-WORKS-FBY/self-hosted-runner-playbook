@@ -276,7 +276,15 @@ if [ -f "$SELF_DIR/ci-health.sh" ]; then
   chmod 0755 /usr/local/bin/ci-health.sh
   printf 'CI_FIXEDWORK_BASELINE=%s\n13 * * * * root /usr/local/bin/ci-health.sh\n' "$CI_FIXEDWORK_BASELINE" > /etc/cron.d/ci-health
   chmod 0644 /etc/cron.d/ci-health
-  info "健康监控已装（每小时 13 分）"
+  # job 产出采样的凭据单独放 0600 文件 —— cron.d 是 0644，不能放 token。
+  # 没有 GH_TOKEN 也不影响安装，只是 jobs 那一项退化成 skip。
+  if [ -n "${GH_REPO:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
+    printf 'GH_REPO=%s\nGH_TOKEN=%s\n' "$GH_REPO" "$GH_TOKEN" > /etc/ci-health.env
+    chmod 0600 /etc/ci-health.env
+    info "健康监控已装（每小时 13 分，含 job 产出采样）"
+  else
+    info "健康监控已装（每小时 13 分；未提供 GH_TOKEN，job 产出采样为 skip）"
+  fi
 fi
 
 # ──────────────────────────── 8. 网络加固 ────────────────────────────

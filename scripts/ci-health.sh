@@ -17,6 +17,13 @@ LOG="${CI_HEALTH_LOG:-/var/log/ci-health.log}"
 SVC="__RUNNER_SVC__"                      # 由 bootstrap.sh 替换
 BASELINE_S="${CI_FIXEDWORK_BASELINE:-0}"  # preflight 给的 p50；为 0 则只记录不告警
 
+# job 产出采样需要一个**只读** PAT（scope: repo 的 actions:read 即可）。
+# 单独放一个 0600 的文件，不写进 /etc/cron.d/（那是 0644，全局可读）。
+# 轮换 PAT 时只改这一个文件。文件不存在就退化成 jobs=skip，不报错、也不伪装成绿。
+CI_HEALTH_ENV="${CI_HEALTH_ENV:-/etc/ci-health.env}"
+# shellcheck disable=SC1090
+[ -r "$CI_HEALTH_ENV" ] && . "$CI_HEALTH_ENV"
+
 t=$(python3 - <<'PY' 2>/dev/null || echo 0
 import hashlib, time
 blk = b'x' * 4096
