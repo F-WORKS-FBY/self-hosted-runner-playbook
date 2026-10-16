@@ -7,7 +7,8 @@
 #   ci-cleanup.timer（每日）             ← 兜底：上面两个在 runner 进程被杀时都不执行
 #
 # 上线一个月（2026-09-07 → 10-16，约 2200 个 job）后各步的实际作用：
-#   docker volume prune  →  每个起了 service/minio 的 job 约 70 MB   ← **每个 job 都在回收的一步**，见第 6 步
+#   docker volume prune  →  每个起了 service/minio 的 job 约 70 MB；参考项目 workflow 侧改完（metta-app #269，10-16）后
+#                           job 不再建匿名卷，这一步只剩兜底，见第 6 步
 #   docker image  prune  →  悬空镜像（同一个 tag 被拉到新版本后旧版本变成 <none>:<none>）；
 #                           用 digest 钉住的旧 pin **不是**悬空镜像，清不掉，要人工退役（08 章 8.6）
 #   BuildKit 缓存        →  **不归这里管**。上限由 daemon.json 的 GC 策略保证（bootstrap.sh 第 4 步）。
@@ -60,11 +61,11 @@ echo "ci-cleanup: 清理上一个 job 的残留"
 L="${CI_LABEL:-__CI_LABEL__}"            # 由 bootstrap.sh 替换；必须与 workflow 给容器打的 --label 完全一致
 APP_PORTS="__CI_APP_PORTS__"             # 由 bootstrap.sh 替换；e2e 等在宿主上监听的端口
 
-# 1) 打了 CI 标的容器
-docker ps -aq --filter "label=$L" 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
+# 1) 打了 CI 标的容器。带 -v：runner 进程被杀、workflow 的清理步骤没跑时，容器的匿名卷随容器一起删，不依赖第 6 步的 volume prune
+docker ps -aq --filter "label=$L" 2>/dev/null | xargs -r docker rm -fv >/dev/null 2>&1
 
 # 2) 漏网的服务容器（历史上用写死 --name 且零清理的那些）
-docker ps -aq --filter "name=^minio" 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
+docker ps -aq --filter "name=^minio" 2>/dev/null | xargs -r docker rm -fv >/dev/null 2>&1
 
 # 3) 上一次 run 遗留的宿主孤儿进程。
 #    不清的话，下一次 e2e 自己的 spawn 会 EADDRINUSE 死掉（只在 stderr 留一行、不失败），
@@ -90,11 +91,11 @@ docker image prune -af --filter "label=$L" --filter "until=6h" >/dev/null 2>&1
 
 # 5) （原 BuildKit 缓存清理已删，见文件头。）
 
-# 6) 匿名卷 —— 每个起了 service 容器或 minio 的 job 都会产生，这一步是它们唯一的回收者。
+# 6) 匿名卷 —— workflow 没挂 tmpfs 时，每个起了 service 容器或 minio 的 job 都会产生。service 容器的卷只有这一步回收。
 #    来源：service 容器（postgres、redis）由 runner 用 `docker rm --force` 删除，**不带 -v**；
 #    workflow 里 `docker run -d` 起、`docker rm -f` 删的容器同理。镜像声明了 VOLUME 就会留下匿名卷，
-#    每个这样的 job 约 70 MB（主要是 PGDATA）。workflow 侧改成 `docker rm -fv` 或给 service 加 `--tmpfs`
-#    可以从源头不产生，但这一步要一直留着兜底。见 05-workflow改造.md 与 09 章 A14。
+#    每个这样的 job 约 70 MB（主要是 PGDATA）。workflow 侧在 VOLUME 路径挂 `--tmpfs`、删容器用 `rm -fv`，
+#    就从源头不产生（参考项目 10-16 改完，之后 job 期间新建卷为 0）。这一步留着兜底。见 05 章 ⑫ 与 09 章 A14。
 #    无标签过滤，**只在这台机专用于 CI 时安全**。若这台机还跑别的东西，给它的卷打标并改成 --filter "label!=keep"。
 docker volume prune -f >/dev/null 2>&1
 

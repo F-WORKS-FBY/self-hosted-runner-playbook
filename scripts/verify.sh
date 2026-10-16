@@ -139,7 +139,7 @@ else sk "口令登录仍开着（bootstrap.sh 默认不动它，要关加 --hard
 hdr "干净度"
 if [ "$BUSY" = 1 ]; then sk "有 job 正在运行，容器属于它，跳过残留检查"
 else [ "$(docker ps -aq 2>/dev/null | wc -l)" -eq 0 ] && ok "无残留容器" || no "有 $(docker ps -aq | wc -l) 个残留容器"; fi
-[ "$(docker volume ls -q 2>/dev/null | wc -l)" -le 6 ] && ok "匿名卷没有累积（$(docker volume ls -q | wc -l) 个；每个 job 会短暂产生约 3 个）" \
+[ "$(docker volume ls -q 2>/dev/null | wc -l)" -le 6 ] && ok "匿名卷没有累积（$(docker volume ls -q | wc -l) 个；workflow 没挂 tmpfs 时每个 job 会短暂产生约 3 个）" \
   || no "有 $(docker volume ls -q | wc -l) 个卷 —— 清理钩子的 volume prune 可能没在跑"
 av=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
 [ "$av" -ge 20 ] && ok "根分区可用 ${av}G" || no "根分区只剩 ${av}G"

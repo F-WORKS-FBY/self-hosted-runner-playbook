@@ -550,14 +550,14 @@ runner 进程被杀时，两个钩子都不执行。
 
 | 命令 | 作用 | 状态 |
 |---|---|---|
-| `docker volume prune` | 回收匿名卷，每个起 service/minio 的 job 约 70 MB | 保留 |
+| `docker volume prune` | 回收匿名卷；workflow 没挂 tmpfs 时，每个起 service/minio 的 job 约 70 MB | 保留（兜底） |
 | `docker image prune`（悬空）+ 按 CI 标签的 `-a` | 同一个 tag 拉到新版本后留下的旧版本 | 保留 |
 | `docker buildx prune --filter until=24h` | — | 已删 |
 | `fuser -k <app_ports>/tcp` | 上一次 run 的宿主孤儿进程 | 保留 |
 
 各条说明：
 
-- `docker volume prune`：这是每个 job 都在回收的一步。runner 删 service 容器时用的是不带 `-v` 的 `rm --force`，会留下匿名卷（主要是 PGDATA）。
+- `docker volume prune`：回收匿名卷。runner 删 service 容器时用的是不带 `-v` 的 `rm --force`，会留下匿名卷（主要是 PGDATA）。workflow 没挂 tmpfs 时，每个 job 都靠这一步回收；挂了之后就不再产生这些卷（05 章 ⑫，参考项目 10-16 已改），这一步只作兜底。脚本删带 CI 标签的容器和名字以 minio 开头的容器时带 `-v`，runner 被杀后留下的这两类容器连卷一起删。
 - `docker image prune`：用 digest 钉住的旧 pin 不算悬空，清不掉，要人工退役（08 章 8.6）。按 CI 标签的那条，要 workflow 的 `docker build` 打了标签才匹配得到，否则匹配 0 个。
 - `docker buildx prune --filter until=24h`：已从脚本删除。旧版表格写它回收 5896 MB、是「主力」，但那是攒了几天之后一次性清掉的量。它删的是 24 小时没被用到的缓存，实际常常是整层几 GB 的依赖层（换了 lockfile，或者安静了一晚上），删完下一次构建就是冷的。这些空间在需要时 GC 本来就会回收。缓存上限靠 4.1 节 daemon.json 里的 GC 策略控制。
 - `fuser -k <app_ports>/tcp`：清掉上一次 run 留在宿主上的孤儿进程，见 05 章 ⑨。这种情况属于「假绿」（检查本该失败，却显示通过）：测试实际跑在上一次 run 留下的孤儿进程上，CI 却显示通过。
@@ -744,9 +744,10 @@ steps:
 要点：
 
 - **`--label` 的值必须和 bootstrap.sh 里的 `CI_LABEL` 完全一致。** 清理钩子第 1 步按这个 label 删除上一个 job 没删掉的容器。本模板原来写的是 `--label ci=1`，和任何 `CI_LABEL` 都对不上。
-- 删除容器用 `rm -fv`，不用 `rm -f`。镜像声明了 `VOLUME` 时（minio、postgres、redis、prometheus 都声明了），Docker 会建匿名卷，带 `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目沿用了这个模板，每个起 minio 的 job 漏 1 个卷。
+- 删除容器用 `rm -fv`，不用 `rm -f`。镜像声明了 `VOLUME` 时（minio、postgres、redis、prometheus 都声明了），Docker 会建匿名卷，带 `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目沿用了这个模板，原来每个起 minio 的 job 漏 1 个卷（10-16 已改，见 ⑫）。
 - `docker run --rm` 解决不了漏卷。实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下。`--rm` 只在容器自己退出或被 `docker stop` 时生效。
-- 清理钩子并非只按 label 过滤。它的第 6 步是一条不带过滤的 `docker volume prune`，用来兜底回收匿名卷（本模板原来说「绝不裸 prune」，这个说法不对）。workflow 里写对 `-v`，就不必依赖它。service 容器的卷见 ⑫。
+- `rm -fv` 只在清理步骤真的跑了时有用。runner 进程被杀时 `if: always()` 也不执行，容器留给钩子删。更稳的是在镜像的 VOLUME 路径挂 tmpfs，一开始就不建卷，写法和注意事项见 ⑫。
+- 清理钩子并非只按 label 过滤。它的第 6 步是一条不带过滤的 `docker volume prune`，用来兜底回收匿名卷（本模板原来说「绝不裸 prune」，这个说法不对）。workflow 里写对了，就不必依赖它。service 容器的卷见 ⑫。
 
 ---
 
@@ -991,7 +992,7 @@ grep -rn 'image:' .github/workflows/ | grep -v '@sha256'  # 有几个镜像没�
 
 ### ⑫ 匿名卷：service 容器和自己起的容器都会留（上线一个月后补）
 
-常驻机器上，CI 容器留下的匿名卷如果没有清理钩子兜底，会不断累积。service 容器要挂 tmpfs，自己起的容器要用 `rm -fv`。
+常驻机器上，CI 容器留下的匿名卷如果没有清理钩子兜底，会不断累积。凡是镜像声明了 VOLUME 的容器，都在那个路径挂 tmpfs；自己起的容器删除时再用 `rm -fv`。
 
 自查：
 
@@ -1005,9 +1006,11 @@ grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为
 | 来源 | 谁删容器 | workflow 能改吗 |
 |---|---|---|
 | `services:` 里的 postgres / redis | runner 自己，`docker rm --force`，不带 `-v` | 能，挂 tmpfs（见下） |
-| 步骤里 `docker run -d` 起的（minio、prometheus…） | workflow 的 `docker rm -f` | 能，改 `rm -fv`（见 ①） |
+| 步骤里 `docker run -d` 起的（minio、prometheus…） | workflow 的 `docker rm -f` | 能，挂 tmpfs，删除时用 `rm -fv`（见 ①） |
 
-参考项目里，每个用到数据库的 job 漏 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA。那台机器上卷数始终是 0，因为清理钩子的 `docker volume prune` 在每个 job 前后都在回收。这是钩子在兜底，workflow 本身并没有写对。换一台没装钩子的常驻 runner，卷数就会一直涨。
+参考项目里，每个用到数据库的 job 原来漏 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA；跑了监控冒烟的 build job 还会给 prometheus 漏 1 个（改了监控配置时跑；碰到 packages/、lockfile、根 package.json 等共享面，或手动触发时也全跑）。那台机器上卷数始终是 0，因为清理钩子的 `docker volume prune` 在每个 job 前后都在回收。这是钩子在兜底，workflow 本身并没有写对。换一台没装钩子的常驻 runner，卷数就会一直涨。
+
+参考项目 2026-10-16 按下面的写法改完（metta-app #269）：postgres、redis、minio、prometheus 都挂 tmpfs，起这些容器的 job 都在起完后核对没挂卷。合并前在 runner 上记了约 15 分钟 `docker events`，覆盖 nightly 的两个 job 和 build job 的两个冒烟，这些容器照常建了又删，期间没有新建卷。
 
 怎么改：给 service 容器挂 tmpfs，从源头上不产生卷。2026-10-16 在参考机上实测：postgres 正常启动，`docker inspect` 的 Mounts 为空，删容器后新增卷 0 个。
 
@@ -1028,8 +1031,27 @@ services:
 - postgres 18 的镜像声明的是 `/var/lib/postgresql`，不是常见的 `/var/lib/postgresql/data`。后者是 17 及以前的路径；18 起 PGDATA 在 `/var/lib/postgresql/<大版本>/docker`。
 - 路径写错不会报错，只是卷照样建、照样漏。
 - tmpfs 占内存（参考项目约 50–120 MB/job）。它记在容器的 cgroup 上，不在 runner 的 MemoryMax 里；但在没有 swap 的机器上它占的是真内存，所以 `size=` 必须写。
+- 镜像以非 root 用户运行时，tmpfs 要加 `mode=1777`。prometheus 以 nobody 运行，不加的话报 `/prometheus/queries.active: permission denied`，起不来。postgres、redis 的入口脚本会先以 root 改属主，不用加。
+- 步骤里起的容器同样挂：`docker run -d ... --tmpfs /data:size=256m <minio 镜像> server /data`。参考机上实测 minio 在 tmpfs 上写 20 MB 对象、读回逐字节一致。
 
-另外，`docker build` 也要打上 `--label "$CI_LABEL"`，清理钩子才能删掉过期的 CI 镜像。不打标签时，钩子里那条清理匹配到 0 个镜像。
+钩子每个 job 都清卷，tmpfs 路径写错、漏了卷也看不出来。所以在起完容器后加一步核对，有 `volume` 类型的挂载就让 job 失败：
+
+```yaml
+- name: 容器没有挂卷
+  env:
+    IDS: ${{ job.services.postgres.id }} ${{ job.services.redis.id }}
+  run: |
+    out=$(docker inspect -f '{{.Name}}{{range .Mounts}}{{if eq .Type "volume"}} {{.Destination}}{{end}}{{end}}' $IDS "$SVC_NAME")
+    echo "$out"
+    if [ "$(wc -l <<<"$out")" -ne 3 ]; then echo "::error::应核对 3 个容器"; exit 1; fi
+    if grep -q ' ' <<<"$out"; then echo "::error::上面带路径的容器挂了 docker 卷"; exit 1; fi
+```
+
+数量也要核：service 改了名字时 `job.services.<名字>.id` 是空串，少核一个容器也不会报错。
+
+另外，`docker build` 也要打上 `--label "$CI_LABEL"`，清理钩子才能删掉过期的 CI 镜像；不打标签时，钩子里那条清理匹配到 0 个镜像。标签漏打也不报错，参考项目让每个 build 带 `--iidfile "$RUNNER_TEMP/ci-images/<名字>"`（先 `mkdir -p "$RUNNER_TEMP/ci-images"`），再加一步遍历这些文件核对标签。
+
+参考项目还在 job 末尾的 `if: always()` 清理里加了一条 `docker image prune -f --filter "label=$CI_LABEL"`（不带 `-a`，只删悬空的，带 tag 的当前版本留着），防的是固定 tag 重建后旧版本变成悬空镜像。这是经典镜像存储的行为；Docker 29 + containerd 快照器上带 `-t` 重建，旧版本直接被删、不留悬空镜像（02 章 2.6 实测，10-16 复测相同），所以在这类机器上这一条只是保险。
 
 ---
 
@@ -1043,6 +1065,8 @@ grep -rn 'ports:'            .github/workflows/ | grep -v '127.0.0.1'  # 应为�
 grep -rn '/tmp/'             .github/workflows/                        # 应为空或已确认无害
 grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理步骤应该有
 grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
+grep -rn -- '--tmpfs'        .github/workflows/                        # 每个声明了 VOLUME 的镜像都应有一条（⑫）
+grep -rn '容器没有挂卷'       .github/workflows/                        # 起了这些容器的 job 都应有这一步（⑫）
 ```
 
 ---
@@ -1484,14 +1508,14 @@ r = simulate(events, svc)
 | 来源 | 由谁清理 | 不清理的后果 |
 |---|---|---|
 | BuildKit build cache | `daemon.json` 的 GC 策略 | 长到上限后由 GC 驱逐 |
-| 匿名卷（services 容器的数据） | 只有 `docker volume prune` | 无上界，约 70 MB/job |
+| 匿名卷（services 容器的数据） | 只有 `docker volume prune` | workflow 没挂 tmpfs 时无上界，约 70 MB/job |
 | 镜像 | 悬空的由钩子清；换掉的旧 pin 要人工退役 | 慢慢累积，参考项目一个月约 2 GB |
 | Docker 以外 | 无 | 参考项目一个月涨了约 6 GiB |
 
 表格补充说明：
 
 - BuildKit 的 GC 策略有三个参数：Reserved / Max Used / Min Free。缓存会一直增长，直到长到 Max Used，或者把可用空间压到 Min Free，然后 GC 开始驱逐。
-- `docker volume prune` 由清理钩子在每个 job 前后各执行一次。除此之外没有别的机制清匿名卷，它不在 BuildKit 的管辖范围内。
+- `docker volume prune` 由清理钩子在每个 job 前后各执行一次。service 容器留下的匿名卷只有它会清，BuildKit 的 GC 不管卷；workflow 给这些容器挂上 tmpfs 后就不再产生（05 章 ⑫）。
 - 换掉的旧 pin 不会被自动清理，退役步骤见 8.6。
 - Docker 以外的增长包括 IDE 远程服务端、旧检出、包管理器缓存等。约 6 GiB 这个数，是 `ci-health` 采样里「可用 + containerd」之和的减少量。
 
@@ -1587,8 +1611,8 @@ COPY apps ./apps
 
 上面的改法把源码挪到了 install 之后，层序已经正确。但 install 层的缓存依据是整份清单，不只是 lockfile。下面两件事让它重新退化：
 
-1. 根 `package.json` 里有 `scripts`。团队每加一个 npm 脚本，install 层就作废。参考项目 9 月下旬起，根 `package.json` 被改了 55 次，其中 50 次只改了 scripts；同期 lockfile 只变了 7 次。两周里 api 镜像冷构建 89/177 次。
-2. 按应用传的构建参数放在 install 前面（`ARG APP_FILTER` + `--filter ${APP_FILTER}`）。结果 api 和 worker 两个镜像各存一份 install 层。实测两份层的文件清单（各约 99,000 条）只有 9 个路径不同，全是工作区链接，也就是同一份依赖存了两遍。BuildKit 缓存 23.6 GB 里 98% 是 install 层（api/worker 18.1 GB，admin 5.0 GB）。
+1. 根 `package.json` 里有 `scripts`。团队每加一个 npm 脚本，install 层就作废。参考项目 9 月以来，根 `package.json` 被改了 55 次，其中 50 次只改了 scripts；同期 lockfile 只变了 7 次。10-02 至 10-16，api 镜像冷构建 89/182 次。
+2. 按应用传的构建参数放在 install 前面（`ARG APP_FILTER` + `--filter ${APP_FILTER}`）。结果 api 和 worker 两个镜像各存一份 install 层。实测两份层的文件清单（各约 99,000 条）只有 9 个路径不同：各自的 2 个工作区链接和它们所在的目录，依赖本身完全相同，也就是同一份依赖存了两遍。BuildKit 缓存里 98% 是 install 层（10-16 实测总量 22.0 GB，api/worker 18.1 GB，admin 3.5 GB；总量随 GC 在 20 GiB 上下浮动）。
 
 改法：
 
@@ -1598,11 +1622,13 @@ RUN pnpm install --frozen-lockfile --filter @app/api... --filter @app/worker... 
 ARG APP_FILTER          # 需要的话放到 install 之后
 # ② 缓存依据去掉 scripts：前置阶段把各 package.json 的 scripts 字段删掉再 COPY 进来做 install，
 #    install 之后在源码层再 COPY 一次完整的 package.json
+# ③ install 之前仍要带 pnpm-workspace.yaml 和 lockfile：pnpm 11 的 nodeLinker、allowBuilds 只从
+#    pnpm-workspace.yaml 读，少了它装法和构建许可都会变
 ```
 
 注意：`pnpm fetch` + `--offline` 解决不了这个问题。实测冷构建 65 秒里，`pnpm install` 整步（含下载）只占约 12–13 秒，大头是导出和解包 1.15 GB 的 node_modules 层（约 50 秒）。管用的办法只有两个：别让 install 层失效，别把它存两份。
 
-收益：这项优化只影响速度和磁盘，不涉及正确性。在参考项目上，它值每周约 1 小时 runner 时间（CI 总时长的约 3.6%），还能让 BuildKit 的 Max Used 从 20 GiB 降下来，腾出 10 GB 以上磁盘。
+收益：这项优化只影响速度和磁盘，不涉及正确性。参考项目 10-10 至 10-16 这一周，冷装共占约 85 分钟 runner 时间（install 约 25 分钟，导出与解包新的依赖层约 60 分钟），约占同期全部 job 时长的 3.2%。改完能省下其中大部分，lockfile 真变了的那几次仍要重装。改完还能让 BuildKit 的 Max Used 从 20 GiB 降下来，腾出 10 GB 以上磁盘。参考项目把这项并进了它的镜像瘦身卡（metta-app 09a-3，#271）。
 
 **先改 Dockerfile，再降 Max Used。** 顺序反过来只会让构建更冷。
 
@@ -1867,14 +1893,16 @@ if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 - `--rm` 只在容器自己退出或 `docker stop` 时生效。
 - runner 删 service 容器的那条命令，workflow 管不到。
 
-参考项目里，每个用到数据库的 job 留下 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA。清理钩子的 `docker volume prune` 一直在兜底，一个月约 2200 个 job 后卷数仍是 0。但这是钩子的作用；换一台没装钩子的常驻 runner，卷数会一直涨。
+参考项目里，每个用到数据库的 job 原来留下 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA。清理钩子的 `docker volume prune` 一直在兜底，一个月约 2200 个 job 后卷数仍是 0。但这是钩子的作用；换一台没装钩子的常驻 runner，卷数会一直涨。
 
 从源头避免产生匿名卷：
 
-- 步骤里起的容器，删除时改用 `rm -fv`。
 - service 容器在 `options:` 里挂 `--tmpfs <VOLUME 路径>`。
+- 步骤里起的容器也挂 tmpfs，删除时再用 `rm -fv`。只靠 `rm -fv` 不够：runner 进程被杀时清理步骤不跑。
 
-注意：路径要用镜像实际声明的。postgres 18 是 `/var/lib/postgresql`，不是 `/var/lib/postgresql/data`。写错了不报错，卷照样漏。（05 章 ⑫）
+注意：路径要用镜像实际声明的。postgres 18 是 `/var/lib/postgresql`，不是 `/var/lib/postgresql/data`。写错了不报错，卷照样漏，所以 job 里要有一步核对容器没挂卷。以非 root 运行的镜像（prometheus 是 nobody）挂 tmpfs 要加 `mode=1777`，否则写不进去、起不来。（05 章 ⑫）
+
+参考项目 2026-10-16 在 workflow 侧改完（metta-app #269），之后 job 期间新建卷为 0。钩子里的 `docker volume prune` 留着兜底。
 
 playbook 自己为什么漏了这一点：05 章 ① 的模板写的就是 `docker rm -f`，参考项目沿用了这个模板。
 
@@ -2051,7 +2079,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 - 它删的是 24 小时没被用到的缓存，常常是整层几 GB 的依赖层（lockfile 一换，或者安静了一晚上）。删完之后，下一次构建就是冷的。
 - 这些空间在需要时 GC 本来就会回收。它确实在删东西，但删的时机不对：空间还够的时候就提前删，结果是冷构建。
 - 真正卡住缓存上限的是 daemon.json 的 GC。
-- 真正每个 job 都在回收的 `volume prune`（每个起 service/minio 的 job 约 70 MB），反而被排在了最后。
+- 上线第一个月里每个 job 都在回收的是 `volume prune`（当时 workflow 还没挂 tmpfs，每个起 service/minio 的 job 约 70 MB），旧版表格却把它排在最后。
 
 教训：
 
@@ -2106,7 +2134,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 各条的详细说明：
 
 - 把 4 个 job 合并成 1 个：三个独立方案都这么建议，论证也对（N=1 上 job 只排队不并行）。但仿真显示，它带来的排队改善与「修 Dockerfile 层序 + 去 cache」等效（11.7 vs 11.2 分钟），而后者不动一行文档，也不破坏回退时的并行。在提速之上再合并，只多省 2.2–2.6 分钟，不值 10 处文档改动。
-- `docker image prune` 是清理主力：实测回收 0 MB。Docker 29 重打同名 tag 不留悬空镜像。原文接着说「主力是 `buildx prune`」，这半句也错了，见 B13：持续负载下真正一直在回收的是 `volume prune`，缓存上限靠 GC。
+- `docker image prune` 是清理主力：实测回收 0 MB。Docker 29 重打同名 tag 不留悬空镜像。原文接着说「主力是 `buildx prune`」，这半句也错了，见 B13：workflow 挂 tmpfs 之前，持续负载下一直在回收的是 `volume prune`；缓存上限靠 GC。
 - metadata 泄露 root 口令 = 阻塞项：机制属实，但把口令与 `/etc/shadow` 的 hash 逐位比对后不匹配，是陈旧凭据，因此降级为「高」。判定「凭据泄露」之前，先验证那个凭据还有效。
 - 零下载的 `docker build` 也扣 Docker Hub 配额：试着复现，没能复现（6 次操作计数一格未动）。记录在案，但不采纳。
 
