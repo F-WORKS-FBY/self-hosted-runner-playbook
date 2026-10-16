@@ -241,7 +241,8 @@ docker buildx prune  →  回收 5896 MB          ← 攒了几天后的一次�
 docker volume prune  →  回收 634 MB           ← services 容器的匿名卷，约 70 MB/run
 ```
 
-> ⚠️ **上线一个月后更正**：`buildx prune --filter until=24h` 在持续负载下几乎删不到东西（缓存 24 小时内都被用过），
+> ⚠️ **上线一个月后更正**：`buildx prune --filter until=24h` 删的是 24 小时没被用到的缓存，实际上常常是整层几 GB 的依赖层
+> （lockfile 一换、或者安静了一晚上），删完下一次构建就是冷的；而这些空间 GC 在需要时本来就会回收。
 > 已从清理钩子里删掉。缓存的上限靠 daemon.json 的 GC 策略（4.1 节）。
 
 容量估算——**别用「基线 + 日增」**，它只描述第一周：
@@ -249,8 +250,8 @@ docker volume prune  →  回收 634 MB           ← services 容器的匿名�
 稳态已用 ≈ 系统与工具链 + 在用镜像 + min(Max Used, 缓存工作集) + Docker 以外的东西
 稳态可用 ≈ max(Min Free, 盘总量 − 上式)
 ```
-> **参考项目**：第一周 13.7 GB / 74.8 GiB = 18%，原稿把这个当成了稳态。实际第四周稳定在约 49 GB / 68%，
-> 可用空间停在 GC 的 Min Free（20 GiB）附近不再下降。详见 08 章 8.2。
+> **参考项目**：上线前测得 13.7 GB / 74.8 GiB = 18%，原稿把这个当成了稳态。实际 10-12～10-16 稳定在约 47–49 GB / 65–68%：
+> 缓存长到 Max Used（20 GiB）停住，可用空间约 23 GiB 不再下降。详见 08 章 8.2。
 
 **别把「不清理会盘满」当成清理的理由**——BuildKit 自己有 GC 兜底，缓存不会无限长。
 真正的理由是：①缓存被反复驱逐导致构建退化；②**匿名卷不在 BuildKit 管辖内，Docker 以外的东西更没人管，那两部分才是无上界的**。
@@ -423,8 +424,8 @@ $nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;   # runner 自己（2026-10 
 
 （我第一版写了 docker + containerd 两条，其中 docker 那条是多余的。查一下你的机器再写。）
 
-> ⚠️ **runner 服务本身也要豁免**（上线后第 25 天补）。2026-10-02 06:06，一次 libssl 自动安全更新
-> 让 needrestart 把 runner 服务在 job 中途重启了，那个 job 当场被取消，只能重跑。
+> ⚠️ **runner 服务本身也要豁免**（上线第 25 天出事，2026-10-16 补）。2026-10-02 06:06，一次 libssl 自动安全更新
+> 让 needrestart 把 runner 服务在 job 中途重启了，那个 job 被当场打断（GitHub 上记为 Failed），只能重跑。
 > 豁免的代价是 runner 继续用旧库直到下次重启 —— 所以要配一条运维纪律：**每月找个没有 job 的时候重启一次机器**
 > （见 08 章 8.6）。`unattended-upgrades` 默认 `Automatic-Reboot "false"`，不会自己重启机器，这点不用改。
 
@@ -473,7 +474,7 @@ ci-cleanup.timer（每日）             ← 兜底
 
 **为什么 `JOB_STARTED` 是主力**：它在**下一个** job 开始前跑，不管上一个是怎么结束的。
 我原来写的理由是「`JOB_COMPLETED` 在 job 被 `cancel-in-progress` 取消时根本不执行」——
-**上线一个月的数据推翻了这句**：38 个被取消的 job **两个钩子都执行了**（runner 2.33x）。
+**上线后的数据推翻了这句**：最近两周（`_diag` 只保留 14 天）里 38 个被取消的 job **两个钩子都执行了**（runner 2.337.0）。
 真正跑不到 `JOB_COMPLETED` 的是两种少见情况：job 在初始化阶段就被取消、runner 服务被停掉。
 结论不变（`JOB_STARTED` 仍是更可靠的那个），理由要改。
 
@@ -483,9 +484,9 @@ ci-cleanup.timer（每日）             ← 兜底
 
 | 命令 | 作用 | 说明 |
 |---|---|---|
-| `docker volume prune` | **每个 job 约 70 MB** | **唯一持续在回收的一步**。service 容器被 runner 用不带 `-v` 的 `rm --force` 删掉，留下匿名卷（主要是 PGDATA） |
-| `docker image prune`（悬空）+ 按 CI 标签的 `-a` | 换 pin 后的旧版本 | 带标签那条要 workflow 的 `docker build` 打标才匹配得到，否则匹配 0 个 |
-| ~~`docker buildx prune --filter until=24h`~~ | **已删** | 原表写它回收 5896 MB 是「主力」——那是攒了几天之后**一次性**清掉的量。持续负载下缓存 24 小时内都被用过，它几乎删不到东西，只在空闲一天以上后把缓存清空、让下一次构建变冷。缓存上限靠 4.1 节 daemon.json 里的 GC 策略 |
+| `docker volume prune` | **每个起 service/minio 的 job 约 70 MB** | **每个 job 都在回收的一步**。service 容器被 runner 用不带 `-v` 的 `rm --force` 删掉，留下匿名卷（主要是 PGDATA） |
+| `docker image prune`（悬空）+ 按 CI 标签的 `-a` | 同一个 tag 被拉到新版本后留下的旧版本 | 用 digest 钉住的旧 pin 不算悬空，清不掉，要人工退役（08 章 8.6）。带标签那条要 workflow 的 `docker build` 打标才匹配得到，否则匹配 0 个 |
+| ~~`docker buildx prune --filter until=24h`~~ | **已删** | 原表写它回收 5896 MB 是「主力」——那是攒了几天之后**一次性**清掉的量。它删的是 24 小时没被用到的缓存，实际常常是整层几 GB 的依赖层（换了 lockfile、或者安静了一晚上），删完下一次构建就是冷的；这些空间 GC 在需要时本来就会回收。缓存上限靠 4.1 节 daemon.json 里的 GC 策略 |
 | `fuser -k <app_ports>/tcp` | — | 上一次 run 的宿主孤儿进程（见 05 章「假绿」那条） |
 
 > ⚠️ **钩子要防「撞上正在跑的 job」**。runner 自己调钩子时本机只有这一个 job，没问题；
@@ -637,7 +638,7 @@ steps:
 - **`--label` 的值必须和 bootstrap.sh 的 `CI_LABEL` 一模一样**，清理钩子第 1 步按它删「上一个 job 没删掉的容器」。
   （本模板原来写的是 `--label ci=1`，跟任何 `CI_LABEL` 都对不上。）
 - **`rm -fv` 不是 `rm -f`**：镜像声明了 `VOLUME`（minio、postgres、redis、prometheus 都声明了）就会建匿名卷，
-  `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目照抄后每个 job 漏 1 个卷。
+  `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目沿用了这个模板，每个起 minio 的 job 漏 1 个卷。
   **`docker run --rm` 救不了**：实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下——
   `--rm` 只在容器自己退出或被 `docker stop` 时生效。
 - 钩子**不是**只按 label 过滤：第 6 步是一条不带过滤的 `docker volume prune`（本模板原来说「绝不裸 prune」，不对）。
@@ -731,10 +732,11 @@ cache: ${{ vars.CI_RUNNER && '' || 'pnpm' }}     # ❌ 不成立
 
 ---
 
-### ⑥ 清理钩子在 job 被取消时不执行
+### ⑥ workflow 最后一步的清理在 job 被取消时不执行
 
-见 04 章 4.4。这里只强调自查点：**你的 workflow 里有 `cancel-in-progress: true` 吗？**
-有的话，任何写在最后一步的清理都会被跳过。用 `if: always()`，并在 runner 侧挂 `JOB_STARTED` 钩子兜底。
+自查点：**你的 workflow 里有 `cancel-in-progress: true` 吗？**
+有的话，写在最后一步、又没带 `if: always()` 的清理会被跳过。用 `if: always()`，并在 runner 侧挂 `JOB_STARTED` 钩子兜底。
+（runner 侧的 `JOB_COMPLETED` 钩子在 job 被取消时其实**会**执行，跑不到的是初始化阶段就被取消、或 runner 服务被停掉这两种情况，见 04 章 4.4。）
 
 ---
 
@@ -878,7 +880,7 @@ services:
     options: --tmpfs /data:size=64m
 ```
 ⚠️ **tmpfs 的路径必须是镜像声明的 VOLUME 路径**，用 `docker image inspect <镜像> --format '{{json .Config.Volumes}}'` 查。
-postgres 18 的镜像声明的是 `/var/lib/postgresql`，**不是**大家熟悉的 `/var/lib/postgresql/data`（那是 16 及以前的）。
+postgres 18 的镜像声明的是 `/var/lib/postgresql`，**不是**大家熟悉的 `/var/lib/postgresql/data`（那是 17 及以前的；18 起 PGDATA 在 `/var/lib/postgresql/<大版本>/docker`）。
 写错了不报错，只是卷照样建、照样漏。tmpfs 占内存（参考项目约 50–120 MB/job），记在容器的 cgroup 上，
 不在 runner 的 MemoryMax 里，但没有 swap 的机器上它占的是真内存，`size=` 必须写。
 
@@ -1059,7 +1061,7 @@ GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
 | 服务与开机自启 | docker / containerd / runner 三个 unit `active + enabled` | 重启后回不来 |
 | runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust≥500`、`After=docker` | 见 04 章各条的后果 |
 | Docker | `live-restore=true`、BuildKit GC 有 **Max Used 与 Min Free 两项** | 只有 Reserved 说明你用了 `defaultKeepStorage`，Min Free 保护丢了 |
-| 清理与监控 | **钩子按 `bash -e` 实跑一次能退出 0**（有 job 时 SKIP）、钩子带运行中 job 守卫、占位符已替换、清理脚本在、**两个钩子都挂**、timer active 且以 runner 身份运行、监控量的是 `/var/lib/containerd`、磁盘阈值与 GC 对齐、告警推送已配 | 钩子在 `-e` 下非零 = **每个 job 全红**（见下方 ⚠️）；没守卫 = timer 撞上 job 会删它的容器；阈值没对齐 = 每小时误报；没配推送 = 告警没人看 |
+| 清理与监控 | **钩子按 `bash -e` 实跑一次能退出 0**（有 job 时 SKIP）、钩子带运行中 job 守卫、占位符已替换、清理脚本在、**两个钩子都挂**、timer active 且以 runner 身份运行、监控量的是 `/var/lib/containerd`、磁盘阈值与 GC 对齐、告警推送已配 | 钩子在 `-e` 下非零 = **每个 job 全红**（见下方 ⚠️）；没守卫 = timer 撞上 job 会删它的容器；阈值没对齐 = 每小时误报；没配推送 = 告警没有接收方 |
 | 部署参数与系统更新 | `/etc/ci-runner.env` 存在且与钩子的 CI 标签一致、needrestart 豁免 runner、有没有待重启的更新 | 参数没落盘 = 下次重新部署静默改回默认值；没豁免 = 安全更新在 job 中途重启 runner |
 | 网络加固 | DOCKER-USER + OUTPUT 两条 metadata 规则、已持久化、**实拨容器验证** | 少一条就有一条路通 |
 | SSH | 口令登录是否关闭 | — |
@@ -1220,7 +1222,7 @@ r = simulate(events, svc)
 | BuildKit build cache | **daemon.json 的 GC 策略**（Reserved / Max Used / Min Free） | 缓存长到 Max Used 或把可用空间压到 Min Free 为止，然后 GC 开始驱逐 |
 | 匿名卷（services 容器的数据） | **只有** `docker volume prune`（清理钩子每个 job 前后各一次） | **无上界**，约 70 MB/job |
 | 镜像 | 悬空的由钩子清；**换掉的旧 pin 没人清**，要人工退役 | 慢慢攒，参考项目一个月攒了约 2 GB |
-| Docker 以外 | 没人管 | IDE 远程服务端、旧检出、包管理器缓存……参考项目一个月涨了约 8 GB |
+| Docker 以外 | 没人管 | IDE 远程服务端、旧检出、包管理器缓存……参考项目一个月涨了约 6 GiB（`ci-health` 采样里「可用 + containerd」之和的减少量） |
 
 **「不清理会盘满」通常是错的**——BuildKit 的 GC 兜底，缓存不会无限长。
 **但匿名卷不在 BuildKit 管辖内，Docker 以外的东西更没人管，那两部分才是真正无上界的。**
@@ -1229,8 +1231,8 @@ r = simulate(events, svc)
 
 | 时间 | 已用 | 可用 | 说明 |
 |---|---|---|---|
-| 第 1 周 | ~18 GB | ~57 GB | 原稿写的「稳态 13.7 GB / 18%」是这个阶段，**不是稳态** |
-| 第 4 周 | ~49 GB（68%） | ~23.5 GB，连续 5 天不再下降 | 真正的稳态：BuildKit 缓存长满约 20 GiB，被 Min Free 顶住 |
+| 上线第一周（09-07～09-13） | ~15 GiB（~20%） | ~57 GiB | 原稿写的「稳态 13.7 GB / 18%」是上线前测的，**不是稳态** |
+| 10-12～10-16 | ~47–49 GB（65–68%） | ~23 GiB，连续 5 天不再下降 | 真正的稳态：BuildKit 缓存长到 Max Used（20 GiB）停住；可用空间比 Min Free 还高约 3 GiB |
 | 清理之后 | ~39 GB（54%） | ~34 GB | 删掉 IDE 旧服务端 2.8 GB、旧检出与 pnpm store 3.4 GB、不再引用的镜像 2.0 GB |
 
 稳态估算公式（比「基线 + 日增」可靠）：
@@ -1238,15 +1240,16 @@ r = simulate(events, svc)
 稳态已用 ≈ 系统与工具链 + 在用镜像 + min(Max Used, 缓存工作集) + Docker 以外的东西
 稳态可用 ≈ max(Min Free, 盘总量 − 上式)
 ```
-缓存工作集由构建频率与层序决定（见 8.4）；它填满 Max Used 之后，**可用空间会停在 Min Free 附近，这是设计行为，不是告警**。
+缓存工作集由构建频率与层序决定（见 8.4）。它填满 Max Used 之后就不再长，**可用空间停在一个稳定值上，这是设计行为，不是告警**。
+Min Free 是另一条线：只有盘更小、或者 Docker 以外的增长把可用空间挤到它附近时，GC 才会为了保底而驱逐缓存——那才值得告警。
 
 监控要点（`scripts/ci-health.sh`）：
 - 量 **`/var/lib/containerd`**，不是 `/var/lib/docker`。Docker 29 默认用 containerd 快照器，
   实测 containerd 2.6 G vs docker 115 M——量错目录会低估约 10 倍，是另一种假绿灯。
 - 匿名卷在 `/var/lib/docker/volumes`，**单独量**。
 - **磁盘阈值从 Min Free 推，不要拍脑袋**。原版写死 WARN < 40 GB、CRIT < 20000 MB：前者在设计稳态下
-  每小时都响（一个月 309 次，没人看），后者只比 Min Free（20480 MiB）低 480 MiB。
-  现在 WARN = Min Free + 1 GiB（GC 已经顶到底线、开始被 Docker 以外的增长挤压），CRIT = 10 GiB。
+  每小时都响（一个月 309 次，没有送达任何人），后者只比 Min Free（20480 MiB）低 480 MiB。
+  现在 WARN = Min Free + 1 GiB（可用空间被挤到 Min Free 附近、GC 开始为保底驱逐缓存），CRIT = 10 GiB。
   bootstrap 自动从 `BUILDKIT_MIN_FREE` 算出来写进 `/etc/cron.d/ci-health`。
 - **告警要送到人**。只写本机 journal 等于没告警。`/etc/ci-health.env` 里配 `CI_ALERT_WEBHOOK`
   （飞书自定义机器人）后，告警集合一变化就推送，持续存在的每 24 小时提醒一次。
@@ -1292,8 +1295,8 @@ COPY apps ./apps
 1. **根 `package.json` 里有 `scripts`**。团队每加一个 npm 脚本，install 层就作废。参考项目 9 月下旬起根 `package.json`
    被改了 55 次，**50 次只改了 scripts**，同期 lockfile 只变了 7 次。两周里 api 镜像冷构建 89/177 次。
 2. **按应用传的构建参数放在 install 前面**（`ARG APP_FILTER` + `--filter ${APP_FILTER}`）。api 和 worker 两个镜像
-   于是各存一份 install 层——实测两份内容只差 15 个文件条目（共约 99,000），是**同一份依赖存了两遍**。
-   BuildKit 缓存 23.6 GB 里 98% 是这些 install 层。
+   于是各存一份 install 层——实测两份层的文件清单（各约 99,000 条）只有 9 个路径不同，全是工作区链接，
+   是**同一份依赖存了两遍**。BuildKit 缓存 23.6 GB 里 98% 是 install 层（api/worker 18.1 GB，admin 5.0 GB）。
 
 改法：
 ```dockerfile
@@ -1303,7 +1306,7 @@ ARG APP_FILTER          # 需要的话放到 install 之后
 # ② 缓存依据去掉 scripts：前置阶段把各 package.json 的 scripts 字段删掉再 COPY 进来做 install，
 #    install 之后在源码层再 COPY 一次完整的 package.json
 ```
-⚠️ 别指望 `pnpm fetch` + `--offline` 解决：实测冷构建 65 秒里下载只占约 13 秒，大头是**导出和解包** 1.15 GB 的
+⚠️ 别指望 `pnpm fetch` + `--offline` 解决：实测冷构建 65 秒里 `pnpm install` 整步（含下载）只占约 12–13 秒，大头是**导出和解包** 1.15 GB 的
 node_modules 层（约 50 秒）。只有「别让它失效」和「别存两份」管用。
 
 收益要说实话：这**不是正确性问题**。参考项目上它值每周约 1 小时 runner 时间（CI 总时长的约 3.6%），
@@ -1336,7 +1339,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 **每月一次，找个没有 job 的时候**（`pgrep -x Runner.Worker` 为空）：
 
 1. **重启机器**。needrestart 已经豁免了 runner（4.2 节），安全更新装上了但 runner 还在用旧库，
-   内核更新更是必须重启才生效。参考机上线 5 周没重启过，攒了 3 个新内核和一次 libc6。
+   内核更新更是必须重启才生效。参考机上线 5 周没重启过，期间来过 3 个新内核（自动只保留最新一个）和一次 libc6，全都没生效。
    先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job。`live-restore` 与 `Restart=always` 会让一切自己回来，
    回来后跑 `verify.sh`。重启后 `apt autoremove --purge` 清掉旧内核。
 2. **退役旧镜像**。workflow 换了 pin 之后旧版本没人删（钩子只删悬空的和打了 CI 标签的）：
@@ -1499,7 +1502,8 @@ if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 06:06:05  Stopping actions.runner.…service      ← needrestart 判定它用了旧 libssl
 ```
 
-当时正在跑的 job（`adal-fixtures (2)`）当场被取消，只能重跑。A5 只豁免了 containerd，
+当时正在跑的 job（`adal-fixtures (2)`）被当场打断（GitHub 上记为 Failed，下游的 adal-gate 跟着红），只能重跑。
+这也是 `JOB_COMPLETED` 钩子跑不到的一个实例：runner 服务被停掉了。A5 只豁免了 containerd，
 **runner 服务本身也在 needrestart 的自动重启范围里**，而它恰恰是最不能在 job 中途重启的那个。
 
 **修法**：`$nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;`（bootstrap.sh 已加）。
@@ -1526,7 +1530,7 @@ if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 ⚠️ 路径要用镜像实际声明的：postgres 18 是 `/var/lib/postgresql`，**不是** `/var/lib/postgresql/data`。
 写错了不报错，卷照漏。（05 章 ⑫）
 
-**为什么 playbook 自己漏了**：05 章 ① 的模板就写的 `docker rm -f`，参考项目照抄了。
+**为什么 playbook 自己漏了**：05 章 ① 的模板就写的 `docker rm -f`，参考项目沿用了这个模板。
 
 ---
 
@@ -1641,16 +1645,16 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 最后一层讽刺值得记下来：MSN-0035 正是**在故障开始那天**以「已完成 / 关键假设 12 成立 / 24 PASS 0 FAIL」收尾的。
 **验收通过和系统可用，在那一刻是两件事，而我们只测了前者。**
 
-### B11. 告警阈值拍脑袋 → 设计稳态下每小时误报 → 没人看 → 真告警也没人看
+### B11. 告警阈值没对齐设计稳态，也没有送达渠道
 
-`ci-health.sh` 原来写死：可用 < 40 GB 报 WARN，< 20000 MB 报 CRIT。而 BuildKit GC 的 Min Free 设的是 20 GiB——
-缓存会一直长到可用空间只剩 20 GiB 为止，**那就是设计稳态**。结果：
+`ci-health.sh` 原来写死：可用 < 40 GB 报 WARN，< 20000 MB 报 CRIT。而 BuildKit GC 设的是 Max Used 20 GiB、
+Min Free 20 GiB——缓存长到 20 GiB 就停，参考机上这时可用空间稳定在约 23 GiB，**那就是设计稳态**。结果：
 
-- WARN 从第 4 周起**每小时**响，一个月 309 次；
-- CRIT 只比 GC 底线（20480 MiB）低 480 MiB，稍一波动就会误报；
-- 这些告警只写本机 journal，没有任何人或系统在读。06 章说的心跳告警也从没部署；
-- 同期真正的 3 次 CRIT（job 连续失败）同样没人看到，其中 10-08 那次还是误报：
-  统计的是全仓库的 run，把 GitHub 托管的 PR 标题检查失败也算了进来。
+- WARN 从 10-02 起开始出现、10-10 起**每小时**都响，一个月 309 次；
+- CRIT 只比 Min Free（20480 MiB）低 480 MiB，可用空间稍一被挤就会触发；
+- 这些告警只写本机 journal，没有接收方。06 章说的心跳告警也从没部署；
+- 唯一一次由定时任务产生的「job 连续失败」CRIT（10-08）同样没有送达任何人，而且它本身是误报：
+  统计的是全仓库的 run，把 GitHub 托管的 PR 标题检查失败也算了进来。（日志里另外两次 CRIT 是 09-14 修 A11 时手工测试产生的。）
 
 **教训**：
 > **阈值从系统自己的设计平衡点推出来，不要从「感觉多少算少」推。** 一个在正常状态下就会响的告警，
@@ -1664,7 +1668,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 **0600 在 CI 机上不是边界**：runner 在 docker 组里（≈ root），任何 CI job——包括 `pnpm install` 时
 某个依赖的 postinstall 脚本——都可以 `docker run -v /etc:/h …` 读到它。同一个 token 还嵌在机器上
-几个 git 检出的 remote URL 里。另外它有过期日，过期后采样会静默退化。
+两个 git 检出的 remote URL 和一个排查脚本里（检出已在 10-16 的清理中删除）。另外它有过期日，过期后采样会静默退化。
 
 **修法**：bootstrap 不再把 `GH_TOKEN` 写进任何文件；采样改用单独的 `CI_HEALTH_GH_TOKEN`
 （fine-grained，只授权这一个仓库，`Actions: read`）；采样失败（401/403）会告警而不是静默跳过。
@@ -1677,13 +1681,14 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 ### B13. 把一次性回收量当成持续效果
 
 原稿测了一次 `docker buildx prune --filter until=24h`，回收 5896 MB，于是在三处文档里写它是清理「主力」。
-那是攒了几天缓存之后**一次性**清掉的量。上线后持续负载下，缓存 24 小时内都被用过，它每次只能删 0.05–0.07 GB；
-真正卡住缓存上限的是 daemon.json 的 GC。反过来，表里写着「回收 0 MB」的 `image prune` 在换镜像 pin 之后开始有用，
-而真正一直在干活的 `volume prune`（每个 job 约 70 MB）被排在了最后。
+那是攒了几天缓存之后**一次性**清掉的量。上线后看小时数据，它删的是 24 小时没被用到的缓存——常常是整层几 GB 的
+依赖层（lockfile 一换、或者安静了一晚上），删完下一次构建就是冷的；而那些空间 GC 在需要时本来就会回收。
+它确实在删东西，只是删得不是时候：空间还够的时候提前删，换来的是冷构建。真正卡住缓存上限的是 daemon.json 的 GC。
+反过来，真正每个 job 都在回收的 `volume prune`（每个起 service/minio 的 job 约 70 MB）被排在了最后。
 
 **教训**：
-> **清理措施的效果要按稳态下的速率量，不是按攒了一阵之后清一次的总量量。** 前者告诉你它每天在做什么，
-> 后者只告诉你它第一次跑的时候有多少东西可删。
+> **清理措施要看稳态下它删的是什么、删了要付出什么代价，不能看攒了一阵之后清一次的总量。** 后者只告诉你
+> 它第一次跑的时候有多少东西可删，不告诉你它平时在帮忙还是在添乱。
 
 ### B14. 自检脚本自称只读，却会打断正在跑的 job（2026-09-14 由我引入）
 

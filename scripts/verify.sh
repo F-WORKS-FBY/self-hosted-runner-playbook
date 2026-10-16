@@ -75,7 +75,7 @@ elif sudo -u "$RUNNER_USER" /usr/bin/bash -e "$RUNNER_HOME/hooks/ci-cleanup.sh" 
 else
   no "清理钩子在 bash -e 下非零退出 —— 每个 job 都会红（2026-09-07 事故的完整形态）。复现：sudo -u $RUNNER_USER /usr/bin/bash -ex $RUNNER_HOME/hooks/ci-cleanup.sh"
 fi
-grep -q 'pgrep -x Runner.Worker' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null \
+grep -qE 'pgrep -c?x Runner\.Worker' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null \
   && ok "钩子带「有 job 在跑就不动」的守卫（每日 timer 不会误杀 job）" \
   || no "钩子缺少运行中 job 的守卫 —— 每日 timer 撞上 job 时会删掉它的容器（重新部署 scripts/ci-cleanup.sh）"
 # 只看赋值行：守卫那行**故意**保留 __CI_ 前缀做判据，不是残留。
@@ -84,7 +84,7 @@ grep -qE '^(L|APP_PORTS)=.*__CI_' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null
   || ok "钩子占位符已全部替换"
 
 n=$(grep -c '^ACTIONS_RUNNER_HOOK_JOB_' "$RUNNER_HOME/.env" 2>/dev/null || echo 0)
-[ "$n" -ge 2 ] && ok "两个钩子都挂了（STARTED + COMPLETED）" || no "只挂了 $n 个钩子（JOB_COMPLETED 在 job 被取消时不执行，必须同时挂 JOB_STARTED）"
+[ "$n" -ge 2 ] && ok "两个钩子都挂了（STARTED + COMPLETED）" || no "只挂了 $n 个钩子（JOB_COMPLETED 在 job 初始化阶段就被取消、或 runner 服务被停掉时不执行，必须同时挂 JOB_STARTED）"
 [ "$(systemctl is-active ci-cleanup.timer 2>/dev/null)" = "active" ] && ok "ci-cleanup.timer active" || no "ci-cleanup.timer 未运行（钩子在 runner 被杀时也不执行，这是唯一兜底）"
 CRON=$(ls /etc/cron.d/ 2>/dev/null | grep -E '^[a-z0-9-]*ci-health$' | head -1)
 [ -x /usr/local/bin/ci-health.sh ] && [ -n "$CRON" ] && ok "健康监控已装（/etc/cron.d/$CRON）" || no "健康监控缺失"
@@ -95,7 +95,7 @@ grep -q '^CI_DISK_WARN_MB=' "/etc/cron.d/$CRON" 2>/dev/null \
   || no "磁盘告警阈值没跟 GC 对齐 —— 旧版写死 WARN<40G，会在设计稳态下每小时误报"
 grep -qE '^CI_ALERT_WEBHOOK=.+' /etc/ci-health.env 2>/dev/null \
   && ok "告警会推送到飞书（CI_ALERT_WEBHOOK 已配）" \
-  || sk "告警只写本机 journal（/etc/ci-health.env 里没配 CI_ALERT_WEBHOOK）—— 等于没人看"
+  || sk "告警只写本机 journal（/etc/ci-health.env 里没配 CI_ALERT_WEBHOOK）—— 告警没有接收方"
 U=$(systemctl show ci-cleanup.service -p User --value 2>/dev/null)
 [ "$U" = "$RUNNER_USER" ] && ok "每日清理以 $RUNNER_USER 身份运行" \
   || no "每日清理以 ${U:-root} 身份运行一个 $RUNNER_USER 可写的脚本 —— runner 能借此拿到 root"

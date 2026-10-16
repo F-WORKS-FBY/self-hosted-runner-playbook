@@ -7,11 +7,13 @@
 #   ci-cleanup.timer（每日）             ← 兜底：上面两个在 runner 进程被杀时都不执行
 #
 # 上线一个月（2026-09-07 → 10-16，约 2200 个 job）后各步的实际作用：
-#   docker volume prune  →  每个 job 约 70 MB   ← **唯一真正持续在回收的一步**，见第 6 步
-#   docker image  prune  →  悬空镜像（换 pin 后的旧版本）；带 CI 标的镜像要等 workflow 给 build 打标才有
+#   docker volume prune  →  每个起了 service/minio 的 job 约 70 MB   ← **每个 job 都在回收的一步**，见第 6 步
+#   docker image  prune  →  悬空镜像（同一个 tag 被拉到新版本后旧版本变成 <none>:<none>）；
+#                           用 digest 钉住的旧 pin **不是**悬空镜像，清不掉，要人工退役（08 章 8.6）
 #   BuildKit 缓存        →  **不归这里管**。上限由 daemon.json 的 GC 策略保证（bootstrap.sh 第 4 步）。
-#                           这里原来有一条 `buildx prune --filter until=24h`，持续负载下几乎删不到东西
-#                           （缓存 24 小时内都被用过），只在空闲超过一天后清空缓存、让下一次构建变冷。已删。
+#                           这里原来有一条 `buildx prune --filter until=24h`：它删的是 24 小时没被用到的缓存，
+#                           实际上常常是整层几 GB 的依赖层（换了 lockfile、或者安静了一晚上），删完下一次构建就是冷的。
+#                           这些空间 GC 在需要时本来就会回收，提前删只换来更多冷构建。已删。
 #
 # ⚠️ 绝不裸 `docker system prune`、绝不用不带 label 的 `-a` —— 那会连基础镜像一起删，
 #    把「稳态 Docker Hub 消耗 ≈0」变回每次冷拉。
@@ -30,18 +32,30 @@ set -uo pipefail
 set +e                # 解除外部强加的 -e
 trap 'exit 0' EXIT    # 兜底：连 set -u 触发的中止也吃掉，让末尾那句承诺无条件成立
 
-# ⚠️ 不是由 runner 调起、而**又有 job 正在跑**时，什么都不做。
+# ⚠️ 会撞上**别的**正在跑的 job 时，什么都不做。
 #
 # 下面第 1–3 步会删掉带 CI 标的容器、minio 容器，并杀掉 e2e 端口上的进程 ——
 # 对「上一个 job 的残留」这是清理，对「正在跑的 job」这是谋杀。
-# runner 自己调钩子时（JOB_STARTED / JOB_COMPLETED）本机只有这一个 job，父进程是 Runner.Worker，放行；
-# 每日 timer、verify.sh、手工执行这三条路径不一样，它们可能正好撞上一个在跑的 job。
+#
+# 怎么判断是不是 runner 自己调的（runner 2.337.0 源码核实）：钩子的 bash 由 Runner.Worker 直接
+# vfork+execve 出来（ProcessInvoker.cs，中间没有 shell/node），所以父进程名就是 Runner.Worker；
+# 另外 runner 给钩子注入了 GITHUB_ACTIONS=true 和 GITHUB_RUN_ID，作为将来 runner 改进程结构时的兜底。
+# 每日 timer（systemd）、verify.sh（sudo 会清环境）、手工执行这三条路径两样都没有。
+#   · runner 自己调的：本机只有它自己这一个 job 时放行（一台机器上装了两个 runner 时，
+#     另一个 runner 的 job 也算「别的 job」）；
+#   · 其他路径：本机没有任何 job 时才放行。
 # 用 `pgrep -x`（按进程名精确匹配）而不是 `-f`：-f 匹配整条命令行，有人在跑
 # `grep Runner.Worker` 或编辑器里开着含这个词的文件时会误判成「有 job」。
-if [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" != "Runner.Worker" ] && pgrep -x Runner.Worker >/dev/null 2>&1; then
-  echo "ci-cleanup: 有 job 正在运行，跳过（只有 runner 自己的钩子调用才会在 job 边界清理）"
-  exit 0
+# 副作用：在 workflow 的某一步里显式调用本脚本，会清掉**当前 job 自己**的 CI 容器——那是调用者的选择。
+n=$(pgrep -cx Runner.Worker 2>/dev/null); n=${n:-0}
+if [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = "Runner.Worker" ] || { [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${GITHUB_RUN_ID:-}" ]; }; then
+  [ "$n" -le 1 ] || { echo "ci-cleanup: 本机有 $n 个 job 在跑（多个 runner？），跳过"; exit 0; }
+else
+  [ "$n" -eq 0 ] || { echo "ci-cleanup: 有 job 正在运行，跳过（只有 runner 自己的钩子调用才会在 job 边界清理）"; exit 0; }
 fi
+# 正常路径也打一行：出现在每个 job 的「Set up runner / Complete runner」日志里，
+# 哪天 runner 升级后守卫误判、每次都在跳过，对照这一行一眼就能看出来。
+echo "ci-cleanup: 清理上一个 job 的残留"
 
 L="${CI_LABEL:-__CI_LABEL__}"            # 由 bootstrap.sh 替换；必须与 workflow 给容器打的 --label 完全一致
 APP_PORTS="__CI_APP_PORTS__"             # 由 bootstrap.sh 替换；e2e 等在宿主上监听的端口
@@ -65,7 +79,8 @@ if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 fi
 
 # 4) 镜像。两条，作用不同：
-#    · 悬空镜像（<none>:<none>）：workflow 把基础镜像换成新 pin 后，旧版本就变成这种。无条件安全。
+#    · 悬空镜像（<none>:<none>）：同一个 tag（如 redis:7-alpine）被拉到新版本后，旧版本就变成这种。无条件安全。
+#      用 digest 钉住的旧 pin（repo@sha256:…）不算悬空，这里清不掉，要人工退役（08 章 8.6）。
 #    · 打了 CI 标的镜像：只有 workflow 的 `docker build` 带上 `--label $CI_LABEL` 才匹配得到。
 #      没打标时这条匹配 0 个 —— 2026-10 实测 18 个镜像无一带标，不是脚本坏了，是 workflow 没打。
 #    ⚠️ 不要换成 `--filter until=...` 加 -a：until 按镜像**创建**时间算，不是最后使用时间，
@@ -75,10 +90,10 @@ docker image prune -af --filter "label=$L" --filter "until=6h" >/dev/null 2>&1
 
 # 5) （原 BuildKit 缓存清理已删，见文件头。）
 
-# 6) 匿名卷 —— 每个 job 都会产生，这一步是它们唯一的回收者。
+# 6) 匿名卷 —— 每个起了 service 容器或 minio 的 job 都会产生，这一步是它们唯一的回收者。
 #    来源：service 容器（postgres、redis）由 runner 用 `docker rm --force` 删除，**不带 -v**；
 #    workflow 里 `docker run -d` 起、`docker rm -f` 删的容器同理。镜像声明了 VOLUME 就会留下匿名卷，
-#    每个 job 约 70 MB（主要是 PGDATA）。workflow 侧改成 `docker rm -fv` 或给 service 加 `--tmpfs`
+#    每个这样的 job 约 70 MB（主要是 PGDATA）。workflow 侧改成 `docker rm -fv` 或给 service 加 `--tmpfs`
 #    可以从源头不产生，但这一步要一直留着兜底。见 05-workflow改造.md 与 09 章 A14。
 #    无标签过滤，**只在这台机专用于 CI 时安全**。若这台机还跑别的东西，给它的卷打标并改成 --filter "label!=keep"。
 docker volume prune -f >/dev/null 2>&1

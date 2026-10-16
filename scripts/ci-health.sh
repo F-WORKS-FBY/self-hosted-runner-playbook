@@ -15,10 +15,11 @@
 #
 # 上线一个月后补的三条（2026-10-16）：
 #
-#  ③ **磁盘阈值必须跟 BuildKit GC 对齐**。GC 的 Min Free（bootstrap 默认 20 GiB）就是设计上的
-#     稳态底线：缓存会一直长到把可用空间压到 20 GiB 附近为止。原来写死的 WARN<40G 于是每小时都响
-#     （一个月 309 次，没人看），CRIT<20000 MiB 又只比 GC 底线低 480 MiB。
-#     现在 WARN = Min Free + 1 GiB（GC 已经顶到底线、开始被非 Docker 的增长挤压），CRIT = 10 GiB。
+#  ③ **磁盘阈值必须跟 BuildKit GC 对齐**。缓存会长到 GC 的 Max Used（bootstrap 默认 20 GiB）才停，
+#     参考机上这时可用空间稳定在约 23 GiB —— 这是设计稳态，不该告警。原来写死的 WARN<40G 于是从第 5 周起
+#     每小时都响（一个月 309 次，没有送达任何人），CRIT<20000 MiB 又只比 GC 的 Min Free（20 GiB）低 480 MiB。
+#     现在 WARN = Min Free + 1 GiB：可用空间被 Docker 以外的增长挤到 Min Free 附近，GC 开始为保底而驱逐缓存；
+#     CRIT = 10 GiB。
 #  ④ **失败连续计数只算跑在本机上的 run**。原来统计全仓库，GitHub 托管的 PR 标题检查之类的失败
 #     也算进来 —— 2026-10-08 那次 CRIT 就是这么误报的。
 #  ⑤ **告警要送到人**。只写本机 journal 等于没告警。配了 CI_ALERT_WEBHOOK 就推飞书，
@@ -31,6 +32,10 @@ BASELINE_S="${CI_FIXEDWORK_BASELINE:-0}"  # preflight 给的 p50；为 0 则只�
 WARN_MB="${CI_DISK_WARN_MB:-21504}"       # bootstrap 按 BUILDKIT_MIN_FREE + 1 GiB 写进 cron.d
 CRIT_MB="${CI_DISK_CRIT_MB:-10240}"
 STATE_DIR="${CI_HEALTH_STATE_DIR:-/var/lib/ci-health}"
+# 阈值必须是 MiB 整数。写成「30G」之类会让下面的 [ -lt ] 静默失败、磁盘告警整个失效，所以改用默认值并报出来。
+CFG_ERR=""
+case "$WARN_MB" in ''|*[!0-9]*) CFG_ERR+=" CI_DISK_WARN_MB=$WARN_MB"; WARN_MB=21504 ;; esac
+case "$CRIT_MB" in ''|*[!0-9]*) CFG_ERR+=" CI_DISK_CRIT_MB=$CRIT_MB"; CRIT_MB=10240 ;; esac
 
 # 凭据与推送地址单独放一个 0600 的文件，不写进 /etc/cron.d/（那是 0644，全局可读）。
 #   GH_REPO=owner/repo
@@ -40,9 +45,16 @@ STATE_DIR="${CI_HEALTH_STATE_DIR:-/var/lib/ci-health}"
 # 旧版本把注册用的 GH_TOKEN 也写进了这个文件 —— 那通常是一个管理员级 token，
 # 而 runner 在 docker 组里（≈ root），任何 CI job 都读得到它。这里仍兼容旧变量名，
 # 但应尽快换成只读的 CI_HEALTH_GH_TOKEN。见 09 章 B12。
+#
+# 按 KEY=VALUE 逐行读、只认下面这几个键，**不 source**：密钥里出现 $ ` \ 空格之类字符时，
+# source 会把它们当 shell 代码解释（改写值，甚至执行）。
 CI_HEALTH_ENV="${CI_HEALTH_ENV:-/etc/ci-health.env}"
-# shellcheck disable=SC1090
-[ -r "$CI_HEALTH_ENV" ] && . "$CI_HEALTH_ENV"
+if [ -r "$CI_HEALTH_ENV" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}; k=${line%%=*}; v=${line#*=}
+    case "$k" in GH_REPO|GH_TOKEN|CI_HEALTH_GH_TOKEN|CI_ALERT_WEBHOOK|CI_ALERT_SECRET) printf -v "$k" '%s' "$v" ;; esac
+  done < "$CI_HEALTH_ENV"
+fi
 TOKEN="${CI_HEALTH_GH_TOKEN:-${GH_TOKEN:-}}"
 
 t=$(python3 - <<'PY' 2>/dev/null || echo 0
@@ -125,10 +137,11 @@ warn(){ ALERTS+=("$1|$2"); echo "$(date -Is) $2" >> "$LOG"; logger -t ci-health 
 awk -v t="${t:-0}" -v b="$BASELINE_S" 'BEGIN{ if (b+0 > 0 && t+0 > b*1.4) exit 1 }' \
   || warn contention "WARN vCPU 争抢：定长任务 ${t}s（基线 ${BASELINE_S}s）"
 if [ "${avail:-999999}" -lt "$CRIT_MB" ]; then
-  warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB —— 已低于 BuildKit GC 能维持的底线，非 Docker 的增长在吃盘"
+  warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB —— 已远低于 BuildKit GC 的 Min Free，GC 腾不出来了，是 Docker 以外的东西在吃盘"
 elif [ "${avail:-999999}" -lt "$WARN_MB" ]; then
-  warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB —— BuildKit 缓存已被压到 GC 底线，看看 Docker 以外是什么在涨"
+  warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB —— 已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存；看看 Docker 以外是什么在涨"
 fi
+[ -n "$CFG_ERR" ] && warn config "WARN 配置无效（应为 MiB 整数）：${CFG_ERR# } —— 已改用默认阈值"
 [ "$run" != "n/a" ] && [ "$run" != "active" ] && warn runner "CRIT runner 服务不是 active（当前 $run）"
 # 产出告警：服务 active 但 job 连红，正是 2026-09-07 那种「假绿」的唯一信号
 case "$jobs" in
@@ -140,20 +153,29 @@ esac
 
 # ── 推送（可选）────────────────────────────────────────────────────────
 # 只在告警集合变化时推（新出现、全部恢复），持续存在的每 24 小时提醒一次。
-# 签名与 metta-app 的 scripts/notify-lark.sh 同一套：以「时间戳 + 换行 + 密钥」为 key 对空消息做 HMAC-SHA256。
+# 签名算法与 metta-app 的 scripts/notify-lark.sh 相同：以「时间戳 + 换行 + 密钥」为 key 对空消息做 HMAC-SHA256。
+# 签名与推送都在 python 里做，密钥和地址只经环境变量传入：放进 openssl/curl 的命令行参数的话，
+# 本机任何用户都能从 /proc/<pid>/cmdline 读到。
 notify(){
   [ -n "${CI_ALERT_WEBHOOK:-}" ] || return 0
-  local text="$1" ts sign payload resp esc
-  ts=$(date +%s)
-  esc=$(printf '%s' "$text" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read())[1:-1])')
-  if [ -n "${CI_ALERT_SECRET:-}" ]; then
-    sign=$(printf '' | openssl dgst -sha256 -hmac "$ts
-$CI_ALERT_SECRET" -binary | openssl base64 -A)
-    payload=$(printf '{"timestamp":"%s","sign":"%s","msg_type":"text","content":{"text":"%s"}}' "$ts" "$sign" "$esc")
-  else
-    payload=$(printf '{"msg_type":"text","content":{"text":"%s"}}' "$esc")
-  fi
-  resp=$(curl -sS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" "$CI_ALERT_WEBHOOK" 2>&1) || resp="curl 失败：$resp"
+  local resp
+  resp=$(TEXT="$1" CI_ALERT_WEBHOOK="$CI_ALERT_WEBHOOK" CI_ALERT_SECRET="${CI_ALERT_SECRET:-}" python3 - <<'PY' 2>&1
+import base64, hashlib, hmac, json, os, time, urllib.request
+url, secret, text = os.environ["CI_ALERT_WEBHOOK"], os.environ.get("CI_ALERT_SECRET", ""), os.environ["TEXT"]
+body = {"msg_type": "text", "content": {"text": text}}
+if secret:
+    ts = str(int(time.time()))
+    body["timestamp"] = ts
+    body["sign"] = base64.b64encode(hmac.new(f"{ts}\n{secret}".encode(), b"", hashlib.sha256).digest()).decode()
+req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=15) as f:
+        print(f.read().decode(errors="replace"))
+except Exception as e:
+    print(f"请求失败：{type(e).__name__}: {e}")
+PY
+)
   # 飞书对签名错、关键词不符等也回 HTTP 200，成败只看返回体里的 code
   printf '%s' "$resp" | grep -Eq '"(code|StatusCode)"[[:space:]]*:[[:space:]]*0[^0-9]' && return 0
   echo "$(date -Is) WARN 告警推送失败：$resp" >> "$LOG"; return 1

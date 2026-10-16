@@ -47,7 +47,7 @@ steps:
 - **`--label` 的值必须和 bootstrap.sh 的 `CI_LABEL` 一模一样**，清理钩子第 1 步按它删「上一个 job 没删掉的容器」。
   （本模板原来写的是 `--label ci=1`，跟任何 `CI_LABEL` 都对不上。）
 - **`rm -fv` 不是 `rm -f`**：镜像声明了 `VOLUME`（minio、postgres、redis、prometheus 都声明了）就会建匿名卷，
-  `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目照抄后每个 job 漏 1 个卷。
+  `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目沿用了这个模板，每个起 minio 的 job 漏 1 个卷。
   **`docker run --rm` 救不了**：实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下——
   `--rm` 只在容器自己退出或被 `docker stop` 时生效。
 - 钩子**不是**只按 label 过滤：第 6 步是一条不带过滤的 `docker volume prune`（本模板原来说「绝不裸 prune」，不对）。
@@ -141,10 +141,11 @@ cache: ${{ vars.CI_RUNNER && '' || 'pnpm' }}     # ❌ 不成立
 
 ---
 
-### ⑥ 清理钩子在 job 被取消时不执行
+### ⑥ workflow 最后一步的清理在 job 被取消时不执行
 
-见 04 章 4.4。这里只强调自查点：**你的 workflow 里有 `cancel-in-progress: true` 吗？**
-有的话，任何写在最后一步的清理都会被跳过。用 `if: always()`，并在 runner 侧挂 `JOB_STARTED` 钩子兜底。
+自查点：**你的 workflow 里有 `cancel-in-progress: true` 吗？**
+有的话，写在最后一步、又没带 `if: always()` 的清理会被跳过。用 `if: always()`，并在 runner 侧挂 `JOB_STARTED` 钩子兜底。
+（runner 侧的 `JOB_COMPLETED` 钩子在 job 被取消时其实**会**执行，跑不到的是初始化阶段就被取消、或 runner 服务被停掉这两种情况，见 04 章 4.4。）
 
 ---
 
@@ -288,7 +289,7 @@ services:
     options: --tmpfs /data:size=64m
 ```
 ⚠️ **tmpfs 的路径必须是镜像声明的 VOLUME 路径**，用 `docker image inspect <镜像> --format '{{json .Config.Volumes}}'` 查。
-postgres 18 的镜像声明的是 `/var/lib/postgresql`，**不是**大家熟悉的 `/var/lib/postgresql/data`（那是 16 及以前的）。
+postgres 18 的镜像声明的是 `/var/lib/postgresql`，**不是**大家熟悉的 `/var/lib/postgresql/data`（那是 17 及以前的；18 起 PGDATA 在 `/var/lib/postgresql/<大版本>/docker`）。
 写错了不报错，只是卷照样建、照样漏。tmpfs 占内存（参考项目约 50–120 MB/job），记在容器的 cgroup 上，
 不在 runner 的 MemoryMax 里，但没有 swap 的机器上它占的是真内存，`size=` 必须写。
 

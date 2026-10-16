@@ -33,8 +33,10 @@ set -euo pipefail
 CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
 PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_HOME RUNNER_MEM_MAX BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB"
 if [ -r "$CI_RUNNER_ENV" ]; then
-  while IFS='=' read -r k v; do
-    case " $PERSIST_VARS " in *" $k "*) [ -z "${!k:-}" ] && printf -v "$k" '%s' "$v" ;; esac
+  # 「显式传入」按变量是否**设置过**判断（${!k+x}），所以 CI_APP_PORTS= 这样的空值也能覆盖文件里的值
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}; k=${line%%=*}; v=${line#*=}
+    case " $PERSIST_VARS " in *" $k "*) [ -z "${!k+x}" ] && printf -v "$k" '%s' "$v" ;; esac
   done < "$CI_RUNNER_ENV"
 fi
 GH_REPO="${GH_REPO:?必须设 GH_REPO，形如 owner/repo}"
@@ -52,13 +54,15 @@ CI_LABEL="${CI_LABEL:-com.ci.selfhosted=1}"   # 必须与 workflow 里 docker ru
 CI_APP_PORTS="${CI_APP_PORTS:-}"          # e2e 等会在**宿主**上监听的端口，清理时要杀孤儿。例：3100 3101
 CI_FIXEDWORK_BASELINE="${CI_FIXEDWORK_BASELINE:-0}"   # preflight --with-load 给的 p50；0 = 只记录不告警
 METADATA_IP="${METADATA_IP:-169.254.169.254}"
-# 磁盘告警阈值从 BuildKit 的 Min Free 推出来：GC 会让缓存一直长到可用空间只剩 Min Free 为止，
-# 那就是设计稳态，不该告警。WARN = Min Free + 1 GiB，CRIT = 10 GiB。
+# 磁盘告警阈值从 BuildKit 的 Min Free 推出来。缓存长到 Max Used 就停（参考机上此时可用约 23 GiB，
+# 那是设计稳态，不该告警）；可用空间被 Docker 以外的增长挤到 Min Free 附近时，GC 开始为保底而驱逐缓存，
+# 这才值得看一眼。WARN = Min Free + 1 GiB，CRIT = 10 GiB。
 # （改了 BUILDKIT_MIN_FREE 就把 /etc/ci-runner.env 里这两行一起改掉或删掉，否则沿用旧值。）
 to_mib(){ local v n; v=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]'); n=${v%%[!0-9]*}
   [ -n "$n" ] || return 0
-  case "${v#"$n"}" in G|GB|GIB) echo $((n * 1024)) ;; M|MB|MIB) echo "$n" ;; T|TB|TIB) echo $((n * 1048576)) ;; esac; }
+  case "${v#"$n"}" in G|GB|GIB) echo $((10#$n * 1024)) ;; M|MB|MIB) echo $((10#$n)) ;; T|TB|TIB) echo $((10#$n * 1048576)) ;; esac; }
 MINFREE_MIB=$(to_mib "$BUILDKIT_MIN_FREE")
+[ -n "$MINFREE_MIB" ] || echo "⚠️ 解析不了 BUILDKIT_MIN_FREE=$BUILDKIT_MIN_FREE（只认整数 + GB/GiB/MB/TB），磁盘 WARN 阈值按 20 GiB 推算" >&2
 CI_DISK_WARN_MB="${CI_DISK_WARN_MB:-$(( ${MINFREE_MIB:-20480} + 1024 ))}"
 CI_DISK_CRIT_MB="${CI_DISK_CRIT_MB:-10240}"
 
@@ -71,6 +75,11 @@ for a in "$@"; do
   esac
 done
 [ "$(id -u)" -eq 0 ] || { echo "必须 root 运行" >&2; exit 1; }
+# 有 job 在跑就别动：第 4 步可能重启 docker、第 6 步一定重启 runner，都会当场打断它；
+# 第 7 步试跑钩子时，钩子也会因为「有别的 job」而跳过，门禁就形同虚设。
+if pgrep -x Runner.Worker >/dev/null 2>&1 && [ "${FORCE_WHILE_BUSY:-0}" != 1 ]; then
+  echo "有 job 正在运行（Runner.Worker），等它跑完再执行；确实要强行执行就加 FORCE_WHILE_BUSY=1" >&2; exit 1
+fi
 
 # 把这次实际生效的参数落盘（不含任何密钥）
 { echo "# 由 bootstrap.sh 写入：本机实际生效的部署参数。重跑 bootstrap 时作为默认值读回。"
@@ -166,7 +175,7 @@ info "live-restore=$(docker info 2>/dev/null | grep -ci 'live restore enabled: t
 # needrestart：Ubuntu 的 APT 钩子默认会自动重启受影响的服务。
 # docker 在出厂免打扰名单里，但 containerd **不在** —— 而 Docker 29 的镜像与容器都由它承载。
 # runner 服务也不在：2026-10-02 06:06 一次 libssl 自动安全更新把 runner 在 job 中途重启，
-# 那个 job 当场被取消，只能重跑。豁免之后 runner 继续用旧库，直到下次重启（见 08 章「每月空闲时重启」）。
+# 那个 job 被当场打断（GitHub 上记为 Failed），只能重跑。豁免之后 runner 继续用旧库，直到下次重启（见 08 章「每月空闲时重启」）。
 # 文件名保留旧的 90-ci-containerd.conf，已部署的机器原地覆盖，不会留下两份。
 if [ -d /etc/needrestart ]; then
   mkdir -p /etc/needrestart/conf.d
@@ -217,7 +226,7 @@ if [ "$SKIP_RUNNER" = 0 ]; then
   [ -z "$SVC" ] && SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)" 2>/dev/null || echo "")
   info "服务单元：${SVC:-<未找到>}"
   # config.sh 生成的 .credentials / .runner 是 0664（只有 RSA 私钥文件是 0600）。收紧到属主可读写。
-  chmod 0600 "$RUNNER_HOME/.credentials" "$RUNNER_HOME/.runner" 2>/dev/null || true
+  chmod 0600 "$RUNNER_HOME/.credentials" "$RUNNER_HOME/.runner" "$RUNNER_HOME/.runner_migrated" 2>/dev/null || true
 fi
 
 # ──────────────────────────── 6. systemd 加固 ────────────────────────────
@@ -340,7 +349,7 @@ if [ -f "$SELF_DIR/ci-health.sh" ]; then
   info "健康监控已装（每小时 13 分；磁盘 WARN<${CI_DISK_WARN_MB}MB CRIT<${CI_DISK_CRIT_MB}MB）"
   grep -qE '^(CI_HEALTH_GH_TOKEN|GH_TOKEN)=.+' /etc/ci-health.env || info "  未配 CI_HEALTH_GH_TOKEN：job 产出采样为 skip"
   grep -qE '^GH_TOKEN=' /etc/ci-health.env && info "  ⚠️ /etc/ci-health.env 里有旧版写入的 GH_TOKEN（通常是注册用的管理员 token，CI job 读得到）——换成只读的 CI_HEALTH_GH_TOKEN 后删掉那一行"
-  grep -qE '^CI_ALERT_WEBHOOK=.+' /etc/ci-health.env || info "  未配 CI_ALERT_WEBHOOK：告警只写本机 journal，没人会看到"
+  grep -qE '^CI_ALERT_WEBHOOK=.+' /etc/ci-health.env || info "  未配 CI_ALERT_WEBHOOK：告警只写本机 journal，没有接收方"
 fi
 
 # journald 显式上限：默认是文件系统的 10%（最多 4 GiB），在 75 GB 的 CI 盘上不该给它这么多
