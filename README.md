@@ -65,7 +65,7 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 |---|---|---|
 | `scripts/preflight.sh` | 候选机自检 → GO/NO-GO。只读 | — |
 | `scripts/bootstrap.sh` | 装机 + 注册 + 加固。`--harden-ssh` 才动 SSH，`--skip-runner` 跳过注册 | ✅ |
-| `scripts/verify.sh` | 装完 / 重启后自检，输出 PASS/FAIL 表。只读 | — |
+| `scripts/verify.sh` | 装完 / 重启后自检，输出 PASS/FAIL 表。基本只读：会试跑一次清理钩子，有 job 在跑时自动跳过 | — |
 | `scripts/ci-cleanup.sh` | 清理钩子（由 bootstrap 安装到 runner 的 hooks/） | ✅ |
 | `scripts/ci-health.sh` | 每小时健康采点（由 bootstrap 安装到 /usr/local/bin/） | ✅ |
 | `scripts/make-single.sh` | 由分章生成单文件版 | ✅ |

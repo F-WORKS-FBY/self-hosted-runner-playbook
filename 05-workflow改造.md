@@ -36,14 +36,22 @@ env:
   #  · run_attempt 是真判据 —— re-run 时 run_id 不变
   #  · github.job 不可省 —— 同一个 run 里的两个 job 只到 run 级仍会自撞
   SVC_NAME: myservice-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+  CI_LABEL: com.myorg.ci=1          # 与 bootstrap.sh 的 CI_LABEL 完全一致
 steps:
   - run: |
-      docker rm -f "$SVC_NAME" 2>/dev/null || true      # 起前幂等
-      docker run -d --name "$SVC_NAME" --label ci=1 ...
+      docker rm -fv "$SVC_NAME" 2>/dev/null || true     # 起前幂等
+      docker run -d --name "$SVC_NAME" --label "$CI_LABEL" ...
   - if: always()                                         # 取消/失败也要清
-    run: docker rm -f "$SVC_NAME" 2>/dev/null || true
+    run: docker rm -fv "$SVC_NAME" 2>/dev/null || true
 ```
-`--label` 是给 runner 清理钩子用的：钩子只按 label 过滤，绝不裸 prune。
+- **`--label` 的值必须和 bootstrap.sh 的 `CI_LABEL` 一模一样**，清理钩子第 1 步按它删「上一个 job 没删掉的容器」。
+  （本模板原来写的是 `--label ci=1`，跟任何 `CI_LABEL` 都对不上。）
+- **`rm -fv` 不是 `rm -f`**：镜像声明了 `VOLUME`（minio、postgres、redis、prometheus 都声明了）就会建匿名卷，
+  `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目照抄后每个 job 漏 1 个卷。
+  **`docker run --rm` 救不了**：实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下——
+  `--rm` 只在容器自己退出或被 `docker stop` 时生效。
+- 钩子**不是**只按 label 过滤：第 6 步是一条不带过滤的 `docker volume prune`（本模板原来说「绝不裸 prune」，不对）。
+  它是匿名卷的兜底；workflow 侧写对 `-v`，就不必依赖它。service 容器的卷见 ⑫。
 
 ---
 
@@ -246,6 +254,46 @@ grep -rn 'image:' .github/workflows/ | grep -v '@sha256'  # 有几个镜像没�
 
 **怎么改**：action 钉 commit SHA + 开 dependabot；镜像钉 digest。
 
+### ⑫ 匿名卷：service 容器和自己起的容器都会留（上线一个月后补）
+
+**自查**
+```bash
+docker volume ls -q | wc -l                       # 在一台常驻 runner 上看；钩子没在跑的话会一直涨
+grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为空
+```
+
+**机制**：镜像声明了 `VOLUME`、启动时又没挂 `-v`/`--mount`/`--tmpfs`，Docker 就建一个匿名卷；
+删容器时不带 `-v` 卷就留下。两处来源：
+
+| 来源 | 谁删容器 | workflow 能改吗 |
+|---|---|---|
+| `services:` 里的 postgres / redis | **runner 自己**，`docker rm --force`，不带 `-v` | 能，挂 tmpfs（见下） |
+| 步骤里 `docker run -d` 起的（minio、prometheus…） | workflow 的 `docker rm -f` | 能，改 `rm -fv`（见 ①） |
+
+参考项目每个用到数据库的 job 漏 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA。
+清理钩子的 `docker volume prune` 每个 job 前后都在回收，所以那台机器上卷数始终是 0——
+**但这是钩子在兜底，不是 workflow 写对了**。换一台没装钩子的常驻 runner，卷数就会一直涨。
+
+**怎么改**：给 service 容器挂 tmpfs，卷从源头就不产生（2026-10-16 在参考机上实测：postgres 正常启动、
+`docker inspect` 的 Mounts 为空、删容器后新增卷 0 个）：
+```yaml
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18@sha256:...
+    options: >-
+      --tmpfs /var/lib/postgresql:size=1g
+      --health-cmd "pg_isready -U app" ...
+  redis:
+    image: redis:7-alpine
+    options: --tmpfs /data:size=64m
+```
+⚠️ **tmpfs 的路径必须是镜像声明的 VOLUME 路径**，用 `docker image inspect <镜像> --format '{{json .Config.Volumes}}'` 查。
+postgres 18 的镜像声明的是 `/var/lib/postgresql`，**不是**大家熟悉的 `/var/lib/postgresql/data`（那是 16 及以前的）。
+写错了不报错，只是卷照样建、照样漏。tmpfs 占内存（参考项目约 50–120 MB/job），记在容器的 cgroup 上，
+不在 runner 的 MemoryMax 里，但没有 swap 的机器上它占的是真内存，`size=` 必须写。
+
+**顺带**：`docker build` 也打上 `--label "$CI_LABEL"`，清理钩子才能删掉过期的 CI 镜像（不打标时那条匹配 0 个）。
+
 ---
 
 ### 改造完的自查
@@ -255,6 +303,7 @@ grep -rn -- '--name '        .github/workflows/ | grep -v 'run_id'      # 应为
 grep -rn 'ports:'            .github/workflows/ | grep -v '127.0.0.1'  # 应为空
 grep -rn '/tmp/'             .github/workflows/                        # 应为空或已确认无害
 grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理步骤应该有
+grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
 ```
 
 ---

@@ -87,7 +87,7 @@ cat <<'TAIL'
 |---|---|
 | `scripts/preflight.sh` | 候选机自检 → GO/NO-GO。只读 |
 | `scripts/bootstrap.sh` | 装机 + 注册 + 加固。`--harden-ssh` 才动 SSH，`--skip-runner` 跳过注册。**幂等** |
-| `scripts/verify.sh` | 装完 / 重启后自检，输出 PASS/FAIL 表。只读 |
+| `scripts/verify.sh` | 装完 / 重启后自检，输出 PASS/FAIL 表。基本只读：会试跑一次清理钩子，有 job 在跑时自动跳过 |
 | `scripts/ci-cleanup.sh` | 清理钩子（bootstrap 装到 runner 的 hooks/） |
 | `scripts/ci-health.sh` | 每小时健康采点（bootstrap 装到 /usr/local/bin/） |
 | `scripts/analysis/` | 调研期测量工具：连通性采样、**排队仿真**、单步资源画像 |

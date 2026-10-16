@@ -11,12 +11,32 @@
 #
 # GH_TOKEN 只在**注册那一刻**用一次（换取 registration token），脚本不会把它写到任何文件里。
 # 建议用 fine-grained PAT，只给目标仓库的 Administration: read&write。用完即撤销。
+# （2026-09-14 到 10-16 的版本曾把它写进 /etc/ci-health.env 供监控用 —— 已改。
+#  监控用单独的只读 token：CI_HEALTH_GH_TOKEN。见 09 章 B12。）
+#
+# 可选：
+#   CI_HEALTH_GH_TOKEN=...   job 产出采样用的**只读** token（fine-grained，只授权这个仓库，Actions: read）
+#   CI_ALERT_WEBHOOK=...     告警推送到飞书自定义机器人；开了签名校验再加 CI_ALERT_SECRET=...
+#
+# 参数会落盘到 /etc/ci-runner.env（无密钥，0644）。重跑时没显式传的参数从那里读，
+# 所以**在已部署的机器上重跑只需 `bash bootstrap.sh`**，不必记得当初传过什么。
 #
 # ⚠️ --harden-ssh 默认**不做**。它是唯一可能把你锁在门外的动作，
 #    不该在无人值守的脚本里默认发生。见文末 harden_ssh 的注释。
 set -euo pipefail
 
 # ──────────────────────────── 参数（全部可用环境变量覆盖）────────────────────────────
+# ⚠️ 先读上次落盘的参数，再套默认值。顺序：本次显式传入 > /etc/ci-runner.env > 下面的默认值。
+#    不这么做的后果（2026-10 审计发现）：这台机实际用的 CI_LABEL、CI_APP_PORTS、基线都跟默认值不同，
+#    又没存在任何地方 —— 有人哪天直接重跑 bootstrap.sh，清理钩子就换成默认标签（按标签清理全部落空）、
+#    孤儿端口清理被关掉、争抢告警归零，而且什么都不报错。
+CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
+PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_HOME RUNNER_MEM_MAX BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB"
+if [ -r "$CI_RUNNER_ENV" ]; then
+  while IFS='=' read -r k v; do
+    case " $PERSIST_VARS " in *" $k "*) [ -z "${!k:-}" ] && printf -v "$k" '%s' "$v" ;; esac
+  done < "$CI_RUNNER_ENV"
+fi
 GH_REPO="${GH_REPO:?必须设 GH_REPO，形如 owner/repo}"
 RUNNER_NAME="${RUNNER_NAME:-ci-$(hostname -s)}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64,ci}"   # 建议再加一个项目专属标签
@@ -32,6 +52,15 @@ CI_LABEL="${CI_LABEL:-com.ci.selfhosted=1}"   # 必须与 workflow 里 docker ru
 CI_APP_PORTS="${CI_APP_PORTS:-}"          # e2e 等会在**宿主**上监听的端口，清理时要杀孤儿。例：3100 3101
 CI_FIXEDWORK_BASELINE="${CI_FIXEDWORK_BASELINE:-0}"   # preflight --with-load 给的 p50；0 = 只记录不告警
 METADATA_IP="${METADATA_IP:-169.254.169.254}"
+# 磁盘告警阈值从 BuildKit 的 Min Free 推出来：GC 会让缓存一直长到可用空间只剩 Min Free 为止，
+# 那就是设计稳态，不该告警。WARN = Min Free + 1 GiB，CRIT = 10 GiB。
+# （改了 BUILDKIT_MIN_FREE 就把 /etc/ci-runner.env 里这两行一起改掉或删掉，否则沿用旧值。）
+to_mib(){ local v n; v=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]'); n=${v%%[!0-9]*}
+  [ -n "$n" ] || return 0
+  case "${v#"$n"}" in G|GB|GIB) echo $((n * 1024)) ;; M|MB|MIB) echo "$n" ;; T|TB|TIB) echo $((n * 1048576)) ;; esac; }
+MINFREE_MIB=$(to_mib "$BUILDKIT_MIN_FREE")
+CI_DISK_WARN_MB="${CI_DISK_WARN_MB:-$(( ${MINFREE_MIB:-20480} + 1024 ))}"
+CI_DISK_CRIT_MB="${CI_DISK_CRIT_MB:-10240}"
 
 HARDEN_SSH=0; SKIP_RUNNER=0
 for a in "$@"; do
@@ -42,6 +71,13 @@ for a in "$@"; do
   esac
 done
 [ "$(id -u)" -eq 0 ] || { echo "必须 root 运行" >&2; exit 1; }
+
+# 把这次实际生效的参数落盘（不含任何密钥）
+{ echo "# 由 bootstrap.sh 写入：本机实际生效的部署参数。重跑 bootstrap 时作为默认值读回。"
+  echo "# 不含密钥。要改某个值：改这里再重跑，或重跑时用环境变量覆盖。"
+  for k in $PERSIST_VARS; do printf '%s=%s\n' "$k" "${!k}"; done
+} > "$CI_RUNNER_ENV"
+chmod 0644 "$CI_RUNNER_ENV"
 
 SVC=""   # runner 的 systemd 单元名，注册后填
 step(){ printf '\n\033[1m▶ %s\033[0m\n' "$*"; }
@@ -129,14 +165,19 @@ info "live-restore=$(docker info 2>/dev/null | grep -ci 'live restore enabled: t
 
 # needrestart：Ubuntu 的 APT 钩子默认会自动重启受影响的服务。
 # docker 在出厂免打扰名单里，但 containerd **不在** —— 而 Docker 29 的镜像与容器都由它承载。
+# runner 服务也不在：2026-10-02 06:06 一次 libssl 自动安全更新把 runner 在 job 中途重启，
+# 那个 job 当场被取消，只能重跑。豁免之后 runner 继续用旧库，直到下次重启（见 08 章「每月空闲时重启」）。
+# 文件名保留旧的 90-ci-containerd.conf，已部署的机器原地覆盖，不会留下两份。
 if [ -d /etc/needrestart ]; then
   mkdir -p /etc/needrestart/conf.d
   cat > /etc/needrestart/conf.d/90-ci-containerd.conf <<'EOF'
-# CI 机：别在 job 跑到一半时重启容器运行时。
+# CI 机：别在 job 跑到一半时重启容器运行时，也别重启 runner。
 # docker 已在出厂名单（needrestart.conf 的 override_rc 里有 qr(^docker) => 0），containerd 没有。
 $nrconf{override_rc}->{qr(^containerd)} = 0;
+# runner：自动重启会直接杀掉正在跑的 job（2026-10-02 实际发生过）。
+$nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;
 EOF
-  info "needrestart 已豁免 containerd"
+  info "needrestart 已豁免 containerd 与 runner"
 fi
 
 # ──────────────────────────── 5. runner 用户与注册 ────────────────────────────
@@ -175,6 +216,8 @@ if [ "$SKIP_RUNNER" = 0 ]; then
   SVC=$(systemctl list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null | awk '{print $1}' | head -1)
   [ -z "$SVC" ] && SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)" 2>/dev/null || echo "")
   info "服务单元：${SVC:-<未找到>}"
+  # config.sh 生成的 .credentials / .runner 是 0664（只有 RSA 私钥文件是 0600）。收紧到属主可读写。
+  chmod 0600 "$RUNNER_HOME/.credentials" "$RUNNER_HOME/.runner" 2>/dev/null || true
 fi
 
 # ──────────────────────────── 6. systemd 加固 ────────────────────────────
@@ -247,15 +290,22 @@ touch "$RUNNER_HOME/.env"
 for k in ACTIONS_RUNNER_HOOK_JOB_STARTED ACTIONS_RUNNER_HOOK_JOB_COMPLETED; do
   grep -q "^$k=" "$RUNNER_HOME/.env" || echo "$k=$RUNNER_HOME/hooks/ci-cleanup.sh" >> "$RUNNER_HOME/.env"
 done
-chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME/.env"
+chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME/.env"; chmod 0600 "$RUNNER_HOME/.env"
 info "钩子已挂：$(grep -c ACTIONS_RUNNER_HOOK "$RUNNER_HOME/.env") 个"
 
+# User=：钩子脚本归 runner 所有、runner 可写，原来这个 unit 却以 root 执行它。
+# 诚实地说这挡不住 CI job（runner 在 docker 组里，本来就 ≈ root），这一行的意义是：
+# 不以 root 运行低权限账户可写的脚本这条基本卫生，以及让 timer 与钩子两条路径的身份一致
+# （同样的文件权限、同样的 docker 访问，不会出现「钩子路径能跑、timer 路径因为身份不同而行为不同」）。
+# 撞上正在跑的 job 时钩子会自己跳过（见 ci-cleanup.sh 开头的守卫）。
 cat > /etc/systemd/system/ci-cleanup.service <<EOF
 [Unit]
 Description=CI docker cleanup (fallback: hooks do not run when a job is cancelled or the runner is killed)
 After=docker.service
 [Service]
 Type=oneshot
+User=$RUNNER_USER
+Group=$RUNNER_USER
 ExecStart=$RUNNER_HOME/hooks/ci-cleanup.sh
 EOF
 cat > /etc/systemd/system/ci-cleanup.timer <<'EOF'
@@ -274,18 +324,33 @@ info "ci-cleanup.timer $(systemctl is-active ci-cleanup.timer)"
 if [ -f "$SELF_DIR/ci-health.sh" ]; then
   sed "s#__RUNNER_SVC__#${SVC:-none}#" "$SELF_DIR/ci-health.sh" > /usr/local/bin/ci-health.sh
   chmod 0755 /usr/local/bin/ci-health.sh
-  printf 'CI_FIXEDWORK_BASELINE=%s\n13 * * * * root /usr/local/bin/ci-health.sh\n' "$CI_FIXEDWORK_BASELINE" > /etc/cron.d/ci-health
+  printf 'CI_FIXEDWORK_BASELINE=%s\nCI_DISK_WARN_MB=%s\nCI_DISK_CRIT_MB=%s\n13 * * * * root /usr/local/bin/ci-health.sh\n' \
+    "$CI_FIXEDWORK_BASELINE" "$CI_DISK_WARN_MB" "$CI_DISK_CRIT_MB" > /etc/cron.d/ci-health
   chmod 0644 /etc/cron.d/ci-health
-  # job 产出采样的凭据单独放 0600 文件 —— cron.d 是 0644，不能放 token。
-  # 没有 GH_TOKEN 也不影响安装，只是 jobs 那一项退化成 skip。
-  if [ -n "${GH_REPO:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
-    printf 'GH_REPO=%s\nGH_TOKEN=%s\n' "$GH_REPO" "$GH_TOKEN" > /etc/ci-health.env
-    chmod 0600 /etc/ci-health.env
-    info "健康监控已装（每小时 13 分，含 job 产出采样）"
-  else
-    info "健康监控已装（每小时 13 分；未提供 GH_TOKEN，job 产出采样为 skip）"
-  fi
+  # 凭据与推送地址放 0600 的 /etc/ci-health.env —— cron.d 是 0644，不能放密钥。
+  # **按键原地更新**，不整个覆盖：原来的版本每次重跑都会重写整个文件，把手工加的推送地址冲掉。
+  set_kv(){ local f=/etc/ci-health.env tmp; ( umask 077; touch "$f" ); tmp=$(umask 077; mktemp)
+    # 值经 ENVIRON 传入而不是 awk -v：-v 会解释反斜杠转义，密钥里有 \ 就被改掉
+    K="$1" V="$2" awk -F= '$1==ENVIRON["K"]{print ENVIRON["K"]"="ENVIRON["V"]; d=1; next} {print} END{if(!d) print ENVIRON["K"]"="ENVIRON["V"]}' "$f" > "$tmp"
+    mv "$tmp" "$f"; chmod 0600 "$f"; }
+  set_kv GH_REPO "$GH_REPO"
+  [ -n "${CI_HEALTH_GH_TOKEN:-}" ] && set_kv CI_HEALTH_GH_TOKEN "$CI_HEALTH_GH_TOKEN"
+  [ -n "${CI_ALERT_WEBHOOK:-}" ]   && set_kv CI_ALERT_WEBHOOK "$CI_ALERT_WEBHOOK"
+  [ -n "${CI_ALERT_SECRET:-}" ]    && set_kv CI_ALERT_SECRET "$CI_ALERT_SECRET"
+  info "健康监控已装（每小时 13 分；磁盘 WARN<${CI_DISK_WARN_MB}MB CRIT<${CI_DISK_CRIT_MB}MB）"
+  grep -qE '^(CI_HEALTH_GH_TOKEN|GH_TOKEN)=.+' /etc/ci-health.env || info "  未配 CI_HEALTH_GH_TOKEN：job 产出采样为 skip"
+  grep -qE '^GH_TOKEN=' /etc/ci-health.env && info "  ⚠️ /etc/ci-health.env 里有旧版写入的 GH_TOKEN（通常是注册用的管理员 token，CI job 读得到）——换成只读的 CI_HEALTH_GH_TOKEN 后删掉那一行"
+  grep -qE '^CI_ALERT_WEBHOOK=.+' /etc/ci-health.env || info "  未配 CI_ALERT_WEBHOOK：告警只写本机 journal，没人会看到"
 fi
+
+# journald 显式上限：默认是文件系统的 10%（最多 4 GiB），在 75 GB 的 CI 盘上不该给它这么多
+mkdir -p /etc/systemd/journald.conf.d
+NEW_JD=$'[Journal]\nSystemMaxUse=1G'
+if [ "$(cat /etc/systemd/journald.conf.d/50-ci-runner.conf 2>/dev/null)" != "$NEW_JD" ]; then
+  printf '%s\n' "$NEW_JD" > /etc/systemd/journald.conf.d/50-ci-runner.conf
+  systemctl restart systemd-journald
+fi
+info "journald 上限 1G"
 
 # ──────────────────────────── 8. 网络加固 ────────────────────────────
 step "8/8 挡住 CI 读云 metadata"

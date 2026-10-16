@@ -237,19 +237,23 @@ n=30  p50=0.51s  max=0.52s  max/p50=1.02   ⇒ 无实质争抢
 带 -t 重复构建同一镜像 3 次（每次改一行源码）：
   磁盘每次 +1.29 GB      悬空镜像恒为 0        ← 不是悬空镜像的锅
 docker image  prune  →  回收 0 MB
-docker buildx prune  →  回收 5896 MB          ← 主力
+docker buildx prune  →  回收 5896 MB          ← 攒了几天后的一次性回收量，不是持续效果（见下）
 docker volume prune  →  回收 634 MB           ← services 容器的匿名卷，约 70 MB/run
 ```
 
-容量估算：
-```
-稳态 ≈ 基线 + 每日增长
-每日增长 ≈ PR/日 × 碰镜像的比例 × 每次构建的 cache 增量 + PR/日 × 每 run 的匿名卷
-```
-> **参考项目**：基线 8.1 GB，日增 5.6 GB，配了每日清理后稳态 **13.7 GB / 74.8 GiB = 18%**。
+> ⚠️ **上线一个月后更正**：`buildx prune --filter until=24h` 在持续负载下几乎删不到东西（缓存 24 小时内都被用过），
+> 已从清理钩子里删掉。缓存的上限靠 daemon.json 的 GC 策略（4.1 节）。
 
-**别把「不清理会盘满」当成清理的理由**——BuildKit 自己有 GC 兜底（出厂 Min Free 13.97 GiB），
-盘不会满，会稳在 80% 左右。真正的理由是：①缓存被反复驱逐导致构建退化；②**匿名卷不在 BuildKit 管辖内，那部分才是无上界的**。
+容量估算——**别用「基线 + 日增」**，它只描述第一周：
+```
+稳态已用 ≈ 系统与工具链 + 在用镜像 + min(Max Used, 缓存工作集) + Docker 以外的东西
+稳态可用 ≈ max(Min Free, 盘总量 − 上式)
+```
+> **参考项目**：第一周 13.7 GB / 74.8 GiB = 18%，原稿把这个当成了稳态。实际第四周稳定在约 49 GB / 68%，
+> 可用空间停在 GC 的 Min Free（20 GiB）附近不再下降。详见 08 章 8.2。
+
+**别把「不清理会盘满」当成清理的理由**——BuildKit 自己有 GC 兜底，缓存不会无限长。
+真正的理由是：①缓存被反复驱逐导致构建退化；②**匿名卷不在 BuildKit 管辖内，Docker 以外的东西更没人管，那两部分才是无上界的**。
 
 ### 2.7 一张最低要求表（起点，按项目调）
 
@@ -414,9 +418,15 @@ Ubuntu 的 `unattended-upgrades` 默认每日跑，`needrestart` 的 APT 钩子�
 ```perl
 # /etc/needrestart/conf.d/90-ci-containerd.conf
 $nrconf{override_rc}->{qr(^containerd)} = 0;
+$nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;   # runner 自己（2026-10 补）
 ```
 
 （我第一版写了 docker + containerd 两条，其中 docker 那条是多余的。查一下你的机器再写。）
+
+> ⚠️ **runner 服务本身也要豁免**（上线后第 25 天补）。2026-10-02 06:06，一次 libssl 自动安全更新
+> 让 needrestart 把 runner 服务在 job 中途重启了，那个 job 当场被取消，只能重跑。
+> 豁免的代价是 runner 继续用旧库直到下次重启 —— 所以要配一条运维纪律：**每月找个没有 job 的时候重启一次机器**
+> （见 08 章 8.6）。`unattended-upgrades` 默认 `Automatic-Reboot "false"`，不会自己重启机器，这点不用改。
 
 ### 4.3 runner 的 systemd 加固
 
@@ -461,20 +471,30 @@ ACTIONS_RUNNER_HOOK_JOB_COMPLETED   ← 顺手
 ci-cleanup.timer（每日）             ← 兜底
 ```
 
-**为什么 `JOB_STARTED` 是主力**：`JOB_COMPLETED` 在 job 被 `cancel-in-progress` 取消时
-**根本不执行**。而取消是高频事件——参考项目历史最忙那天有 9 个 run 跑到一半被后续 push 取消。
-`JOB_STARTED` 对此免疫：它在**下一个** job 开始前跑，不管上一个是怎么结束的。
+**为什么 `JOB_STARTED` 是主力**：它在**下一个** job 开始前跑，不管上一个是怎么结束的。
+我原来写的理由是「`JOB_COMPLETED` 在 job 被 `cancel-in-progress` 取消时根本不执行」——
+**上线一个月的数据推翻了这句**：38 个被取消的 job **两个钩子都执行了**（runner 2.33x）。
+真正跑不到 `JOB_COMPLETED` 的是两种少见情况：job 在初始化阶段就被取消、runner 服务被停掉。
+结论不变（`JOB_STARTED` 仍是更可靠的那个），理由要改。
 
 **为什么还要 timer**：两个钩子在 **runner 进程被杀**时都不执行。
 
-清理脚本的关键（`scripts/ci-cleanup.sh`）：
+清理脚本的关键（`scripts/ci-cleanup.sh`），上线一个月（约 2200 个 job）后的实际作用：
 
-| 命令 | 实测回收 | 说明 |
+| 命令 | 作用 | 说明 |
 |---|---|---|
-| `docker image prune` | **0 MB** | Docker 29 重打同名 tag 不留悬空镜像，这条基本是摆设 |
-| `docker buildx prune --filter until=24h` | **5896 MB** | **主力**。Docker 29 已移除 `--keep-storage`，必须用 `--filter until=` |
-| `docker volume prune` | **634 MB** | services 容器的匿名 PGDATA/minio，约 70 MB/run |
+| `docker volume prune` | **每个 job 约 70 MB** | **唯一持续在回收的一步**。service 容器被 runner 用不带 `-v` 的 `rm --force` 删掉，留下匿名卷（主要是 PGDATA） |
+| `docker image prune`（悬空）+ 按 CI 标签的 `-a` | 换 pin 后的旧版本 | 带标签那条要 workflow 的 `docker build` 打标才匹配得到，否则匹配 0 个 |
+| ~~`docker buildx prune --filter until=24h`~~ | **已删** | 原表写它回收 5896 MB 是「主力」——那是攒了几天之后**一次性**清掉的量。持续负载下缓存 24 小时内都被用过，它几乎删不到东西，只在空闲一天以上后把缓存清空、让下一次构建变冷。缓存上限靠 4.1 节 daemon.json 里的 GC 策略 |
 | `fuser -k <app_ports>/tcp` | — | 上一次 run 的宿主孤儿进程（见 05 章「假绿」那条） |
+
+> ⚠️ **钩子要防「撞上正在跑的 job」**。runner 自己调钩子时本机只有这一个 job，没问题；
+> 但每日 timer、`verify.sh`、手工执行都可能正好撞上一个在跑的 job，而钩子会删掉它的容器、杀掉它的 e2e 进程。
+> 脚本开头的守卫：父进程不是 `Runner.Worker` 且有 `Runner.Worker` 在跑，就直接退出。
+> 判断「有没有 job」要用 `pgrep -x Runner.Worker`（按进程名精确匹配），别用 `-f`——
+> 后者匹配整条命令行，有人在 `grep Runner.Worker` 时就会误判。
+>
+> timer 的 unit 要写 `User=runner`：钩子文件归 runner 所有、runner 可写，不该以 root 执行它。
 
 > ⚠️ **绝不裸 `docker system prune`、绝不用不带 label 的 `-a`**。
 > 那会连基础镜像一起删，把「稳态 Docker Hub 消耗 ≈0」变回每次冷拉。
@@ -606,14 +626,22 @@ env:
   #  · run_attempt 是真判据 —— re-run 时 run_id 不变
   #  · github.job 不可省 —— 同一个 run 里的两个 job 只到 run 级仍会自撞
   SVC_NAME: myservice-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+  CI_LABEL: com.myorg.ci=1          # 与 bootstrap.sh 的 CI_LABEL 完全一致
 steps:
   - run: |
-      docker rm -f "$SVC_NAME" 2>/dev/null || true      # 起前幂等
-      docker run -d --name "$SVC_NAME" --label ci=1 ...
+      docker rm -fv "$SVC_NAME" 2>/dev/null || true     # 起前幂等
+      docker run -d --name "$SVC_NAME" --label "$CI_LABEL" ...
   - if: always()                                         # 取消/失败也要清
-    run: docker rm -f "$SVC_NAME" 2>/dev/null || true
+    run: docker rm -fv "$SVC_NAME" 2>/dev/null || true
 ```
-`--label` 是给 runner 清理钩子用的：钩子只按 label 过滤，绝不裸 prune。
+- **`--label` 的值必须和 bootstrap.sh 的 `CI_LABEL` 一模一样**，清理钩子第 1 步按它删「上一个 job 没删掉的容器」。
+  （本模板原来写的是 `--label ci=1`，跟任何 `CI_LABEL` 都对不上。）
+- **`rm -fv` 不是 `rm -f`**：镜像声明了 `VOLUME`（minio、postgres、redis、prometheus 都声明了）就会建匿名卷，
+  `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目照抄后每个 job 漏 1 个卷。
+  **`docker run --rm` 救不了**：实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下——
+  `--rm` 只在容器自己退出或被 `docker stop` 时生效。
+- 钩子**不是**只按 label 过滤：第 6 步是一条不带过滤的 `docker volume prune`（本模板原来说「绝不裸 prune」，不对）。
+  它是匿名卷的兜底；workflow 侧写对 `-v`，就不必依赖它。service 容器的卷见 ⑫。
 
 ---
 
@@ -816,6 +844,46 @@ grep -rn 'image:' .github/workflows/ | grep -v '@sha256'  # 有几个镜像没�
 
 **怎么改**：action 钉 commit SHA + 开 dependabot；镜像钉 digest。
 
+### ⑫ 匿名卷：service 容器和自己起的容器都会留（上线一个月后补）
+
+**自查**
+```bash
+docker volume ls -q | wc -l                       # 在一台常驻 runner 上看；钩子没在跑的话会一直涨
+grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为空
+```
+
+**机制**：镜像声明了 `VOLUME`、启动时又没挂 `-v`/`--mount`/`--tmpfs`，Docker 就建一个匿名卷；
+删容器时不带 `-v` 卷就留下。两处来源：
+
+| 来源 | 谁删容器 | workflow 能改吗 |
+|---|---|---|
+| `services:` 里的 postgres / redis | **runner 自己**，`docker rm --force`，不带 `-v` | 能，挂 tmpfs（见下） |
+| 步骤里 `docker run -d` 起的（minio、prometheus…） | workflow 的 `docker rm -f` | 能，改 `rm -fv`（见 ①） |
+
+参考项目每个用到数据库的 job 漏 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA。
+清理钩子的 `docker volume prune` 每个 job 前后都在回收，所以那台机器上卷数始终是 0——
+**但这是钩子在兜底，不是 workflow 写对了**。换一台没装钩子的常驻 runner，卷数就会一直涨。
+
+**怎么改**：给 service 容器挂 tmpfs，卷从源头就不产生（2026-10-16 在参考机上实测：postgres 正常启动、
+`docker inspect` 的 Mounts 为空、删容器后新增卷 0 个）：
+```yaml
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18@sha256:...
+    options: >-
+      --tmpfs /var/lib/postgresql:size=1g
+      --health-cmd "pg_isready -U app" ...
+  redis:
+    image: redis:7-alpine
+    options: --tmpfs /data:size=64m
+```
+⚠️ **tmpfs 的路径必须是镜像声明的 VOLUME 路径**，用 `docker image inspect <镜像> --format '{{json .Config.Volumes}}'` 查。
+postgres 18 的镜像声明的是 `/var/lib/postgresql`，**不是**大家熟悉的 `/var/lib/postgresql/data`（那是 16 及以前的）。
+写错了不报错，只是卷照样建、照样漏。tmpfs 占内存（参考项目约 50–120 MB/job），记在容器的 cgroup 上，
+不在 runner 的 MemoryMax 里，但没有 swap 的机器上它占的是真内存，`size=` 必须写。
+
+**顺带**：`docker build` 也打上 `--label "$CI_LABEL"`，清理钩子才能删掉过期的 CI 镜像（不打标时那条匹配 0 个）。
+
 ---
 
 ### 改造完的自查
@@ -825,6 +893,7 @@ grep -rn -- '--name '        .github/workflows/ | grep -v 'run_id'      # 应为
 grep -rn 'ports:'            .github/workflows/ | grep -v '127.0.0.1'  # 应为空
 grep -rn '/tmp/'             .github/workflows/                        # 应为空或已确认无害
 grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理步骤应该有
+grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
 ```
 
 ---
@@ -978,6 +1047,11 @@ GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
 
 **重启之后也跑这一条就够了**——它逐项核对开机恢复路径是否真的自愈了。
 
+> ⚠️ **它不是纯只读的**。「钩子实跑」那条会真的执行一次清理钩子：删带 CI 标签的容器、删 minio、
+> 杀 e2e 端口上的进程。有 job 在跑时执行就是把那个 job 打断。所以脚本会先看有没有 `Runner.Worker` 进程，
+> 有就把这条和「无残留容器」标成 **SKIP**。看到 SKIP 说明当时机器在忙，等空闲再跑一次拿完整结果。
+> （这个脚本原来自称「只读」，08 章又把它列为日常巡检——2026-10-16 才发现两者叠在一起是个陷阱。）
+
 ### 7.1 `verify.sh` 查什么
 
 | 分组 | 项 | 不通过意味着 |
@@ -985,10 +1059,11 @@ GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
 | 服务与开机自启 | docker / containerd / runner 三个 unit `active + enabled` | 重启后回不来 |
 | runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust≥500`、`After=docker` | 见 04 章各条的后果 |
 | Docker | `live-restore=true`、BuildKit GC 有 **Max Used 与 Min Free 两项** | 只有 Reserved 说明你用了 `defaultKeepStorage`，Min Free 保护丢了 |
-| 清理与监控 | **钩子按 `bash -e` 实跑一次能退出 0**、占位符已替换、清理脚本在、**两个钩子都挂**、timer active、监控量的是 `/var/lib/containerd` | 钩子在 `-e` 下非零 = **每个 job 全红**（见下方 ⚠️）；只挂 COMPLETED = 取消时不清理；量 `/var/lib/docker` = 假绿灯 |
+| 清理与监控 | **钩子按 `bash -e` 实跑一次能退出 0**（有 job 时 SKIP）、钩子带运行中 job 守卫、占位符已替换、清理脚本在、**两个钩子都挂**、timer active 且以 runner 身份运行、监控量的是 `/var/lib/containerd`、磁盘阈值与 GC 对齐、告警推送已配 | 钩子在 `-e` 下非零 = **每个 job 全红**（见下方 ⚠️）；没守卫 = timer 撞上 job 会删它的容器；阈值没对齐 = 每小时误报；没配推送 = 告警没人看 |
+| 部署参数与系统更新 | `/etc/ci-runner.env` 存在且与钩子的 CI 标签一致、needrestart 豁免 runner、有没有待重启的更新 | 参数没落盘 = 下次重新部署静默改回默认值；没豁免 = 安全更新在 job 中途重启 runner |
 | 网络加固 | DOCKER-USER + OUTPUT 两条 metadata 规则、已持久化、**实拨容器验证** | 少一条就有一条路通 |
 | SSH | 口令登录是否关闭 | — |
-| 干净度 | 无残留容器、磁盘余量 | 清理没生效 |
+| 干净度 | 无残留容器（有 job 时 SKIP）、匿名卷没有累积、磁盘余量 | 清理没生效 |
 | GitHub 侧 | runner `online` | 注册或网络问题 |
 
 > ⚠️ **为什么「清理与监控」那一行的第一项是「实跑一次」而不是「文件在不在」**
@@ -1142,18 +1217,45 @@ r = simulate(events, svc)
 
 | 来源 | 谁管 | 不管会怎样 |
 |---|---|---|
-| BuildKit build cache | `docker buildx prune` + BuildKit 自己的 GC | 缓存被反复驱逐 ⇒ 构建从 1 秒退回 60 秒 |
-| 匿名卷（services 容器的数据） | **只有** `docker volume prune` | **无上界**，约 70 MB/run |
-| 镜像 | `docker image prune`（实测回收 0，因为不留悬空镜像） | 基本不涨 |
+| BuildKit build cache | **daemon.json 的 GC 策略**（Reserved / Max Used / Min Free） | 缓存长到 Max Used 或把可用空间压到 Min Free 为止，然后 GC 开始驱逐 |
+| 匿名卷（services 容器的数据） | **只有** `docker volume prune`（清理钩子每个 job 前后各一次） | **无上界**，约 70 MB/job |
+| 镜像 | 悬空的由钩子清；**换掉的旧 pin 没人清**，要人工退役 | 慢慢攒，参考项目一个月攒了约 2 GB |
+| Docker 以外 | 没人管 | IDE 远程服务端、旧检出、包管理器缓存……参考项目一个月涨了约 8 GB |
 
-**「不清理会盘满」通常是错的**——BuildKit 有 Min Free 兜底，盘会稳在 80% 左右而不是满。
-真正的理由是上表右列。**但匿名卷不在 BuildKit 管辖内，那部分才是真正无上界的。**
+**「不清理会盘满」通常是错的**——BuildKit 的 GC 兜底，缓存不会无限长。
+**但匿名卷不在 BuildKit 管辖内，Docker 以外的东西更没人管，那两部分才是真正无上界的。**
+
+**上线一个月的实测**（参考项目，75 GB 盘，GC 设 Reserved 10 GiB / Max Used 20 GiB / Min Free 20 GiB，约 2200 个 job）：
+
+| 时间 | 已用 | 可用 | 说明 |
+|---|---|---|---|
+| 第 1 周 | ~18 GB | ~57 GB | 原稿写的「稳态 13.7 GB / 18%」是这个阶段，**不是稳态** |
+| 第 4 周 | ~49 GB（68%） | ~23.5 GB，连续 5 天不再下降 | 真正的稳态：BuildKit 缓存长满约 20 GiB，被 Min Free 顶住 |
+| 清理之后 | ~39 GB（54%） | ~34 GB | 删掉 IDE 旧服务端 2.8 GB、旧检出与 pnpm store 3.4 GB、不再引用的镜像 2.0 GB |
+
+稳态估算公式（比「基线 + 日增」可靠）：
+```
+稳态已用 ≈ 系统与工具链 + 在用镜像 + min(Max Used, 缓存工作集) + Docker 以外的东西
+稳态可用 ≈ max(Min Free, 盘总量 − 上式)
+```
+缓存工作集由构建频率与层序决定（见 8.4）；它填满 Max Used 之后，**可用空间会停在 Min Free 附近，这是设计行为，不是告警**。
 
 监控要点（`scripts/ci-health.sh`）：
 - 量 **`/var/lib/containerd`**，不是 `/var/lib/docker`。Docker 29 默认用 containerd 快照器，
   实测 containerd 2.6 G vs docker 115 M——量错目录会低估约 10 倍，是另一种假绿灯。
 - 匿名卷在 `/var/lib/docker/volumes`，**单独量**。
+- **磁盘阈值从 Min Free 推，不要拍脑袋**。原版写死 WARN < 40 GB、CRIT < 20000 MB：前者在设计稳态下
+  每小时都响（一个月 309 次，没人看），后者只比 Min Free（20480 MiB）低 480 MiB。
+  现在 WARN = Min Free + 1 GiB（GC 已经顶到底线、开始被 Docker 以外的增长挤压），CRIT = 10 GiB。
+  bootstrap 自动从 `BUILDKIT_MIN_FREE` 算出来写进 `/etc/cron.d/ci-health`。
+- **告警要送到人**。只写本机 journal 等于没告警。`/etc/ci-health.env` 里配 `CI_ALERT_WEBHOOK`
+  （飞书自定义机器人）后，告警集合一变化就推送，持续存在的每 24 小时提醒一次。
+- 失败连续计数**只算跑在本机上的 run**。统计全仓库会把 GitHub 托管的检查（PR 标题之类）也算进来。
 - 看**增量**不只看水位：日增超过预期两倍就该查是不是哪个构建的层序坏了。
+
+> ⚠️ **CI 机上别常驻开发工具，或者把它们算进磁盘和内存预算**。参考机上 VS Code 远程服务端每次客户端升级
+> 就多一份（约 650 MB），一个月攒了 5 份；它和 AI 助手一起常驻约 2–3 GB 内存，而这台机没有 swap、
+> runner 又被设成 OOM 时第一个被杀。偶尔连上来排查可以，用完断开。
 
 ### 8.3 CPU 争抢监控
 
@@ -1183,6 +1285,31 @@ COPY apps ./apps
 ⚠️ **必须实测三件事**再合：①构建成功；②改一行源码后温重建 <10 秒；③**镜像连真依赖起得来**
 （`docker run` 起容器打健康端点，不只是 `import` 一下）。
 
+**上线一个月后的复盘：层序改对了，缓存依据还没改对**（参考项目，2026-10）
+
+上面的改法把源码挪到了 install 之后，但 install 层的缓存依据是**整份清单**，不只是 lockfile。两件事让它重新退化：
+
+1. **根 `package.json` 里有 `scripts`**。团队每加一个 npm 脚本，install 层就作废。参考项目 9 月下旬起根 `package.json`
+   被改了 55 次，**50 次只改了 scripts**，同期 lockfile 只变了 7 次。两周里 api 镜像冷构建 89/177 次。
+2. **按应用传的构建参数放在 install 前面**（`ARG APP_FILTER` + `--filter ${APP_FILTER}`）。api 和 worker 两个镜像
+   于是各存一份 install 层——实测两份内容只差 15 个文件条目（共约 99,000），是**同一份依赖存了两遍**。
+   BuildKit 缓存 23.6 GB 里 98% 是这些 install 层。
+
+改法：
+```dockerfile
+# ① install 不带按应用的参数：所有 node 应用共用一份依赖层
+RUN pnpm install --frozen-lockfile --filter @app/api... --filter @app/worker... --filter <root>
+ARG APP_FILTER          # 需要的话放到 install 之后
+# ② 缓存依据去掉 scripts：前置阶段把各 package.json 的 scripts 字段删掉再 COPY 进来做 install，
+#    install 之后在源码层再 COPY 一次完整的 package.json
+```
+⚠️ 别指望 `pnpm fetch` + `--offline` 解决：实测冷构建 65 秒里下载只占约 13 秒，大头是**导出和解包** 1.15 GB 的
+node_modules 层（约 50 秒）。只有「别让它失效」和「别存两份」管用。
+
+收益要说实话：这**不是正确性问题**。参考项目上它值每周约 1 小时 runner 时间（CI 总时长的约 3.6%），
+以及让 BuildKit 的 Max Used 可以从 20 GiB 降下来、腾出 10 GB 以上磁盘。**先改 Dockerfile，再降 Max Used**，
+顺序反过来只会让构建更冷。
+
 ### 8.5 什么时候该加第二台机器
 
 信号（任一命中就该算账了）：
@@ -1200,11 +1327,27 @@ COPY apps ./apps
 ### 8.6 日常巡检
 
 ```bash
-bash scripts/verify.sh                    # 全面自检
-tail -20 /var/log/ci-health.log           # 采点趋势
+bash scripts/verify.sh                    # 全面自检（有 job 在跑时部分项会 SKIP，空闲时再跑拿完整结果）
+tail -20 /var/log/ci-health.log           # 采点趋势：可用空间、job 连续失败、runner 内存峰值
 docker system df                          # 磁盘构成
 systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 ```
+
+**每月一次，找个没有 job 的时候**（`pgrep -x Runner.Worker` 为空）：
+
+1. **重启机器**。needrestart 已经豁免了 runner（4.2 节），安全更新装上了但 runner 还在用旧库，
+   内核更新更是必须重启才生效。参考机上线 5 周没重启过，攒了 3 个新内核和一次 libc6。
+   先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job。`live-restore` 与 `Restart=always` 会让一切自己回来，
+   回来后跑 `verify.sh`。重启后 `apt autoremove --purge` 清掉旧内核。
+2. **退役旧镜像**。workflow 换了 pin 之后旧版本没人删（钩子只删悬空的和打了 CI 标签的）：
+   ```bash
+   docker images --digests          # 对照 workflow 里实际引用的 image@sha256，删掉不再引用的
+   docker image rm <旧镜像>          # 不带 -f：还有容器在用的话 Docker 会拒绝
+   ```
+   ⚠️ 别用 `docker image prune -a --filter until=...` 代劳：until 按镜像**创建**时间算，
+   一个两年前构建、今天还在用的 pin 会被删掉。
+3. **看一眼 Docker 以外的增长**：`du -sh /root/.vscode-server /root/.cursor-server /home/*/.cache` 之类。
+   VS Code 远程服务端可以只留正在用的那一份（`ls ~/.vscode-server/cli/servers/`，进程在用的那个之外都能删）。
 
 ---
 
@@ -1346,6 +1489,45 @@ sed -e "s#__CI_APP_PORTS__#${CI_APP_PORTS}#" ...
 if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 ```
 
+### A13. 自动安全更新会在 job 中途重启 runner 服务
+
+**2026-10-02 06:06，上线第 25 天。**
+
+```
+06:05:55  Starting apt-daily-upgrade.service
+06:06:00  unattended-upgrade：libssl3t64 / openssl 3.0.13-0ubuntu3.15 → 3.16
+06:06:05  Stopping actions.runner.…service      ← needrestart 判定它用了旧 libssl
+```
+
+当时正在跑的 job（`adal-fixtures (2)`）当场被取消，只能重跑。A5 只豁免了 containerd，
+**runner 服务本身也在 needrestart 的自动重启范围里**，而它恰恰是最不能在 job 中途重启的那个。
+
+**修法**：`$nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;`（bootstrap.sh 已加）。
+代价是 runner 继续用旧库，所以要配「每月空闲时重启」（08 章 8.6）。
+
+**教训**：豁免名单要按「job 依赖的常驻进程」逐个过，不是只看容器运行时。
+
+### A14. 匿名卷：`docker rm -f` 留卷、`--rm` 救不了、runner 删 service 容器也留卷
+
+镜像声明了 `VOLUME`、启动时又没挂 `-v`/`--mount`/`--tmpfs`，Docker 就建一个匿名卷。删容器时：
+
+| 删法 | 卷 |
+|---|---|
+| `docker rm -f`（不带 `-v`） | **留下** |
+| `docker run -d --rm` 起、`docker rm -f` 删 | **留下**（实测。`--rm` 只在容器自己退出或 `docker stop` 时生效） |
+| `docker rm -fv` | 删掉 |
+| runner 删 `services:` 容器（`docker rm --force <id>`） | **留下** —— workflow 管不到这条命令 |
+
+参考项目每个用数据库的 job 留 3 个（postgres + redis + minio），约 70 MB，大头是 PGDATA。
+清理钩子的 `docker volume prune` 一直在兜底，一个月约 2200 个 job 后卷数仍是 0——
+但这是钩子的功劳，换一台没装钩子的常驻 runner 就会一直涨。
+
+**从源头不产生**：步骤里起的容器改 `rm -fv`；service 容器在 `options:` 里挂 `--tmpfs <VOLUME 路径>`。
+⚠️ 路径要用镜像实际声明的：postgres 18 是 `/var/lib/postgresql`，**不是** `/var/lib/postgresql/data`。
+写错了不报错，卷照漏。（05 章 ⑫）
+
+**为什么 playbook 自己漏了**：05 章 ① 的模板就写的 `docker rm -f`，参考项目照抄了。
+
 ---
 
 ## B. 我们自己判断错的地方
@@ -1459,6 +1641,77 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 最后一层讽刺值得记下来：MSN-0035 正是**在故障开始那天**以「已完成 / 关键假设 12 成立 / 24 PASS 0 FAIL」收尾的。
 **验收通过和系统可用，在那一刻是两件事，而我们只测了前者。**
 
+### B11. 告警阈值拍脑袋 → 设计稳态下每小时误报 → 没人看 → 真告警也没人看
+
+`ci-health.sh` 原来写死：可用 < 40 GB 报 WARN，< 20000 MB 报 CRIT。而 BuildKit GC 的 Min Free 设的是 20 GiB——
+缓存会一直长到可用空间只剩 20 GiB 为止，**那就是设计稳态**。结果：
+
+- WARN 从第 4 周起**每小时**响，一个月 309 次；
+- CRIT 只比 GC 底线（20480 MiB）低 480 MiB，稍一波动就会误报；
+- 这些告警只写本机 journal，没有任何人或系统在读。06 章说的心跳告警也从没部署；
+- 同期真正的 3 次 CRIT（job 连续失败）同样没人看到，其中 10-08 那次还是误报：
+  统计的是全仓库的 run，把 GitHub 托管的 PR 标题检查失败也算了进来。
+
+**教训**：
+> **阈值从系统自己的设计平衡点推出来，不要从「感觉多少算少」推。** 一个在正常状态下就会响的告警，
+> 会训练所有人忽略它——包括它真正该响的那一次。
+> **告警的定义包括它送到谁手里。** 写进本机日志的告警，等于没有告警。
+
+### B12. 把管理员 token 落在了 CI 机上（2026-09-14 修 A11 时由我引入）
+
+给 `ci-health.sh` 加 job 产出采样时，我把**注册 runner 用的那个 PAT** 写进了 `/etc/ci-health.env`，
+理由是「文件 0600、只有 root 能读」。那是一个 classic token，权限包括 `admin:org`、`delete_repo`、`workflow`。
+
+**0600 在 CI 机上不是边界**：runner 在 docker 组里（≈ root），任何 CI job——包括 `pnpm install` 时
+某个依赖的 postinstall 脚本——都可以 `docker run -v /etc:/h …` 读到它。同一个 token 还嵌在机器上
+几个 git 检出的 remote URL 里。另外它有过期日，过期后采样会静默退化。
+
+**修法**：bootstrap 不再把 `GH_TOKEN` 写进任何文件；采样改用单独的 `CI_HEALTH_GH_TOKEN`
+（fine-grained，只授权这一个仓库，`Actions: read`）；采样失败（401/403）会告警而不是静默跳过。
+已部署的机器要撤销旧 token、换上只读 token、删掉 `/etc/ci-health.env` 里的 `GH_TOKEN` 行。
+
+**教训**：
+> **CI 机上没有「只有 root 能读」这回事。** 落在这台机器磁盘上的任何东西，都要按「CI job 读得到」来设计。
+> 给监控用的凭据，按它真正需要的最小权限单独申请，不要顺手复用手边最大的那个。
+
+### B13. 把一次性回收量当成持续效果
+
+原稿测了一次 `docker buildx prune --filter until=24h`，回收 5896 MB，于是在三处文档里写它是清理「主力」。
+那是攒了几天缓存之后**一次性**清掉的量。上线后持续负载下，缓存 24 小时内都被用过，它每次只能删 0.05–0.07 GB；
+真正卡住缓存上限的是 daemon.json 的 GC。反过来，表里写着「回收 0 MB」的 `image prune` 在换镜像 pin 之后开始有用，
+而真正一直在干活的 `volume prune`（每个 job 约 70 MB）被排在了最后。
+
+**教训**：
+> **清理措施的效果要按稳态下的速率量，不是按攒了一阵之后清一次的总量量。** 前者告诉你它每天在做什么，
+> 后者只告诉你它第一次跑的时候有多少东西可删。
+
+### B14. 自检脚本自称只读，却会打断正在跑的 job（2026-09-14 由我引入）
+
+修 A11 时我给 `verify.sh` 加了「真的执行一次钩子」这条检查（B10 的教训），却没改脚本头上「只读，不改任何东西」那句。
+而钩子会删 CI 容器、杀 e2e 端口——08 章又把 `verify.sh` 列为日常巡检。有 job 时跑一次，那个 job 就被打断。
+每日 timer 也有同样的问题。
+
+修的时候又踩了两个**测试本身**的坑，值得记下：
+
+- 用 `pgrep -f Runner.Worker` 判断「有没有 job」，结果匹配到了**我自己测试命令的命令行**，空闲时也判成忙。改 `pgrep -x`。
+- 测试副本放在 `/tmp` 并 `chown` 给了 runner；Ubuntu 默认 `fs.protected_regular=2`，**root 也不能覆盖写**粘滞目录里
+  别的用户的文件，于是之后每次重新生成都静默失败，测的一直是最早那个旧版本——有一轮「通过」是假的。
+
+**教训**：
+> **给一个「只读」工具加主动探测，要么加守卫，要么改掉它的名字和说明。** 两边的说法不一致就是陷阱。
+> **测试通过时先确认它测到的是新代码**（比如 grep 一下被测文件里有没有你刚加的那行），尤其是测试结果和预期一致的时候。
+
+### B15. 部署脚本幂等，但参数不落盘
+
+`bootstrap.sh` 号称幂等、可以重跑，但 `CI_LABEL`、`CI_APP_PORTS`、基线这些参数只在命令行上传一次，哪里都没存。
+参考机的实际值跟默认值全都不同。谁要是哪天直接重跑 `bootstrap.sh`，清理钩子就换成默认标签（按标签清理全部落空）、
+孤儿端口清理被关掉、争抢告警归零——而且什么都不报错。
+
+**修法**：参数落盘到 `/etc/ci-runner.env`，重跑时作为默认值读回；`verify.sh` 核对钩子里的标签与落盘值一致。
+
+**教训**：
+> **「可以重跑」的前提是「重跑时知道上次是怎么跑的」。** 幂等说的是操作，不是参数。
+
 ---
 
 ## C. 有争议但我没采纳的建议
@@ -1468,7 +1721,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 | 建议 | 为什么没采纳 |
 |---|---|
 | **把 4 个 job 合并成 1 个** | 三个独立方案都这么建议，论证也对（N=1 上 job 只排队不并行）。但仿真显示它买到的排队改善与「修 Dockerfile 层序 + 去 cache」**等效**（11.7 vs 11.2 分钟），而后者不动一行文档、不破坏回退时的并行。在提速之上再合并只多买 2.2–2.6 分钟，不值 10 处文档改动。 |
-| **`docker image prune` 是清理主力** | 实测回收 **0 MB**。Docker 29 重打同名 tag 不留悬空镜像。主力是 `buildx prune`。 |
+| **`docker image prune` 是清理主力** | 实测回收 **0 MB**。Docker 29 重打同名 tag 不留悬空镜像。（原文接着说「主力是 `buildx prune`」——这半句也错了，见 B13：持续负载下真正一直在回收的是 `volume prune`，缓存上限靠 GC。） |
 | **metadata 泄露 root 口令 = 阻塞项** | 机制属实，但把口令与 `/etc/shadow` 的 hash 逐位比对后**不匹配**——是陈旧凭据。降级为「高」。**判定「凭据泄露」之前先验证那个凭据还有效。** |
 | **零下载的 `docker build` 也扣 Docker Hub 配额** | 试着复现，**没能复现**（6 次操作计数一格未动）。记录在案但不采纳。 |
 
@@ -1483,7 +1736,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 |---|---|
 | `scripts/preflight.sh` | 候选机自检 → GO/NO-GO。只读 |
 | `scripts/bootstrap.sh` | 装机 + 注册 + 加固。`--harden-ssh` 才动 SSH，`--skip-runner` 跳过注册。**幂等** |
-| `scripts/verify.sh` | 装完 / 重启后自检，输出 PASS/FAIL 表。只读 |
+| `scripts/verify.sh` | 装完 / 重启后自检，输出 PASS/FAIL 表。基本只读：会试跑一次清理钩子，有 job 在跑时自动跳过 |
 | `scripts/ci-cleanup.sh` | 清理钩子（bootstrap 装到 runner 的 hooks/） |
 | `scripts/ci-health.sh` | 每小时健康采点（bootstrap 装到 /usr/local/bin/） |
 | `scripts/analysis/` | 调研期测量工具：连通性采样、**排队仿真**、单步资源画像 |
