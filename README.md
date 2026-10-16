@@ -1,3 +1,17 @@
+<p align="center">
+  <img src="assets/banner.svg" width="100%" alt="自建 GitHub Actions CI runner 部署手册：preflight、bootstrap、verify、改 workflow、接线、测试 PR；runner 接 job，每个 job 前后由 ci-cleanup.sh 清理，ci-health 每小时巡检并推送飞书">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/GitHub_Actions-self--hosted_runner-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="GitHub Actions self-hosted runner">
+  <img src="https://img.shields.io/badge/actions%2Frunner-2.337.0-24292F?style=flat-square&logo=github&logoColor=white" alt="actions/runner 2.337.0">
+  <img src="https://img.shields.io/badge/Ubuntu-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Ubuntu">
+  <img src="https://img.shields.io/badge/Docker_29-containerd_snapshotter-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker 29 + containerd snapshotter">
+  <img src="https://img.shields.io/badge/scripts-bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white" alt="scripts: bash">
+  <img src="https://img.shields.io/badge/verify.sh-34_PASS_%2F_0_FAIL-2EA043?style=flat-square" alt="verify.sh 34 PASS / 0 FAIL">
+  <img src="https://img.shields.io/badge/%E6%89%8B%E5%86%8C-9_%E7%AB%A0-30363D?style=flat-square" alt="手册 9 章">
+</p>
+
 # 自建 GitHub Actions CI runner 部署手册
 
 这份手册的用途：换服务器时不必重新调研一遍，跑两个脚本、对一遍验收表就能到位。
@@ -38,17 +52,56 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 # 6. 连开两个测试 PR，再手动触发一次定时 workflow
 ```
 
-**第 4 步是唯一不能跳过的人工步骤。**
+| 步骤 | 做什么 | 怎么做 |
+|---|---|---|
+| 1 – 3 | 机器配置 | `preflight.sh` → `bootstrap.sh` → `verify.sh` |
+| 4 | 改 workflow | 人工，对照 [05 章](05-workflow改造.md) |
+| 5 | 接线 | 设置仓库变量 `CI_RUNNER` |
+| 6 | 验证 | 两个测试 PR，加一次手动触发的定时 workflow |
 
-- 第 1 到 3 步是机器配置。
-- 第 4 步要把仓库里那些「只在一次性 VM 上成立」的写法找出来改掉。失败真正会发生在这里。
+> [!IMPORTANT]
+> **第 4 步是唯一不能跳过的人工步骤。**
+>
+> - 第 1 到 3 步是机器配置。
+> - 第 4 步要把仓库里那些「只在一次性 VM 上成立」的写法找出来改掉。失败真正会发生在这里。
 
 ---
 
 ## 手册里没有、但你必须自己做的两件事
 
-1. 配云防火墙（04 章 4.7）。这一步只能在云厂商控制台里配。Docker 会自己写 DNAT 规则，绕过宿主机的 ufw。能挡住这类流量的只有云防火墙这一层。
-2. 撤销注册用的 PAT（03 章 3.4）。registration token 是一次性的，但用来换取它的 PAT 不是，用完要撤销。
+> [!WARNING]
+> 1. 配云防火墙（04 章 4.7）。这一步只能在云厂商控制台里配。Docker 会自己写 DNAT 规则，绕过宿主机的 ufw。能挡住这类流量的只有云防火墙这一层。
+> 2. 撤销注册用的 PAT（03 章 3.4）。registration token 是一次性的，但用来换取它的 PAT 不是，用完要撤销。
+
+---
+
+## 装好之后，机器上在跑什么
+
+`bootstrap.sh` 把清理钩子挂在 job 的开始和结束两处，另配一个每日 timer 兜底；`ci-health.sh` 每小时采一次点，配了飞书机器人地址就推送告警。
+
+```mermaid
+flowchart LR
+    G["GitHub 派发 job"] --> S["JOB_STARTED 钩子<br/>ci-cleanup.sh"]
+    S --> J["job 的各个 step"]
+    J --> C["JOB_COMPLETED 钩子<br/>ci-cleanup.sh"]
+    C --> L["runner listener<br/>等下一个 job"]
+    L --> G
+    T["ci-cleanup.timer<br/>每日 04:17"] --> X["ci-cleanup.sh<br/>兜底清理"]
+    H["ci-health.sh<br/>每小时第 13 分"] --> LOG["/var/log/ci-health.log"]
+    H -->|"告警集合变化"| F["飞书群"]
+    classDef base fill:#F6F8FA,stroke:#D0D7DE,color:#1F2328
+    classDef run fill:#1F883D,stroke:#1A7F37,color:#ffffff
+    classDef hook fill:#DDF4FF,stroke:#54AEFF,color:#1F2328
+    classDef job fill:#DAFBE1,stroke:#4AC26B,color:#1F2328
+    classDef alert fill:#FFF8C5,stroke:#D4A72C,color:#1F2328
+    class G,LOG base
+    class L run
+    class S,C,T,X hook
+    class J job
+    class H,F alert
+```
+
+各部分的理由在 [04 章 4.4](04-加固.md)（清理为什么挂三处）和 [08 章 8.2](08-运维与容量.md)（监控与告警阈值）。
 
 ---
 
@@ -106,7 +159,10 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 | `verify.sh` | 本机实跑（2026-10-16 重启后） | 34 PASS / 0 FAIL |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 
-各项细节：
+<details>
+<summary><b>各项细节</b></summary>
+
+<br>
 
 - `bootstrap.sh` 幂等重跑：退出码 0，12 项关键状态逐字节相同（仅注释文本被标准化）。
 - `bootstrap.sh` 从零安装 1–3 步：docker / node / gh / psmisc 全部从零装成，`daemon.json` 生成正确。
@@ -114,7 +170,10 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 - `preflight.sh`：各项与已知实测值吻合。
 - `verify.sh`：实跑时抓出了脚本自身的两个 bug。
 
-> 注意：`bootstrap.sh` 第 4–8 步仅在已有机器上验证过效果，首次在全新机器上跑请盯着输出。runner 全新注册路径未自动化验证。
+</details>
+
+> [!CAUTION]
+> `bootstrap.sh` 第 4–8 步仅在已有机器上验证过效果，首次在全新机器上跑请盯着输出。runner 全新注册路径未自动化验证。
 
 ---
 
@@ -127,4 +186,5 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 - 「为什么 N=1（只注册一个 runner）够用」「为什么不合并 job」这类结论，背后的仿真数据与实测台账留在内部的核验报告里，没有随手册发布。
 - 手册里引用结论的地方都直接给了数字和测法，一般不需要回溯原始台账。
 
-标「参考项目」的地方都是举例：一个 4 人小队的 pnpm monorepo，跑在 4 核 / 7.5 GiB 单机上的实测值。你的数字会不同，但测法是通用的。
+> [!NOTE]
+> 标「参考项目」的地方都是举例：一个 4 人小队的 pnpm monorepo，跑在 4 核 / 7.5 GiB 单机上的实测值。你的数字会不同，但测法是通用的。
