@@ -147,8 +147,10 @@ av=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
 if [ -n "$GH_REPO" ] && [ -n "${GH_TOKEN:-}" ]; then
   hdr "GitHub 侧"
   J=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$GH_REPO/actions/runners" 2>/dev/null || echo '{}')
-  st=$(echo "$J" | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("runners") or [{}])[0].get("status","?"))' 2>/dev/null)
-  [ "$st" = "online" ] && ok "runner 在 GitHub 侧 online" || no "runner 在 GitHub 侧是 $st"
+  # 按本机注册名取，不能取列表第一个：仓库里有多台 runner 时，第一个多半是别的机器
+  RN=$(python3 -c "import json;print(json.load(open('$RUNNER_HOME/.runner',encoding='utf-8-sig')).get('agentName',''))" 2>/dev/null)
+  st=$(echo "$J" | RN="$RN" python3 -c 'import os,sys,json;d=json.load(sys.stdin);print(next((r.get("status","?") for r in d.get("runners") or [] if r.get("name")==os.environ["RN"]),"未注册"))' 2>/dev/null)
+  [ "$st" = "online" ] && ok "runner ${RN} 在 GitHub 侧 online" || no "runner ${RN:-<读不到 .runner>} 在 GitHub 侧是 $st"
   echo "     注：这个字段有分钟级延迟，刚重启完可能还显示旧值，等 1–2 分钟再看。"
 else
   hdr "GitHub 侧"; sk "未提供 GH_REPO/GH_TOKEN，跳过（重启后建议补查一次）"

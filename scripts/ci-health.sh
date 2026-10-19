@@ -106,11 +106,16 @@ try:
     runs = get(f"/repos/{repo}/actions/runs?per_page=20&status=completed").get("workflow_runs", [])
     concl = []
     for r in runs:
+        c = r.get("conclusion") or "?"
         if name:   # 读不到 runner 名时退化成统计全仓库
             js = get(f"/repos/{repo}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
-            if not any(j.get("runner_name") == name for j in js):
+            mine = [j for j in js if j.get("runner_name") == name]
+            if not mine:
                 continue
-        concl.append(r.get("conclusion") or "?")
+            # 只看落在本机的 job。两台 runner 共用一套标签，同一个 run 的 job 会分到两台上，
+            # 按 run 的结论算的话，另一台的 job 红了，这台也跟着报连续失败。
+            c = "failure" if any(j.get("conclusion") in ("failure", "timed_out") for j in mine) else "ok"
+        concl.append(c)
         if len(concl) >= 10:
             break
     streak = 0

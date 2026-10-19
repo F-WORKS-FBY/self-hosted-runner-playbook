@@ -118,7 +118,9 @@ step "3/8 Node ${NODE_MAJOR} + pnpm + gh"
 if ! command -v node >/dev/null || [ "$(node -v | sed 's/v\([0-9]*\).*/\1/')" != "$NODE_MAJOR" ]; then
   NV=$(curl -fsSL https://nodejs.org/dist/index.json | jq -r --arg m "v${NODE_MAJOR}." '[.[]|select(.version|startswith($m))][0].version')
   curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/${NV}/node-${NV}-linux-x64.tar.xz"
-  rm -rf /opt/node && mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 && rm -f /tmp/node.tar.xz
+  # --no-same-owner：官方包里的文件属主是 uid 1001，root 解压默认照搬。机器上谁恰好是 1001，
+  # 谁就能改 CI 和 root 都会执行的 node（2026-10-19 第二台装机时发现）。
+  rm -rf /opt/node && mkdir -p /opt/node && tar --no-same-owner -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 && rm -f /tmp/node.tar.xz
   for b in node npm npx corepack; do ln -sf "/opt/node/bin/$b" "/usr/local/bin/$b"; done
 fi
 info "node $(node -v)"
@@ -370,7 +372,9 @@ iptables -C DOCKER-USER -d "$METADATA_IP" -j DROP 2>/dev/null \
   || iptables -I DOCKER-USER -d "$METADATA_IP" -j DROP
 iptables -C OUTPUT -d "$METADATA_IP" -m owner --uid-owner "$RU_UID" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
   || iptables -I OUTPUT -d "$METADATA_IP" -m owner --uid-owner "$RU_UID" -j REJECT --reject-with icmp-port-unreachable
-if ! dpkg -l iptables-persistent >/dev/null 2>&1; then
+# 不能用 `dpkg -l` 判断：全新的 24.04 上 ufw 的 Breaks 让 dpkg 记着这个包名（状态 un），
+# `dpkg -l` 照样返回 0，于是跳过安装，下一行 netfilter-persistent 找不到命令，脚本在这里退出（2026-10-19 第二台装机时踩到）。
+if ! dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -q 'install ok installed'; then
   echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections
   echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
   apt-get install -y -qq iptables-persistent >/dev/null
