@@ -75,7 +75,7 @@ for a in "$@"; do
   esac
 done
 [ "$(id -u)" -eq 0 ] || { echo "必须 root 运行" >&2; exit 1; }
-# 有 job 在跑就别动：第 4 步可能重启 docker、第 6 步一定重启 runner，都会当场打断它；
+# 有 job 在跑就别动：第 4 步可能重启 docker、第 8 步末尾一定重启 runner，都会当场打断它；
 # 第 7 步试跑钩子时，钩子也会因为「有别的 job」而跳过，门禁就形同虚设。
 if pgrep -x Runner.Worker >/dev/null 2>&1 && [ "${FORCE_WHILE_BUSY:-0}" != 1 ]; then
   echo "有 job 正在运行（Runner.Worker），等它跑完再执行；确实要强行执行就加 FORCE_WHILE_BUSY=1" >&2; exit 1
@@ -223,7 +223,10 @@ if [ "$SKIP_RUNNER" = 0 ]; then
   else
     info "runner 已注册，跳过"
   fi
-  ( cd "$RUNNER_HOME" && ./svc.sh install "$RUNNER_USER" >/dev/null 2>&1 || true; ./svc.sh start >/dev/null 2>&1 || true )
+  # 这里只装服务不启动，等加固、钩子、metadata 拦截都就位后在第 8 步末尾统一启动。
+  # 原来在这里就 start：新注册的 runner 一上线就去接排队的 job，第 6 步紧接着 restart 会把它打断；
+  # 而且钩子要到第 7 步才写进 .env，runner 只在启动时读 .env，那一轮跑的 job 没有清理钩子。
+  ( cd "$RUNNER_HOME" && ./svc.sh install "$RUNNER_USER" >/dev/null 2>&1 || true )
   SVC=$(systemctl list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null | awk '{print $1}' | head -1)
   [ -z "$SVC" ] && SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)" 2>/dev/null || echo "")
   info "服务单元：${SVC:-<未找到>}"
@@ -258,8 +261,6 @@ MemoryAccounting=yes
 MemoryMax=${RUNNER_MEM_MAX}
 EOF
   systemctl daemon-reload
-  systemctl restart "$SVC" || true
-  sleep 3
   info "Restart=$(systemctl show "$SVC" -p Restart --value)  MemoryMax=${RUNNER_MEM_MAX}  StartLimitInterval=$(systemctl show "$SVC" -p StartLimitIntervalUSec --value)"
 else
   info "未找到 runner 服务单元，跳过（--skip-runner 时正常）"
@@ -381,6 +382,13 @@ if ! dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -q 'ins
 fi
 netfilter-persistent save >/dev/null 2>&1
 info "metadata 拦截规则已生效并持久化（$(grep -c "$METADATA_IP" /etc/iptables/rules.v4 2>/dev/null) 条）"
+
+# runner 只在这里（重新）启动一次：加固（第 6 步）、钩子（第 7 步）、metadata 拦截（第 8 步）都已就位
+if [ -n "$SVC" ]; then
+  systemctl restart "$SVC" || true
+  sleep 3
+  info "runner 服务 $SVC：$(systemctl is-active "$SVC")"
+fi
 
 # ──────────────────────────── 可选：SSH 加固 ────────────────────────────
 harden_ssh(){
