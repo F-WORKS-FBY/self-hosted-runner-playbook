@@ -43,7 +43,9 @@ if [ -n "$SVC" ]; then
   [ "$r" = "always" ] && ok "Restart=always" || no "Restart=$r（应为 always，否则进程一死永久死着）"
   [ "$s" = "0" ] && ok "StartLimitIntervalSec=0" || no "StartLimitIntervalUSec=$s（应为 0，否则 5 次/10 秒后 systemd 停止重试）"
   [ "$m" != "infinity" ] && ok "MemoryMax=$m" || no "MemoryMax 未设"
-  [ "$o" -ge 500 ] 2>/dev/null && ok "OOMScoreAdjust=$o" || no "OOMScoreAdjust=$o（应 ≥500，让 CI 先于系统服务被 OOM 挑中）"
+  # 期望值以 /etc/ci-runner.env 为准（机器上跑开发工具时会调低，见 bootstrap.sh 的 RUNNER_OOM_ADJ），没写就是默认 800
+  want=$(sed -n 's/^RUNNER_OOM_ADJ=//p' /etc/ci-runner.env 2>/dev/null); want=${want:-800}
+  [ "$o" = "$want" ] && [ "$o" -gt 0 ] 2>/dev/null && ok "OOMScoreAdjust=$o" || no "OOMScoreAdjust=$o（应为 $want，且 >0，让 CI 先于系统服务被 OOM 挑中）"
   systemctl show "$SVC" -p After --value | grep -q docker.service && ok "After=docker.service" || no "缺 After=docker.service（重启后可能先接到 job 再有 docker）"
 else sk "无 runner 单元，跳过加固检查"; fi
 

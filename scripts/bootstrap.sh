@@ -31,7 +31,7 @@ set -euo pipefail
 #    又没存在任何地方 —— 有人哪天直接重跑 bootstrap.sh，清理钩子就换成默认标签（按标签清理全部落空）、
 #    孤儿端口清理被关掉、争抢告警归零，而且什么都不报错。
 CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
-PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_HOME RUNNER_MEM_MAX BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB"
+PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_HOME RUNNER_MEM_MAX RUNNER_OOM_ADJ BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB"
 if [ -r "$CI_RUNNER_ENV" ]; then
   # 「显式传入」按变量是否**设置过**判断（${!k+x}），所以 CI_APP_PORTS= 这样的空值也能覆盖文件里的值
   while IFS= read -r line || [ -n "$line" ]; do
@@ -47,6 +47,11 @@ RUNNER_HOME="${RUNNER_HOME:-/opt/actions-runner}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
 PNPM_VERSION="${PNPM_VERSION:-}"          # 留空则不预装 pnpm，交给 workflow 的 action 处理
 RUNNER_MEM_MAX="${RUNNER_MEM_MAX:-6G}"    # 按「单 job 实测峰值 × 1.3」定
+# runner 的 OOM 优先级。800 = 比系统服务先死。机器上还有人开 VSCode / Claude / Codex、
+# 又想让它们比 CI 先死时，光把它们设成 1000 不够：内核按「RSS 页数 + adj × 总页数/1000」挑，
+# 差 200 只抵约 1.5 GiB，大的 CI 进程（Metro 打包等）照样排在前面。要保证就得满足
+# (1000 − 本值) / 1000 × 总内存 > RUNNER_MEM_MAX，8G 机器上取 200（第二台 runner 就是这么设的）。
+RUNNER_OOM_ADJ="${RUNNER_OOM_ADJ:-800}"
 BUILDKIT_RESERVED="${BUILDKIT_RESERVED:-10GB}"
 BUILDKIT_MAX_USED="${BUILDKIT_MAX_USED:-20GB}"
 BUILDKIT_MIN_FREE="${BUILDKIT_MIN_FREE:-20GB}"
@@ -256,7 +261,7 @@ Restart=always
 RestartSec=10
 # swap=0 的机器上 OOM 是 kill 不是变慢，而内核按 RSS 挑受害者、不知道谁是客人。
 # 这一行让 CI 先死，别把 sshd 或别的东西带走。
-OOMScoreAdjust=800
+OOMScoreAdjust=${RUNNER_OOM_ADJ}
 MemoryAccounting=yes
 MemoryMax=${RUNNER_MEM_MAX}
 EOF
@@ -270,12 +275,15 @@ fi
 step "7/8 清理钩子 + 每日 timer + 健康监控"
 mkdir -p "$RUNNER_HOME/hooks"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 先渲染到 .new，试跑通过再替换。.env 里挂的是正式路径，runner 每个 job 现读现跑：
+# 直接覆盖正式文件的话，在已部署的机器上试跑失败时坏钩子已经生效，「拒绝接线」就是空话。
+HOOK="$RUNNER_HOME/hooks/ci-cleanup.sh"
 if [ -f "$SELF_DIR/ci-cleanup.sh" ]; then
-  sed -e "s#__CI_APP_PORTS__#${CI_APP_PORTS}#" -e "s#__CI_LABEL__#${CI_LABEL}#" "$SELF_DIR/ci-cleanup.sh" > "$RUNNER_HOME/hooks/ci-cleanup.sh"
+  sed -e "s#__CI_APP_PORTS__#${CI_APP_PORTS}#" -e "s#__CI_LABEL__#${CI_LABEL}#" "$SELF_DIR/ci-cleanup.sh" > "$HOOK.new"
 else
   echo "缺少 $SELF_DIR/ci-cleanup.sh" >&2; exit 1
 fi
-chmod 0755 "$RUNNER_HOME/hooks/ci-cleanup.sh"; chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME/hooks/ci-cleanup.sh"
+chmod 0755 "$HOOK.new"; chown "$RUNNER_USER:$RUNNER_USER" "$HOOK.new"
 
 # ⚠️ 装完必须**按 runner 的真实调用方式跑一次**，跑不过就拒绝接线。
 #
@@ -285,15 +293,16 @@ chmod 0755 "$RUNNER_HOME/hooks/ci-cleanup.sh"; chown "$RUNNER_USER:$RUNNER_USER"
 # 而 systemctl / verify.sh / ci-health.sh 三处全部显示正常。
 #
 # 这一道门禁的全部价值：把「装上了」和「真能用」区分开。多花 0.2 秒。
-if ! sudo -u "$RUNNER_USER" /usr/bin/bash -e "$RUNNER_HOME/hooks/ci-cleanup.sh"; then
+if ! sudo -u "$RUNNER_USER" /usr/bin/bash -e "$HOOK.new"; then
   echo "钩子以 runner 的真实调用方式（bash -e）执行失败，拒绝接线 —— 接了就是每个 job 全红" >&2
-  echo "复现：sudo -u $RUNNER_USER /usr/bin/bash -ex $RUNNER_HOME/hooks/ci-cleanup.sh" >&2
+  echo "复现：sudo -u $RUNNER_USER /usr/bin/bash -ex $HOOK.new（正式钩子没动）" >&2
   exit 1
 fi
 # 占位符必须全部替换掉。只看赋值行：守卫那行**故意**保留 __CI_ 前缀做判据，不是残留。
-if grep -qE '^(L|APP_PORTS)=.*__CI_' "$RUNNER_HOME/hooks/ci-cleanup.sh"; then
-  echo "钩子仍含未替换的占位符（赋值行），sed 替换失败" >&2; exit 1
+if grep -qE '^(L|APP_PORTS)=.*__CI_' "$HOOK.new"; then
+  echo "钩子仍含未替换的占位符（赋值行），sed 替换失败（正式钩子没动）" >&2; exit 1
 fi
+mv -f "$HOOK.new" "$HOOK"
 info "钩子已按 runner 的调用方式试跑通过"
 
 # 两个钩子都挂：JOB_STARTED 是主力（对「上一个 job 被 cancel-in-progress 取消」免疫），
