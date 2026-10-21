@@ -315,6 +315,7 @@ bash scripts/bootstrap.sh
 |---|---|---|
 | `RUNNER_LABELS` | 至少一个项目专属标签，不要只用 `self-hosted` | `myproj-ci` |
 | `RUNNER_MEM_MAX` | 单 job 实测峰值 × 1.3 | `6G`（峰值 4.8 GiB） |
+| `RUNNER_OOM_ADJ` | runner 被内核 OOM 挑中的优先级，见 04 章 4.3。机器只跑 CI 用默认值；还跑着开发工具、要它们先被杀时，取满足 (1000 − 本值) / 1000 × 总内存 > `RUNNER_MEM_MAX` 的值 | `800`（只跑 CI）；8G 机器上和开发工具共用时 `200` |
 | `CI_APP_PORTS` | CI 在宿主上监听的端口，不填容器端口 | `3100 3101`（e2e 拉起的 API） |
 | `CI_LABEL` | 与 workflow 里 `docker run --label` 的值逐字一致 | `com.myorg.ci=1` |
 | `CI_FIXEDWORK_BASELINE` | `preflight.sh --with-load` 给出的 p50 | `0.51` |
@@ -497,7 +498,7 @@ StartLimitIntervalSec=0        # ← 缺这行等于白写，见下
 [Service]
 Restart=always
 RestartSec=10
-OOMScoreAdjust=800
+OOMScoreAdjust=800             # 默认值，bootstrap 的 RUNNER_OOM_ADJ 可改，见下
 MemoryAccounting=yes
 MemoryMax=6G
 ```
@@ -506,7 +507,7 @@ MemoryMax=6G
 
 - `After=docker`：出厂 unit 不写这个依赖。实测 runner 就绪只比 dockerd 晚 1.3 秒，而且两者完全无序。重启后 runner 可能先接到 job，docker 才起来。
 - `StartLimitIntervalSec=0`：systemd 默认 `StartLimitBurst=5` / `Interval=10s`。不关掉的话，`Restart=always` 在连续失败 5 次后会被标成 `failed` 并停止重试。**只写 `Restart=always` 是不够的**，这是最容易漏的一行。
-- `OOMScoreAdjust=800`：swap=0 的机器上，内存不够时进程会被 OOM kill，不会只是变慢。内核按 RSS 挑要杀的进程，不知道哪些是 CI 这样的「客人」。这一行让 CI 先被杀，别把 sshd 带走。
+- `OOMScoreAdjust=800`：swap=0 的机器上，内存不够时进程会被 OOM kill，不会只是变慢。内核按 RSS 挑要杀的进程，不知道哪些是 CI 这样的「客人」。这一行让 CI 先被杀，别把 sshd 带走。800 是默认值，由 bootstrap 的 `RUNNER_OOM_ADJ` 设。机器上还跑着开发工具（VS Code、Claude、Codex 等）、又要它们比 CI 先被杀时，光把它们设成 1000 不够：内核按「内存占用 + adj × 总内存 / 1000」挑，8G 的机器上差 200 只抵约 1.5 GiB，大的 CI 进程照样排在前面。要保证就得满足 (1000 − 本值) / 1000 × 总内存 > `RUNNER_MEM_MAX`，8G 机器上取 200。
 - `MemoryMax`：一个失控的 job 只杀死自己。
 
 注意：`MemoryMax` 只管 runner 进程树。CI 起的容器是 dockerd 的子进程，不在这个范围内。要管住它们，得用 `--cgroup-parent`，或者给服务容器加 `--memory`。
@@ -1275,7 +1276,7 @@ GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
 | 分组 | 检查项 | 不通过意味着 |
 |---|---|---|
 | 服务与开机自启 | docker / containerd / runner 三个 unit `active + enabled` | 重启后回不来 |
-| runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust≥500`、`After=docker` | 见 04 章各条的后果 |
+| runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust` 等于 `/etc/ci-runner.env` 里的 `RUNNER_OOM_ADJ`（没写按 800）且大于 0、`After=docker` | 见 04 章各条的后果 |
 | Docker | `live-restore=true`；BuildKit GC 有 Max Used 与 Min Free 两项 | 见表下说明 |
 | 清理与监控 | 共 9 项，见表下说明 | 见表下说明 |
 | 部署参数与系统更新 | `/etc/ci-runner.env` 存在且与钩子的 CI 标签一致；needrestart 豁免 runner；有没有待重启的更新 | 见表下说明 |
