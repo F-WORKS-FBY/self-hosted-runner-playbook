@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Sustained full-load CPU steal measurement
+# stealtest.sh [秒数]：全核满载，同时每 10 秒采一次 steal。需要 stress-ng。
+# 先用 preflight.sh 确认这台机器的 steal 能观测到，否则采到的全是 0。CPUS 默认取全部核。
 OUT="${CI_DATA_DIR:-./data}/steal.csv"
 DUR=${1:-600}
+CPUS="${CPUS:-$(nproc)}"
 echo "ts,window_s,user_pct,sys_pct,idle_pct,iowait_pct,steal_pct,total_jiffies" > "$OUT"
-stress-ng --cpu 4 --cpu-method matrixprod --timeout ${DUR}s --metrics-brief > "${CI_DATA_DIR:-./data}/stress.log" 2>&1 &
+stress-ng --cpu "$CPUS" --cpu-method matrixprod --timeout ${DUR}s --metrics-brief > "${CI_DATA_DIR:-./data}/stress.log" 2>&1 &
 SPID=$!
 prev=$(awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat)
 for i in $(seq 1 $((DUR/10))); do

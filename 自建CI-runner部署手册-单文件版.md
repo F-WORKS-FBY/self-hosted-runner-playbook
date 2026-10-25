@@ -3,40 +3,55 @@
 > 这份文件由仓库里的分章文件自动拼成，用 `bash scripts/make-single.sh` 重新生成。
 > 要改内容请改分章文件，不要改这一份，否则两个版本会对不上。
 >
-> 手册讲一套通用做法：怎么判断一台机器够不够用、怎么装、怎么改 workflow、怎么接线、怎么验证、怎么运维。
-> 里面的数字都来自一次真实落地（一台 4 核、7.5 GiB 内存的机器，跑一个 pnpm monorepo 的 CI）。
-> 写着「参考项目」的地方是举例，不是要求。
+> 手册讲一套通用做法：怎么选机器、按规格怎么定参数、怎么装、怎么改 workflow、怎么接线、怎么验证、怎么运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。
+> 里面的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在一台 4 核、约 7.6 GiB 内存的机器上。没有特别说明时，数字指这一台。
+> 写着「参考项目」的地方是举例，不是要求。你的机器该跑几个实例、参数怎么取，按 10 章的公式算。
 
 ---
 
-## 15 分钟快速开始
+## 快速开始
 
 ```bash
-# 1. 判断这台机器够不够用（只读）
-CI_HOST_PORTS="5433 6379 9000" bash scripts/preflight.sh --with-load
+# 1. 验机（只读）。端口填你项目 CI 占用的宿主端口（02 章开头）
+CI_HOST_PORTS="<CI 会占用的宿主端口，空格分隔>" bash scripts/preflight.sh --with-load
+REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一台没有参考机，不给 REF
 
-# 2. 装机、注册、加固（可以重复跑；参数会存到 /etc/ci-runner.env，下次重跑不用再传）
-GH_REPO=owner/repo GH_TOKEN=<一次性PAT> \
-RUNNER_LABELS=self-hosted,linux,x64,ci \
-CI_APP_PORTS="3100 3101" CI_LABEL=com.myorg.ci=1 \
-CI_FIXEDWORK_BASELINE=<上一步给的 p50> \
+# 2. 装机和加固，先不注册，不需要 token。参数存到 /etc/ci-runner.env，下次重跑不用再传
+#    新机器先跑这一步，再建开发用户等其他普通用户：它按 RUNNER_UID（默认 1000）建 runner 用户（03 章 3.3）
+#    RUNNER_NAME 每台机器不同；标签所有机器相同
+#    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
+#    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
+GH_REPO=owner/repo \
+RUNNER_NAME=ci-$(hostname -s) \
+RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
+CI_LABEL=com.myorg.ci=1 \
+CI_APP_PORTS="<CI 在宿主上监听的端口，空格分隔，没有就留空>" \
+CI_FIXEDWORK_BASELINE=<第 1 步 preflight 给的 p50> \
+bash scripts/bootstrap.sh --skip-runner
+#    然后以 runner 用户回放最慢的 job，核对超时余量（02 章 2.7）
+
+# 3. 注册。PAT 用 read -s 输入，不留在 shell 历史里；注册完去 GitHub 撤销
+read -rsp 'PAT: ' GH_TOKEN; echo; export GH_TOKEN
 bash scripts/bootstrap.sh
-#    可选：CI_HEALTH_GH_TOKEN=<只读 token>        监控「本机 job 是否连续失败」用
-#          CI_ALERT_WEBHOOK=<飞书机器人地址>  CI_ALERT_SECRET=<签名密钥>   告警推送到飞书群
+unset GH_TOKEN
+#    可选：CI_HEALTH_GH_TOKEN（只读 token，监控「本机 job 是否连续失败」用）、
+#    CI_ALERT_WEBHOOK 和 CI_ALERT_SECRET（告警推送到飞书群）。同样用 read -s 输入后 export，再跑这一步
 
-# 3. 自检
-GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
+# 4. 自检。GitHub 侧那一组要只读 token，最好在 CI 机以外查（07 章）
+bash scripts/verify.sh
 
-# 4. 改 workflow：没有脚本，必须有人读一遍第 05 章
+# 5. 改 workflow：没有脚本，必须有人读一遍第 05 章
 #    改完之前不要打开开关，否则第 2 个 PR 就会失败
 
-# 5. 接线
-gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64","ci"]'
+# 6. 接线
+gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64","myproj-ci"]'
 
-# 6. 连开两个测试 PR，再手动触发一次定时 workflow
+# 7. 连开两个测试 PR，再手动触发一次定时 workflow
 ```
 
-第 4 步是唯一不能跳过的人工步骤。前三步配置的是机器；第 4 步要找出仓库里那些只在一次性 VM 上才成立的写法并改掉，CI 出问题大多出在这里。
+第 5 步是唯一不能跳过的人工步骤。前四步配置的是机器；第 5 步要找出仓库里那些只在一次性 VM 上才成立的写法并改掉，CI 出问题大多出在这里。
+
+加第二台及以后的机器：第 1 到 4 步照做，第 5、6 步不用再做，步骤和验收清单见 08 章 8.7 和 07 章 7.5。
 
 ---
 
@@ -51,12 +66,13 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 - [07 验证](#07-验证)
 - [08 运维与容量](#08-运维与容量)
 - [09 踩坑记录](#09-踩坑记录)
+- [10 按机器规格定参数](#10-按机器规格定参数)
 
 ---
 
 ## 01 决策：要不要自建
 
-这一章帮你判断要不要自建 runner。结论先说：**自建 runner 通常不是省钱方案。** 如果你的动机是省钱，先把本章的账算完再决定。
+这一章帮你判断要不要自建 runner。结论先说：自建 runner 通常不是省钱方案。如果你的动机是省钱，先把本章的账算完再决定。
 
 ### 1.1 先把「省多少」算清楚
 
@@ -64,6 +80,12 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 
 1. 每个 job 单独向上取整到整分钟，再求和，而不按 workflow 墙钟计。一个 6 秒的 job 和一个 59 秒的 job 都记 1 分钟。job 越多、越短，取整损耗的占比越高。
 2. 自托管 runner 不消耗 included minutes（套餐内含的免费额度）。所以搬走哪些 workflow，就直接省下这些 workflow 的分钟数。
+
+第 2 条截至 2026-10 仍然成立，但要留意它可能会变。GitHub 在 2025-12-16 宣布，从 2026-03-01 起对私有仓库的自托管 runner 收每分钟 $0.002 的平台费，并计入套餐额度；随后宣布推迟，说要重新评估，没有给新日期。动手前查一下 GitHub 当前的计费文档。这项一旦生效，1.1 的账和 1.2 的理由都要重算。
+
+- [GitHub Changelog：Actions 定价调整，顶部有推迟说明](https://github.blog/changelog/2025-12-16-coming-soon-simpler-pricing-and-a-better-experience-for-github-actions/)
+- [github/roadmap #1197：自托管 runner 收费，已以 not planned 关闭](https://github.com/github/roadmap/issues/1197)
+- [GitHub 文档：Actions runner 计费（托管 runner 的单价）](https://docs.github.com/en/billing/reference/actions-runner-pricing)
 
 计算方法：
 
@@ -76,7 +98,7 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 每 run 计费分钟 = Σ(每个 job 的 ceil(秒数/60))     # 注意是每 job 各自取整
 ```
 
-> 参考项目：按现配置外推为 2280 计费分钟/月，免费额度 2000，超出 280 分钟。按 Linux 2 核 $0.006/分钟计，费用为 $1.68/月。而机器月租 €7–14。只算钱的话，自建是亏的。
+> 参考项目：按现配置外推为 2280 计费分钟/月，免费额度 2000，超出 280 分钟。按 Linux 2 核 $0.006/分钟计，费用为 $1.68/月。而一台机器月租 €7–14。只算钱的话，自建是亏的。
 
 ### 1.2 为什么仍然值得做
 
@@ -84,7 +106,7 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 
 免费额度 2000 分钟看起来不少，换算一下：按每 run 10 计费分钟算，只够约 200 个 PR-run（一个 PR 触发的一次完整 CI 运行）。一个 4 人小队在冲刺周很容易一天跑掉 30–35 个 PR。
 
-> 参考项目：额度于 2026-08-21 10:27 UTC 耗尽，直到 09-01 才重置。这 10.5 天里，GitHub 仍然接受触发，但不分配 runner，job 在 1–6 秒内失败。结果是 **85 个已合并的 PR 里，52 个（61%）从来没有跑过一次真实的 CI。**
+> 参考项目：额度于 2026-08-21 10:27 UTC 耗尽，直到 09-01 才重置。这 10.5 天里，GitHub 仍然接受触发，但不分配 runner，job 在 1–6 秒内失败。结果是 85 个已合并的 PR 里，52 个（61%）从来没有跑过一次真实的 CI。
 
 自建要解决的就是这个问题。相比之下，每月 $1.68 的超额费用可以忽略。
 
@@ -95,45 +117,56 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 | 情形 | 原因 |
 |---|---|
 | 公开仓库 | fork PR 会在你的机器上执行任意代码，而 `docker` 组约等于宿主 root。GitHub 官方明确不建议。 |
-| 机器还跑着别的东西 | CI 会独占宿主端口、写满磁盘、触发 OOM。见表下说明。 |
+| 机器还跑着别的东西（包括日常开发） | CI 会独占宿主端口、写满磁盘、触发 OOM。开发工具也算，见表下说明。 |
 | 没人愿意长期维护 | 它需要清理、监控、告警、版本升级。托管 runner 不需要管这些。 |
 | 额度还很宽裕 | 先做免费优化（合并 job、砍重复触发、路径门控）。通常能砍掉 50%，而且零风险。 |
-| 团队分布在多时区、峰值连续 | 单机（N=1）的排队会累积。先算清楚（见 08 章 8.1 的仿真方法）。 |
+| 团队分布在多时区、峰值连续 | runner 实例少（比如只有一台机器、一个实例，N=1）时排队会累积。先算清楚（见 08 章 8.1 的仿真方法）。 |
 
 关于共享机器：如果 CI 和业务共用一个 dockerd，一次 ENOSPC（磁盘写满）除了让 CI 变红，业务也会一起写不进去。要自建就用专机。
+
+开发工具同理。参考项目在 8 GB 的 CI 机上开着 VS Code Remote 和 AI 助手开发了两天，出了 11 次全局 OOM，被杀的大多是 CI 的进程。8 GB 这一档的机器只跑 CI。更大的机器要兼开发，按 04 章 4.8 配置，内存够不够按 10 章算。
 
 ### 1.4 决策清单
 
 下面五项全部为「是」，才继续往下做：
 
 1. 仓库是私有的，或你能接受 fork PR 的代码执行风险。
-2. 有一台专用机器（不跑业务、不跑别人的数据）。
+2. 有专用的机器（不跑业务、不跑别人的数据，8 GB 这一档的机器上也不做日常开发）。要几台、每台多大，见 10 章。
 3. 已经做完免费优化，额度仍然吃紧。
 4. 有人负责它的运维（清理、监控、升级）。
-5. 接受「N=1 时 job 会排队」。先用 08 章 8.1 的方法算一遍你的峰值。
+5. 接受「runner 实例有限时 job 会排队」。先用 08 章 8.1 的方法算一遍你的峰值，再决定要几台机器、每台跑几个实例（10 章）。
 
 ---
 
 ## 02 选机与验收
 
-本章说明怎么判断一台候选机能不能用作 CI runner。一条命令就能给出结论：
+本章说明怎么判断一台候选机能不能用作 CI runner。拿到机器、装任何东西之前，先跑两个只读脚本：
 
 ```bash
-CI_HOST_PORTS="5433 6379 9000" bash scripts/preflight.sh --with-load
+CI_HOST_PORTS="<CI 会占用的宿主端口，空格分隔>" bash scripts/preflight.sh --with-load
+REF=<现有 runner 的单核分数> bash scripts/machine-check.sh
 ```
 
-这个脚本只读，不安装任何东西，最后打印 GO / NO-GO。下面逐项解释它查什么、为什么这样查。阈值可以按你的项目调整，测法不能改。
+`CI_HOST_PORTS` 填这台机器上 CI 会占用的所有宿主端口：`services:` 映射到宿主的端口，加上 03 章的 `CI_APP_PORTS`。参考项目填的是 `5433 6379 9000 3100 3101`。不填时 preflight 跳过端口检查，并记一条提醒。
+
+`preflight.sh` 查硬件下限、端口、时间同步、网络和 CPU 争抢，最后打印 GO / NO-GO。它判断不了单核速度，因为它的 sha256 基线只能和同一台机器自己比（2.5）。单核速度用 `machine-check.sh` 和现有 runner 比，再按 2.7 核对每个 job 的超时余量。第一台机器没有参考机，`REF` 留空，按 2.7 的第 4 步回放。
+
+两个脚本里的硬件下限（4 核、7000 MiB 内存、40 GiB 可用盘）是按参考项目定的默认值。你的项目按 10 章算出要多少，用 `MIN_CORES`、`MIN_MEM_MIB`、`MIN_DISK_GIB`（machine-check 里叫 `MIN_DISK_GB`）传进去。其中 40 GiB 只是脚本的最低门槛，不代表够用。跑 docker build 的 CI，盘按 10 章 10.4 算，参考项目要约 75 GB 的盘。
+
+下面逐项解释查什么、为什么这样查。阈值可以按你的项目调整，测法不能改。
 
 ### 2.1 CPU 与内存：按单 job 实测峰值来定
 
 CPU 和内存的配置要以单个 job 的实测峰值为依据，不要靠估算。
 
-唯一可靠的做法：在候选机上把你的 CI 完整跑一遍，逐步测量峰值 RSS 和 CPU 核秒。
+唯一可靠的做法：在候选机上把你的 CI 完整跑一遍，测每一步的峰值内存和 CPU 核秒。内存要分两个口径量：
 
-- 用 `scripts/analysis/step.sh` 测。它基于 cgroup 统计，比 `/usr/bin/time` 准。
-- `/usr/bin/time` 遇到多进程时只取单个进程的最大值，会低估。
+- 进程树的峰值：job 各步骤自己拉起的进程，上线后它们都在 runner 服务的 cgroup 里。用 `scripts/analysis/step.sh` 测，它把每一步放进单独的 cgroup 里跑、按 cgroup 统计内存，比 `/usr/bin/time` 准（`/usr/bin/time` 遇到多进程时只取单个进程的最大值，会低估）。`services:` 容器、`docker run` 起的容器和 `docker build` 的 RUN 步骤都由 dockerd 管，不在这个 cgroup 里，所以这个数不含它们。它用来定 `RUNNER_MEM_MAX`（03 章 3.1）。
+- 整机的峰值。CI 完整跑一遍的同时，用 `scripts/analysis/sysmon.sh` 记可用内存（MemAvailable，5 秒一采），用空闲时的可用内存减去全程最低值。它包含容器、tmpfs 和 docker build，用来定机器要多大内存、一台跑几个实例。10 章把它记作 J。量的时候机器上不要开开发工具，否则它们的占用会混进来。
 
-参考项目的单 job 峰值 RSS：
+step.sh 的 CPU 核秒读的是整机，容器也算在内。
+
+参考项目各 job 的进程树峰值（step.sh 读数，不含容器）：
 
 | job | 峰值 RSS |
 |---|---|
@@ -143,11 +176,11 @@ CPU 和内存的配置要以单个 job 的实测峰值为依据，不要靠估�
 | Metro | 1271 MB |
 | e2e | 623 MB |
 
-typecheck 的 3663 MB 是全场最高。CPU 方面，test 3.73 核、typecheck 3.31 核、Metro 3.34 核，单个 job 就几乎用满 4 核。
+typecheck 的 3663 MB 是全场最高。CPU 方面，test 3.73 核、typecheck 3.31 核、Metro 3.34 核，单个 job 就几乎用满 4 核。这些数是在 4 核机器上量的。测试框架和打包工具的 worker 数默认跟着核数走，换到核更多的机器上，同一个 job 可能用更多的核和内存，所以要在目标机器上重新量（10 章 10.1）。
 
-按此估算：单 job 峰值 ≈ 3.7 GB + 服务容器 0.6 GB + 系统 0.5 GB ≈ 4.8 GiB。因此 7.57 GiB 的机器只能跑 1 个并发 job。
+进程树的数加起来只能粗估整机。参考项目早先按「进程树 3.7 GB + 服务容器 0.6 GB + 系统 0.5 GB」估出单 job 约 4.8 GiB，漏掉了 docker build。后来按整机量：2026-09-14 完整跑一遍 ci.yml（含两次 docker build），7.57 GiB 的机器上可用内存最低只剩 1339 MB，也就是 CI 加系统最多占了约 6.3 GiB，减去系统的约 0.5 GiB，单 job 约 5.8 GiB。10 章取 J = 6 GiB 就是从这里来的。当时机器上是否开着开发工具已经确认不了，所以这个值偏保守。按这个数，7.57 GiB 的机器只能同时跑 1 个 job。
 
-**能不能跑 2 个并发 job（N=2），要用实验确认，不要用估算。** 参考项目实际注册了两个 runner，让两个 job 并发跑了两次，结果如下：
+一台机器能不能同时跑 2 个 job（同机 2 个 runner 实例，10 章记作 k=2），算过之后还要用实验确认。参考项目在第一台 4 核 7.57 GiB 的机器上注册了两个 runner，让两个 job 并发跑了两次，结果如下：
 
 | 第几次 | 报错 | 原因 |
 |---|---|---|
@@ -157,9 +190,9 @@ typecheck 的 3663 MB 是全场最高。CPU 方面，test 3.73 核、typecheck 3
 - 第 1 次：CPU 饥饿导致一条固定超时的测试失败。同一条测试在三次单 job 运行里全部通过。
 - 第 2 次：内核 OOM 杀掉了 tsc，触发 OOM 的是另一个 job 的 redis 容器。
 
-两次并发出现了两种不同的失败。这说明 N=2 会带来不确定的红叉（同一份代码时红时绿），这比慢更糟。它会让团队习惯「重跑一次就好了」，CI 的可信度从这里开始下降。
+两次并发出现了两种不同的失败，说明在这台机器上同机跑两个实例会带来不确定的红叉，同一份代码时红时绿。这种失败会让团队习惯「重跑一次就好了」，CI 的可信度会跟着下降。
 
-注意：第 1 次失败与内存无关。所以「加内存就能跑 N=2」不成立，CPU 会先成为瓶颈。
+注意：第 1 次失败与内存无关。所以在这台 4 核机器上，加内存也跑不了两个实例，CPU 会先成为瓶颈。核数和内存都更多的机器，资源上能跑几个按 10 章 10.2 算。现有脚本和参考项目的 workflow 每台机器只支持一个实例，要跑多个，先满足 10 章 10.6 的前提。眼下要提高并发，加机器最省事，参考项目扩容也是再加一台同规格的 4 核 8 GB，每台一个实例。
 
 ### 2.2 swap：不是否决项，但决定了两项配置
 
@@ -167,16 +200,21 @@ swap 为 0 不影响这台机能否选用，但会决定两项必须做的配置
 
 `swap = 0` 时，内存超限的结果是 OOM kill，而不会变慢。这里不要求加 swap，CI 场景下快速失败通常好过换页颠簸。需要做的是：
 
-- 必须设 `MemoryMax`，否则一个失控的 job 会拖垮整机。
-- 必须设 `OOMScoreAdjust`，否则内核按 RSS 挑选要杀的进程，可能杀掉 sshd 而不是 CI。
+- 必须设 `MemoryMax`，否则一个失控的 job 会拖垮整机。它只管 runner 的进程树，CI 起的容器不在里面，容器的内存要在 workflow 里用 `--memory` 限（04 章 4.3）。
+- 必须设 `OOMScoreAdjust`，否则内核按内存占用挑要杀的进程，可能杀掉你的 SSH 会话、监控脚本或别的服务。sshd 主进程会把自己调到 −1000，不会被杀，从它派生出的登录会话没有这层保护。这个值让 CI 先于普通进程被杀。机器上还开着开发工具时，先被杀的也会是 CI，要让开发工具先死，按 04 章 4.8 配。
 
-### 2.3 端口：被占用时 CI 会连错库
+这两项 bootstrap 都会设。
 
-端口被占用时，CI 照样能起来，但会连到占着端口的那个服务上。测试照常通过，数据却会被污染。
+### 2.3 端口：被占用时 CI 可能连错库
 
-原因：CI 的 `services:` 容器会独占宿主端口。如果这台机上已经有程序占着 6379，CI 就会连到那个 Redis 上。
+CI 要用的宿主端口被别的程序占着时，有两种结果：
 
-做法：装机前必须确认端口空闲。用 `ss -ltn` 对照你项目的端口清单检查。
+- `services:` 映射到宿主的端口被占，按 Docker 的默认配置，服务容器起不来，job 直接失败。这种容易发现。
+- CI 在宿主上直接起的进程（03 章的 `CI_APP_PORTS`，比如 e2e 拉起的 API）端口被占，测试可能连到占着端口的那个程序上，照常通过，数据却是错的。参考项目实测过这种假绿，见 05 章 ⑨。
+
+做法：装机前确认端口空闲。preflight 的 `CI_HOST_PORTS` 把这两类端口都填上，或者用 `ss -ltn` 对照你项目的端口清单检查。
+
+同一台机器上跑多个 runner 实例时，各实例会抢同一组宿主端口。这是参考项目每台只跑一个实例的原因之一，见 10 章 10.6。
 
 ### 2.4 连通性：四条阈值各管一件事
 
@@ -204,21 +242,23 @@ registry-1.docker.io           服务容器与基础镜像的 manifest
 auth.docker.io                 上面那个的鉴权
 ```
 
+依赖源按你的包管理器换：Python 是 `pypi.org` 和 `files.pythonhosted.org`，Go 是 `proxy.golang.org`，Maven 是 `repo.maven.apache.org`。preflight 默认测 npm，别的源用 `CI_EXTRA_ENDPOINTS` 加进去，比如 `CI_EXTRA_ENDPOINTS="https://pypi.org/simple/ https://files.pythonhosted.org/"`。
+
 官方 allowlist 里还有 `*.actions.githubusercontent.com`（pipelines/vstoken/results-receiver）、`codeload.github.com`、`objects.githubusercontent.com`。它们通常和上面几个走同一路径。一次成功的真实 runner run 比任何 curl 探针都更能证明它们是通的。
 
 统计口径上有两个坑：
 
-① IP 协议族。探针默认用 `curl -4`，但很多机器是双栈，而且 DNS 对 Docker/npm 优先返回 IPv6。生产实际走的那条栈可能根本没测到。`preflight.sh` 对两个协议族都测。
+① IP 协议族。探针如果写死 `curl -4`，在双栈机器上可能测错了栈：DNS 对 Docker、npm 这类地址常优先返回 IPv6，生产实际走的那条栈根本没测到。`preflight.sh` 的连通性测试不指定协议族，和生产流量一样由系统选，每行末尾标出实际走的是 IPv4 还是 IPv6。双栈机器上，有 IPv6 地址的端点一般走 IPv6，只有 IPv4 地址的端点走 IPv4（写这份手册时 `github.com`、`api.github.com`、`ghcr.io` 都只有 IPv4 地址）。只有 Docker Hub 配额那一项分别测了两个协议族。要让两个协议族都单独过阈值，用 `scripts/analysis/netprobe.sh` 和 `netprobe6.sh` 分别跑。
 
 ② 5xx 的计法。成功率要把 5xx 计为失败。宽口径（收到任何 HTTP 响应都算成功）会把对端故障也算成通过。参考项目实测：满载轮 400 个样本里，`api.github.com` 有 6 次 504，集中在 3 分钟窗口内。宽口径报 100%，严格口径是 98.50%，刚过 98% 的线。
 
-另外，400 个样本里的 6 个事件在数学上不会体现在 p95 上。所以 PASS 只能理解为「链路质量达标」，不能理解为「不会有偶发失败」。
+另外，400 个样本里的 6 个事件在数学上不会体现在 p95 上。所以 PASS 只说明链路质量达标，偶发失败仍然可能出现。
 
 ### 2.5 CPU 争抢：先确认仪器能不能用
 
 这一节说明为什么在很多云主机上不能用 steal 时间判断 CPU 争抢，以及改用什么方法。这是本章最容易被跳过、也最容易搞错的一项。
 
-很多云的宿主不向 guest 暴露 `KVM_FEATURE_STEAL_TIME`（CPUID `0x40000001` 的 bit5）。这时 `/proc/stat` 的 steal 列结构上恒为 0：内核根本拿不到这项数据，这个 0 不是测出来的。**任何基于 `%st` 的监控在这种机器上都是永久的假绿**。假绿指检查本该报警或失败，却显示正常；这里就是指标一直正常，实际什么也没测到。
+很多云的宿主不向 guest 暴露 `KVM_FEATURE_STEAL_TIME`（CPUID `0x40000001` 的 bit5）。这时 `/proc/stat` 的 steal 列结构上恒为 0：内核根本拿不到这项数据，这个 0 不是测出来的。任何基于 `%st` 的监控在这种机器上都是永久的假绿。假绿指检查本该报警或失败，却显示正常；这里就是指标一直正常，实际什么也没测到。
 
 检查方法如下：
 
@@ -233,16 +273,20 @@ print(hex(eax), 'STEAL_TIME bit5 =', (eax>>5)&1)"
 
 参考项目测得 `eax=0x0100005b`，bit5 = 0，steal 不可观测。第一轮测试曾把「steal 全程 0.00%」当作「无争抢」的证据。由于 steal 列恒为 0，那 1855 个样本得出 0.00% 是必然的，什么也证明不了。
 
-替代方法是测定长任务的墙钟时间。同样的活干 N 遍，如果被邻居抢核，就会变慢。
+替代方法是测定长任务的墙钟时间。同样的活干 N 遍，如果被邻居抢核，就会变慢。参考项目在一台机器上连跑 30 遍的结果：
 
 ```text
 n=30  p50=0.51s  max=0.52s  max/p50=1.02   ⇒ 无实质争抢
-判读：CV < 5% 且 max/p50 < 1.15
+判读：max/p50 < 1.15；样本多时再看 CV < 5%
 ```
+
+preflight 只跑 8 遍，只看 max/p50。
 
 注意：必须用定量负载，也就是固定工作量。不要用 `openssl speed -seconds N`：它是定时的，墙钟恒等于 N，测了等于没测。`preflight.sh` 用的是固定次数的 sha256。
 
-把这个 p50 记下来作为基线。装机后由 `ci-health.sh` 每小时采点，超过基线 1.4 倍就是争抢信号。
+这个数只能和同一台机器自己比，不能拿来比较两台机器的快慢。有 SHA 指令扩展（`/proc/cpuinfo` 里的 `sha_ni`）的 CPU 算 sha256 快得多，和跑 JS、Python 的快慢对不上，两个方向都可能测偏。参考项目里，没有 `sha_ni` 的 Intel Skylake 和有 `sha_ni` 的 AMD EPYC 比，sha256 慢约 5 倍，实际单核只慢约 2 倍；两台同为 EPYC 的机器，sha256 只差约 4%，Python 循环却差 15–25%。跨机比较单核用 2.7 的方法。
+
+把这个 p50 记下来，作为这台机器自己的基线（03 章的 `CI_FIXEDWORK_BASELINE`）。装机后由 `ci-health.sh` 每小时采点，超过基线 1.4 倍就是争抢信号。有多台 runner 时，每台用自己测的基线，不要抄别的机器的。
 
 ### 2.6 磁盘：看增量，不只看水位
 
@@ -269,63 +313,160 @@ docker volume prune  →  回收 634 MB           ← services 容器的匿名�
 
 参考项目的实际情况：
 
-- 上线前测得 13.7 GB / 74.8 GiB = 18%，原稿把这个当成了稳态。
+- 上线前测得 13.7 GB / 74.8 GiB = 18%。这只是第一周的水位，不是稳态。
 - 实际 10-12～10-16 稳定在约 47–49 GB / 65–68%。缓存长到 Max Used（20 GiB）后停住，可用空间约 23 GiB，不再下降。详见 08 章 8.2。
 
-管磁盘的理由不是「不清理会盘满」。BuildKit 自己有 GC 兜底，缓存不会无限增长。真正要关心的是两件事：
+BuildKit 自己有 GC 兜底，缓存不会无限增长，盘一般不会被缓存写满。要关心的是下面两件事：
 
 ① 盘给小了，GC 为了守住 Min Free 会反复驱逐缓存，构建就从温缓存退回冷构建。参考项目一次冷构建比温构建多约 65 秒。
 
-② 匿名卷不在 BuildKit 管辖范围内，Docker 以外的东西更没有任何机制管理。**这两部分没有上界**，要靠清理钩子和定期运维（08 章 8.6）。
+② 匿名卷不在 BuildKit 管辖范围内，Docker 以外的东西更没有任何机制管理。这两部分没有上界，要靠清理钩子和定期运维（08 章 8.6）。
 
-### 2.7 一张最低要求表（起点，按项目调）
+GC 的三个参数（Reserved、Max Used、Min Free）按盘的大小取，公式和各档的值见 10 章 10.4。参考项目 75 GB 的盘用 10 / 20 / 20 GB。
 
-下表汇总各项的最低要求。它只是起点，按你的项目调整。
+### 2.7 单核速度和超时余量
+
+核数和内存达标，不代表这台机器够快。共享 vCPU 的云主机，同一个套餐每次开出来的 CPU 型号可能不同，单核速度能差一倍。
+
+最先受影响的是单核受限的 job：被限成 1 个 CPU 的测试容器、单线程的类型检查和 lint，还有测试里写死的超时（2.1 里的 `Test timed out in 5000ms`）。这类 job 不会因为核多而变快，单核慢多少，耗时就涨多少，最后撞上 `timeout-minutes`。preflight 查不出这个问题。
+
+> 参考项目：找第二台机器时，先开到两台 Intel Skylake 的机器，`machine-check.sh` 的单核分数是 4.2–4.7。现有 runner（AMD EPYC-Rome）在跑 CI 时测的分数约 2.5，比值 1.7–1.9，两台都判为不合格。这个 REF 是忙时量的，偏大，实际差距只会更大。后来开到一台同为 EPYC-Rome 的 8 核机器，把真实的单核算法测试在上面跑了一遍，仍比现有 runner 慢 23%。最后用上的那台也是 EPYC-Rome（4 核），分数 2.91，比值 1.16，回放算法测试慢 13–18%。
+
+做法分四步。
+
+1. 拿参考分数。在现有的、跑得好好的 runner 上跑一次 `machine-check.sh`，记下它打印的「单核分数」。分数是耗时，越大越慢。最好挑它空闲的时候量（03 章 3.0）。只能在它跑 CI 时量的，加 `PAR=0` 跳过全核满载那一项，免得和 CI 抢核。这时测出的分数偏大，候选机的比值跟着偏小，判得偏松。比值接近 1.2 的候选机，要按第 4 步回放后再定。
+
+   ```bash
+   PAR=0 bash scripts/machine-check.sh                  # 在现有 runner 上；它空闲时不用加 PAR=0
+   REF=<上面的单核分数> bash scripts/machine-check.sh    # 在候选机上
+   ```
+
+2. 测候选机。拿到机器先跑。候选机分数 ÷ REF 不超过 1.2 判合格，不超过 1.4 判有保留，再大判不合格。不合格的直接删掉重开；按小时计费的云上，这样做几乎没有成本。脚本还会打印 CPU 型号、有没有 SHA 指令扩展，以及全核同时满载时单核掉速多少。掉速超过 1.3 倍，可能有邻居在抢 CPU，隔一会儿再测。
+
+   在 Hetzner 上可以把这一步交给 `scripts/hetzner-pick.py`：它用 API 开机，用运行者自己的 SSH 钥匙登进去跑 `machine-check.sh`，合格就停，不合格就删掉，随机等几分钟、优先换个机房再开，用法见 README 的「脚本」一节。别的云要自己写同样的循环，要点有三个：只删自己开的机器（打标签再按标签核对），中断时先删掉正在测的那台，设次数上限。
+
+   两台机器要用同一个 Python 大版本，否则分数没法比。同一个发行版版本自带的 python3 是一样的。不要拿 preflight 的 sha256 基线比两台机器（2.5）。
+
+   项目以 JS 为主时，可以再用 node 跑一个同类循环当旁证，两台机器的 Node 大版本也要一致：
+
+   ```bash
+   for i in 1 2 3; do node -e "let t=Date.now(),s=0;for(let i=0;i<5e8;i++)s+=i%7;console.log((Date.now()-t)/1000)"; done
+   ```
+
+3. 核对超时余量。记 R = 候选机耗时 ÷ 参考机耗时，先用第 2 步的分数比，有了第 4 步的回放结果就换成回放的比值。对每个跑在自建机上的 job 核对：
+
+   ```text
+   最长实测耗时 × R ≤ timeout-minutes × 2/3
+   ```
+
+   `timeout-minutes` 没写的默认 360 分钟。不满足时，先调大这个 job 的超时或者优化它，再不行就换一台机器。测试里写死的超时（比如 Jest 默认的 5000 ms）也按同样的比例核对。一台机器上跑 k 个实例时（10 章），左边再乘争核系数 M = max(1, k × C ÷ 核数)，C 是单 job 用核；每台一个实例时 M = 1。
+
+   最长实测耗时从 GitHub 取。下面这段列出最近 100 个成功的 run 里，每个自建 job 的最长耗时。`self-hosted` 可以换成你 `runs-on` 里的项目标签：
+
+   ```bash
+   REPO=owner/repo
+   gh run list --repo "$REPO" --limit 100 --status success --json databaseId -q '.[].databaseId' |
+   while read -r id; do
+     gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" -q '.jobs[]
+       | select(.conclusion == "success" and .completed_at != null and any(.labels[]; . == "self-hosted"))
+       | [.name, ((.completed_at|fromdate) - (.started_at|fromdate))] | @tsv'
+   done | sort -t$'\t' -k2,2nr | awk -F'\t' '!seen[$1]++ {printf "%-40s 最长 %d 秒\n", $1, $2}'
+   grep -rn "timeout-minutes" .github/workflows/
+   ```
+
+4. 回放最慢的 job。这是最可靠的证据。先用 `bootstrap.sh --skip-runner` 装好工具链和加固，不注册（03 章 3.0）。再以 runner 用户把最慢的那个 job 的命令原样跑一遍：检出代码、装依赖、按 workflow 里的命令跑。跑两遍，拿第二遍的耗时和现有机器上同一个 job 的耗时比，用这个比值当 R 再核一遍第 3 步。通过了再注册。第一台机器没有参考机，就和这个 job 在托管 runner 上的耗时比。
+
+### 2.8 最低要求汇总（起点，按项目调）
+
+下表汇总各项的最低要求。它只是起点，具体的数按 10 章的公式算。表里的 k 是一台机器上的 runner 实例数，现有脚本下 k = 1。
 
 | 项 | 建议下限 | 依据 |
 |---|---|---|
-| CPU | 单 job 实测峰值核数 + 1 | 参考项目单 job 吃 3.7 核 ⇒ 4 核 |
-| 内存 | 单 job 实测峰值 × 1.5 | 参考项目 4.8 GiB ⇒ ≥7 GiB |
-| 磁盘 | 按 2.6 的稳态公式估算，可用空间要高于 GC 的 Min Free | 参考项目稳态已用约 47–49 GB，74.8 GiB 的盘稳态可用约 23 GiB，高于 Min Free 20 GiB |
+| CPU 核数 | k × 单 job 用核 C（在目标机器上量，向上取整）；有人在这台机器上开发，再加 2 | 参考项目单 job 约 3.7 核，C 取 4，每台一个实例要 4 核。公式见 10 章 10.2 |
+| 单核速度 | `machine-check.sh` 的分数不超过参考机的 1.2 倍合格；1.2–1.4 倍要逐个核对超时余量，或者回放最慢的 job；超过 1.4 倍换一台 | 见 2.7 |
+| 内存 | 系统占用 S + k × 单 job 整机峰值 J + 开发工具 D + 余量 max(1 GiB, 总内存的 10%) | 参考项目 J 取 6 GiB、S 约 0.5 GiB，7.57 GiB 的机器刚好跑 1 个，不能兼开发。公式见 10 章 10.2 |
+| 磁盘 | 按 2.6 的稳态公式估算，稳态可用要高于 GC 的 Min Free | 参考项目 74.8 GiB 的盘稳态可用约 23 GiB，高于 Min Free 20 GiB。BuildKit 三个值按盘大小取，见 10 章 10.4 |
+| 端口 | CI 要用的宿主端口全部空闲 | 见 2.3 |
 | swap | 无所谓，但影响配置 | 见 2.2 |
 | 网络 | 四条阈值全过 | 见 2.4 |
+
+各种规格的机器该跑几个实例、参数怎么取，见 10 章 10.5 的推荐表。
 
 ---
 
 ## 03 装机与注册
 
-本章用 `scripts/bootstrap.sh` 一条命令完成装机和 runner 注册，后面各节逐项说明脚本每一步为什么这样做。
+本章用 `scripts/bootstrap.sh` 完成装机和 runner 注册，后面各节逐项说明脚本每一步为什么这样做。新机器建议分两次跑：第一次不注册，确认机器够快之后再注册，见 3.0。
+
+脚本的适用范围是 x86_64 的 Ubuntu（测过 24.04），一台机器一个 runner 实例。在别的架构上它一开始就退出。现在要提高并发就加机器（08 章 8.7）；一台机器跑多个实例要先满足 10 章 10.6 的前提。
 
 ```bash
+read -rsp 'PAT: ' GH_TOKEN; echo; export GH_TOKEN
 GH_REPO=owner/repo \
-GH_TOKEN=<一次性 PAT> \
 RUNNER_NAME=ci-$(hostname -s) \
-RUNNER_LABELS=self-hosted,linux,x64,ci \
+RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
+CI_LABEL=com.myorg.ci=1 \
 CI_APP_PORTS="3100 3101" \
-CI_FIXEDWORK_BASELINE=0.51 \
-PNPM_VERSION=11.21.0 \
+CI_FIXEDWORK_BASELINE=<这台机器上 preflight 给的 p50> \
 bash scripts/bootstrap.sh
+unset GH_TOKEN
 ```
 
-`bootstrap.sh` 是幂等的：重复运行不会破坏已有配置，只补齐缺少的部分。已在一台配置完成的机器上重跑验证过：12 项关键状态逐字节相同，只有注释文本被标准化。
+第一行用 `read -s` 输入一次性 PAT，这样它不会留在 shell 历史里（3.4）。注册完去 GitHub 撤销这个 PAT。标签、端口和 `CI_LABEL` 是参考项目的取值，要换成你自己的，各项怎么定见 3.1。没写出来的参数用默认值。`PNPM_VERSION` 可选，留空就交给 workflow 里的 action 处理。
+
+`bootstrap.sh` 是幂等的：重复运行不会破坏已有配置，只补齐缺少的部分。参数会落盘到 `/etc/ci-runner.env`，重跑时没显式传的从那里读回。已在一台配置完成的机器上重跑验证过：12 项关键状态逐字节相同，只有注释文本被标准化。2026-10-19 在全新的 Ubuntu 24.04 上从零安装时跑出过几处问题（09 章 A15–A17），修复后当天和 10-25 两次在全新机器上用 `--skip-runner` 跑通，退出码 0。修复之后，注册加 verify 的完整流程还没有在全新机器上跑过。之后新加的等 apt 锁、检查架构和 uid、注册前查同名这几处只在沙箱里单独测过，还没在真机上整体跑过。
+
+在已经接 job 的机器上重跑之前，先等它空闲，用 `systemctl stop` 停掉 runner 服务再跑，脚本最后会重新启动它。原因是脚本只在开头查一次有没有 job，跑的几分钟里接到的 job 会被最后那次重启打断；改了 BuildKit 参数还会重启 docker。具体步骤见 08 章 8.7。
+
+### 3.0 装机前
+
+拿到一台新机器，按下面的顺序做。
+
+1. 用密钥登录。Ubuntu 24.04 的 sshd 默认 `PermitRootLogin prohibit-password`，root 只能用公钥登录。云厂商发来的 root 口令是对的，登录时也提示可以输口令，照样会被拒（09 章 A21）。建机器时就填上 SSH 公钥。忘了填的，用云控制台的网页终端登进去，把公钥写进 `/root/.ssh/authorized_keys`。
+2. 测单核速度。`scripts/machine-check.sh` 只依赖 python3，一分钟左右打印硬件信息和单核分数。先在现有的 runner 上跑一次，拿到它的分数，最好挑它空闲的时候跑；它正在跑 CI 时加 `PAR=0`，跳过全核满载那一项。再在新机器上用 `REF=<现有 runner 的分数>` 跑，脚本会判合格、有保留或不合格。不合格就删掉重开，按小时计费的云上这样做几乎没有成本。第一台没有参考机，只记下分数，以后加机器时拿它当 REF。怎么判读、超时余量怎么核对，见 02 章 2.7。端口、网络、争抢这些检查用 `preflight.sh`（02 章）。
+3. 等 apt 锁。新机器刚开机时，cloud-init 和自动升级常占着 dpkg 锁，这时 apt-get 会直接失败。bootstrap 会先等 cloud-init 跑完，之后每次 apt-get 遇到锁最多等 10 分钟（`APT_LOCK_WAIT` 可调，设成 0 表示不等）。在它之前要手工装东西的，先跑 `cloud-init status --wait`，apt-get 加 `-o DPkg::Lock::Timeout=600`。注意这个选项只管 install，`apt-get update` 遇到锁仍然直接失败，要自己重试。
+4. 先建 runner 用户，固定 uid。bootstrap 第一次运行时按 `RUNNER_UID`（默认 1000）建 runner 用户，所以要在建开发用户等其他普通用户之前跑它。原因和处理办法见 3.3。
+5. 分两次跑 bootstrap。第一次带上全部参数、不给 token，加 `--skip-runner`：装工具链、做加固、建 runner 用户，不注册。然后以 runner 用户把最慢的那个 job 回放一遍，和现有机器的耗时比（02 章 2.7）。通过了，再输入 PAT 重跑一次完成注册。第二次的参数从 `/etc/ci-runner.env` 读回，不用再传。
+
+   ```bash
+   # 第一次：不注册，不需要 token
+   GH_REPO=owner/repo RUNNER_NAME=... RUNNER_LABELS=... CI_LABEL=... CI_APP_PORTS=... \
+   CI_FIXEDWORK_BASELINE=... bash scripts/bootstrap.sh --skip-runner
+
+   # 回放最慢的 job，比耗时（02 章 2.7）
+
+   # 第二次：注册并启动 runner
+   read -rsp 'PAT: ' GH_TOKEN; echo; export GH_TOKEN
+   bash scripts/bootstrap.sh
+   unset GH_TOKEN
+   ```
+
+   这样单核慢的机器在接到真实的 job 之前就能发现。
 
 ### 3.1 参数怎么定
 
+第三列是参考项目的取值，只是示例。内存、OOM 优先级、BuildKit 这几项按机器规格怎么取，见 10 章的公式和推荐表。
+
 | 变量 | 怎么定 | 参考项目取值 |
 |---|---|---|
-| `RUNNER_LABELS` | 至少一个项目专属标签，不要只用 `self-hosted` | `myproj-ci` |
-| `RUNNER_MEM_MAX` | 单 job 实测峰值 × 1.3 | `6G`（峰值 4.8 GiB） |
-| `RUNNER_OOM_ADJ` | runner 被内核 OOM 挑中的优先级，见 04 章 4.3。机器只跑 CI 用默认值；还跑着开发工具、要它们先被杀时，取满足 (1000 − 本值) / 1000 × 总内存 > `RUNNER_MEM_MAX` 的值 | `800`（只跑 CI）；8G 机器上和开发工具共用时 `200` |
+| `RUNNER_NAME` | 每台机器唯一。注册时带 `--replace`，同名会顶掉另一台的注册。脚本注册前会查 GitHub 上有没有同名的，有就停下（3.4）。默认取主机名，云上主机名可能重复，有多台机器时显式传 | `ci-<主机名>`（默认） |
+| `RUNNER_LABELS` | 至少一个项目专属标签，不要只用 `self-hosted`。多台机器用同一套 | `self-hosted,linux,x64,myproj-ci` |
+| `RUNNER_UID` | 所有 runner 机器一致，见 3.3。只在新建 runner 用户时用 | `1000`（默认） |
+| `RUNNER_MEM_MAX` | 不低于 runner 进程树实测峰值的 1.3 倍，不高于 10 章 10.3 的上限。进程树峰值用 `step.sh`（02 章 2.1）或 runner 单元 `memory.stat` 里的 anon 加 shmem 量，不含容器。`systemctl show -p MemoryPeak` 含页缓存，不能直接拿来乘。这个值只跟 job 有关，换大机器不用调大 | `6G`（进程树峰值约 3.7 GB） |
+| `RUNNER_OOM_ADJ` | runner 被内核 OOM 挑中的优先级。机器只跑 CI 用默认值。还开着开发工具、要它们先被杀时，取满足 (1000 − 本值) / 1000 × 总内存 > `RUNNER_MEM_MAX` 的值。原理见 04 章 4.3，各内存档的取值见 10 章 10.3 | `800`（只跑 CI）；约 7.6 GiB 的机器兼开发时 `200` |
 | `CI_APP_PORTS` | CI 在宿主上监听的端口，不填容器端口 | `3100 3101`（e2e 拉起的 API） |
 | `CI_LABEL` | 与 workflow 里 `docker run --label` 的值逐字一致 | `com.myorg.ci=1` |
-| `CI_FIXEDWORK_BASELINE` | `preflight.sh --with-load` 给出的 p50 | `0.51` |
-| `BUILDKIT_MAX_USED` / `MIN_FREE` | 按盘大小定，不用出厂默认值 | `20GB` / `20GB` |
+| `CI_FIXEDWORK_BASELINE` | 这台机器上 `preflight.sh --with-load` 给出的 p50。每台各测各的，不能抄别的机器，也不能拿来比两台机器的快慢（02 章 2.5） | `0.51`（第一台） |
+| `BUILDKIT_RESERVED` / `BUILDKIT_MAX_USED` / `BUILDKIT_MIN_FREE` | 按盘大小定，不用出厂默认值，公式见 10 章 10.4。已部署的机器上改了 `BUILDKIT_MIN_FREE`，磁盘告警阈值不会跟着重算，做法也见 10.4 | 75 GB 盘：`10GB` / `20GB` / `20GB`；150 GB 盘：`10GB` / `40GB` / `30GB` |
+| `METADATA_IP` | 云 metadata 服务的地址，bootstrap 拦住 CI 访问它。多数云用默认值，阿里云、腾讯云等不同，见 04 章 4.5。旧版脚本没有把它落盘，这样的机器第一次用新版重跑时要显式传一次 | `169.254.169.254`（默认） |
 
 注意：`CI_LABEL` 必须和 workflow 里 `docker run --label` 的值逐字一致。清理钩子（`scripts/ci-cleanup.sh`，见 04 章 4.4）靠这个标签认领容器。
 
-### 3.2 工具链：托管 runner 预装约 100 个工具，自建 runner 什么都没有
+参数落盘在 `/etc/ci-runner.env`，里面有 `RUNNER_NAME` 和这台机器自己测的基线。不要把它拷到别的机器，新机器照本章重新定参数（3.6）。
 
-自建 runner 上缺工具，是装机时最容易被低估的问题。安装前先查清 workflow 用到了哪些命令：
+### 3.2 工具链：workflow 用到的命令都要自己装
+
+托管 runner 预装了约 100 个工具，自建 runner 上默认没有。缺工具是装机时最容易被低估的问题。安装前先查清 workflow 用到了哪些命令：
 
 ```bash
 grep -rhoE '\b(gh|jq|yq|aws|az|gcloud|make|cmake|gcc|python3|zstd|unzip)\b' .github/workflows/ | sort -u
@@ -345,6 +486,8 @@ grep -rhoE '\b(gh|jq|yq|aws|az|gcloud|make|cmake|gcc|python3|zstd|unzip)\b' .git
 
 Node 用官方 tarball 装到 `/opt/node`，不用发行版的包。这份 Node 供 runner 自身和运维脚本使用；workflow 里的 `actions/setup-node` 仍然自己管理版本。
 
+解压时要加 `--no-same-owner`。官方包里的文件属主是 uid 1001，root 解压时默认照搬属主，机器上恰好是 uid 1001 的用户就能改掉 root 和 CI 都会执行的 node（09 章 A16）。脚本已经这样做了。Node 大版本没变时脚本不会重新解压，所以它每次运行都会检查 `/opt/node`，有不归 root 的文件就把属主收回 root。旧版脚本装的机器，重跑 bootstrap 就能修好，也可以手工执行 `chown -R root:root /opt/node`。检查命令是 `find /opt/node ! -user 0 | head`，没有输出就对了。
+
 ### 3.3 runner 用户：`docker` 组 ≈ 免密宿主 root
 
 runner 用户必须加入 `docker` 组，而 `docker` 组等价于免密的宿主 root。
@@ -359,20 +502,59 @@ runner 用户必须加入 `docker` 组，而 `docker` 组等价于免密的宿�
 - 在私有仓里，这指所有有 push 权限的协作者，可以接受。
 - 它也包括被投毒的第三方 action。05 章 ⑪ 的供应链措施防的就是这种情况，有实际必要。
 
+开发用的账号另建，不要加进 `docker` 组，见 04 章 4.8。
+
+#### runner 用户的 uid：每台机器一致
+
+所有 runner 机器上，runner 用户用同一个 uid，参考项目用 1000。
+
+原因在工作区。常驻机器上工作区跨 job 复用，下一个 job 的 checkout 要先清掉上一次留下的文件。CI 容器往挂进去的工作区写文件时，文件属主是容器里进程的 uid。很多镜像里的普通用户是 uid 1000，比如 node 官方镜像自带的 `node` 用户（这个镜像默认以 root 运行，要在 workflow 里用 `--user` 切过去）。runner 也是 1000 时，这些文件归它，下一次 checkout 删得掉。runner 换成别的 uid，checkout 清理工作区时会报 `EACCES`，job 在第一步就失败（09 章 A19）。以 root 运行的容器写下的文件属于 uid 0，runner 是哪个 uid 都删不掉，处理办法见 05 章 ⑬。
+
+做法：
+
+- bootstrap 新建 runner 用户时用 `RUNNER_UID` 指定 uid，默认 1000。这个 uid 已经被别的用户占了，脚本报错退出，不会让 `useradd` 悄悄换一个。
+- 所以拿到新机器先跑 bootstrap（3.0），再建开发用户等其他普通用户。
+- 有的云镜像自带一个 uid 1000 的默认用户，比如 AWS 上的 `ubuntu`。这种机器要么先把它删掉或改到别的 uid，要么所有 runner 机器统一用另一个 uid，并确认容器写文件时用的也是它。
+- runner 用户已经存在时，bootstrap 不改它的 uid，只在和 `RUNNER_UID` 不一致时打印一行提示。已部署的机器重跑不受影响。
+
 ### 3.4 注册：用一次性 token，不留常驻凭据
 
 注册时用一次性 PAT 换取 registration token，不在机器上留常驻凭据。
 
 ```bash
-# registration token 有效期 1 小时，用完即弃
-REG=$(curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" \
-  "https://api.github.com/repos/$GH_REPO/actions/runners/registration-token" | jq -r .token)
+# registration token 有效期 1 小时，只能用来注册 runner。
+# PAT 经标准输入交给 curl（-H @-），不进命令行参数。printf 是 bash 内建命令，不单独起进程。
+REG=$(printf 'Authorization: Bearer %s\n' "$GH_TOKEN" \
+  | curl -fsS -X POST -H @- \
+      "https://api.github.com/repos/$GH_REPO/actions/runners/registration-token" | jq -r .token)
 sudo -u runner ./config.sh --unattended --url "https://github.com/$GH_REPO" \
   --token "$REG" --name "$RUNNER_NAME" --labels "$RUNNER_LABELS" --work _work --replace
 ```
 
-- `GH_TOKEN` 只在这一步用一次，用来换取 registration token。脚本不会把它写进任何文件。
-- 建议用 fine-grained PAT，只授予目标仓库的 `Administration: read&write` 权限，用完撤销。
+PAT 的处理：
+
+- `GH_TOKEN` 只在注册时用，做两件事：查 runner 的最新版本号，换取 registration token。脚本不会把它写进任何文件。
+- 建议用 fine-grained PAT，只授予目标仓库的 `Administration: read&write` 权限，注册完立刻撤销。
+- 不要把 `GH_TOKEN=...` 写在交互式命令行上，它会留在 `~/.bash_history`。CI job 以 runner 用户运行，runner 在 `docker` 组里，读得到机器上的任何文件（3.3）。用 `read -rs GH_TOKEN` 输入后 `export`。
+- 也不要把 PAT 放进命令行参数。命令行参数本机所有用户都看得到（`ps`、`/proc/<pid>/cmdline`），所以脚本里的两处 curl 都从标准输入读 token。
+- 从另一台机器远程装的，经标准输入把 token 写进新机器上一个 0600 的临时文件，`source` 之后马上删掉，再跑 bootstrap。一定要在 runner 启动之前删，runner 一启动就可能接 job。
+- registration token 会短暂出现在 `config.sh` 的命令行参数里。它只能用来注册 runner，1 小时后失效，而且注册时 runner 还没启动、机器上没有 job。注册时机器上不要有别人登录。
+
+`--replace` 会顶掉同名的已有注册，不报错。名字撞上另一台在用的机器时，那台从此接不到 job，而按名字查 GitHub 上的状态还是 online（在线的是新机器），很难发现（09 章 A18）。所以 `RUNNER_NAME` 每台必须不同，多台机器的其他注意事项见 08 章 8.7。
+
+为此 bootstrap 在调 `config.sh` 之前，会用同一个 PAT 查一次仓库里的 runner 列表。查到同名的注册（不管在线还是离线）就报错退出，不注册。这时分两种情况：
+
+- 那是另一台还在用的机器：换一个名字，用 `RUNNER_NAME=<新名字>` 重跑。
+- 那条注册确实已经作废，比如这台机器重装之前留下的，或者对应的机器已经撤掉：先在仓库的 Settings → Actions → Runners 里删掉它再重跑，或者重跑时加 `FORCE_REPLACE=1`，让 `--replace` 顶掉它。
+
+手工注册时没有这层检查，先按 08 章 8.7 的命令列一遍已有的 runner。
+
+启动顺序：注册之后脚本只把服务装好，不启动。等 04 章的 systemd 加固、清理钩子和 metadata 拦截都就位，最后才启动一次（09 章 A17）。原因有两个：
+
+1. runner 一上线就会去接排队的 job。先启动再加固，紧接着的重启会把这个 job 打断。
+2. runner 只在启动时读 `.env` 里的钩子。启动早了，那一轮接到的 job 没有清理钩子。
+
+手工注册也按这个顺序。
 
 ### 3.5 不要加 `--ephemeral`
 
@@ -390,7 +572,7 @@ bin/RunnerService.js:  "Runner listener exit with 0 return code, stop the servic
 1. `Restart=always` 把服务拉起来也没用，因为它已经没有注册信息了。
 2. 要恢复，必须拿一个新的 registration token。这意味着机器上必须常驻管理员凭据，和「用完撤销 token」的做法直接冲突。
 
-一次没被发现的注销，会造成**最长 24 小时全员 CI 停摆**。原因有两点：
+一次没被发现的注销，会造成最长 24 小时全员 CI 停摆。原因有两点：
 
 - GitHub 对排队 job 的自动取消时限是 24 小时。
 - 回退开关救不了已经排队的 job。
@@ -403,18 +585,23 @@ bin/RunnerService.js:  "Runner listener exit with 0 return code, stop the servic
 
 ```text
 /opt/actions-runner/          runner 本体
-├── .env                      两个钩子的挂载点（JOB_STARTED / JOB_COMPLETED）
+├── .env                      两个钩子的挂载点（JOB_STARTED / JOB_COMPLETED），runner 只在启动时读
 ├── .runner .credentials*     注册信息（别备份、别进快照，原因见下）
 ├── hooks/ci-cleanup.sh       清理脚本
 └── _work/                    工作区，跨 job 复用（这正是自建比托管快的原因）
     ├── <repo>/<repo>/        checkout 落点
-    ├── _temp/                $RUNNER_TEMP —— 每 job 新建并清理
+    ├── _temp/                $RUNNER_TEMP，每个 job 新建并清理
     └── _tool/                setup-node 等的工具缓存（约 200 MB，跨 job 复用）
 /opt/node/                    Node 运行时
 /usr/local/bin/ci-health.sh   健康采点
+/etc/cron.d/ci-health         每小时跑一次 ci-health.sh，基线和磁盘阈值也写在这里
+/etc/ci-runner.env            本机的部署参数（无密钥，0644），重跑 bootstrap 时读回。不要拷到别的机器
+/etc/ci-health.env            监控用的只读 token 和告警地址（0600）
 ```
 
 注意：`.runner` 和 `.credentials*` 是注册信息，不要备份，也不要放进快照。`.credentials` 和 `.credentials_rsaparams` 里是这台 runner 的身份凭据（含 RSA 私钥）：拿到这两个文件的人可以冒充这台 runner 去领 job，而 job 能读到仓库的 secrets；把快照恢复到另一台机器上，还会出现两台机器用同一个身份抢 job 的情况。
+
+`/etc/ci-runner.env` 也不要跟着快照或拷贝走。它存着 `RUNNER_NAME`，用快照克隆或拷文件做出第二台时，新机器会带着同一个名字去注册。bootstrap 查到同名会停下（3.4），但加了 `FORCE_REPLACE=1` 或者手工注册时，第一台的注册就被顶掉了。新机器照 3.0 从头装，参数重新定。
 
 ---
 
@@ -422,9 +609,11 @@ bin/RunnerService.js:  "Runner listener exit with 0 return code, stop the servic
 
 `bootstrap.sh` 已经完成了这一章的大部分操作。本章逐条说明每项配置的理由，其中有几条和直觉相反。
 
+文中的具体数值，比如 `MemoryMax=6G`、BuildKit 的 10GB / 20GB / 20GB，都是参考项目的取值，来自它的第一台 runner：4 核、约 7.6 GiB 内存、75 GB 盘。你的机器按 10 章的公式和推荐表定。
+
 ### 4.1 Docker 守护进程
 
-daemon.json 里要有这两项：
+daemon.json 里要有这两项。下面 GC 的三个数是参考项目 75 GB 盘的取值，别的盘大小见 10 章 10.4：
 
 ```json
 {
@@ -437,14 +626,14 @@ daemon.json 里要有这两项：
 
 #### BuildKit GC 上限
 
-出厂默认值对小盘来说太松，实测 Max Used 为 55.88 GiB，Min Free 为 13.97 GiB。
+出厂默认值按盘大小的比例算，对 CI 机来说太松。参考项目 75 GB 的盘上，出厂的 Max Used 是 55.88 GiB，Min Free 是 13.97 GiB，大约是盘的四分之三和五分之一。
 
 写法上踩过两个坑：
 
 - `"defaultKeepStorage": "10GB"` 只映射到 Reserved Space，会丢掉 `Min Free` 保护。
 - 在顶层直接写 `reservedSpace`/`maxUsedSpace`/`minFreeSpace` 会被静默忽略。daemon 不报错，回落到出厂值。
 
-所以**必须用 `policy` 数组，三个参数写全**。
+所以要用 `policy` 数组，三个参数写全。
 
 改完后确认三项都在：
 
@@ -452,34 +641,47 @@ daemon.json 里要有这两项：
 docker buildx inspect default | grep -A6 'rule#0'
 ```
 
+三个值按盘大小怎么取，见 10 章 10.4。两个参考点：75 GB 的盘取 10GB / 20GB / 20GB，150 GB 的盘取 10GB / 40GB / 30GB。
+
+磁盘告警阈值跟着 Min Free 走。bootstrap 按 Min Free + 1 GiB 算出 `CI_DISK_WARN_MB`，写进 `/etc/ci-runner.env`。这个值落盘以后，重跑 bootstrap 会读回旧值，不会按新的 Min Free 重算。所以在已部署的机器上改 `BUILDKIT_MIN_FREE` 时，要么同时显式传新的 `CI_DISK_WARN_MB`，要么先把 env 文件里那一行删掉。
+
 #### `live-restore: true`
 
 不开的话，dockerd 一旦重启（比如由 unattended-upgrades 触发），当前 job 的 `services` 容器会当场全部被杀掉。这时报错会指向业务代码，排查方向会完全错。
+
+#### 在已部署的机器上改参数
+
+本章各项参数（BuildKit 三个值、`RUNNER_OOM_ADJ`、`RUNNER_MEM_MAX` 等）在已部署的机器上要改，做法是重跑 bootstrap。重跑之前先等机器空闲，用 `systemctl stop` 停掉 runner 服务。bootstrap 只在开头查一次有没有 job，跑的几分钟里接到的 job 会被末尾的重启打断；daemon.json 有变化时，它还会重启 docker。脚本最后会重新启动 runner。有多台机器时一次只动一台，步骤见 08 章 8.7。
 
 ### 4.2 别让自动升级打断 job
 
 本节要防的是：自动升级在 job 中途重启 containerd 或 runner 服务，把 job 打断。
 
-Ubuntu 的 `unattended-upgrades` 默认每日运行。`needrestart` 的 APT 钩子默认 `-m u`，即自动重启受影响的服务。
+本节按 Ubuntu 写。Ubuntu 的 `unattended-upgrades` 默认每日运行。`needrestart` 的 APT 钩子默认 `-m u`，即自动重启受影响的服务。needrestart 是 Ubuntu 服务器版默认装的；Debian 有这个包，但默认不装。没装 needrestart 的系统可以跳过这一节，bootstrap 发现没有 `/etc/needrestart` 目录也会跳过。别的发行版的自动更新机制不一样，原则相同：不要让它在 job 中途重启 containerd、docker 和 runner。
 
 出厂配置已经豁免了 `docker`：`/etc/needrestart/needrestart.conf` 的 `override_rc` 里有 `qr(^docker) => 0`。但 `containerd` 不在名单里，而 Docker 29 的镜像与容器都由 containerd 承载。所以要补上 containerd 一条，再加上 runner 服务自身：
 
 ```perl
 # /etc/needrestart/conf.d/90-ci-containerd.conf
 $nrconf{override_rc}->{qr(^containerd)} = 0;
-$nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;   # runner 自己（2026-10 补）
+# runner 服务本身
+$nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;
 ```
 
-注意：本手册第一版写了 docker 和 containerd 两条，其中 docker 那条是多余的。写之前先查一下你机器上的出厂名单。
+docker 已经在出厂名单里，不用重复写。不同版本的出厂名单可能不一样，写之前先查一下：
+
+```bash
+grep -n override_rc -A12 /etc/needrestart/needrestart.conf
+```
 
 #### runner 服务本身也要豁免
 
-这一条是上线第 25 天出事后，于 2026-10-16 补上的。
+参考项目出过一次事：
 
 - 2026-10-02 06:06，一次 libssl 自动安全更新让 needrestart 在 job 中途重启了 runner 服务。
 - 那个 job 当场被打断，GitHub 上记为 Failed，只能重跑。经过见 09 章 A13。
 
-豁免的代价是 runner 会一直用旧库，直到下次重启。所以要配一条运维纪律：**每月找一个没有 job 的时间重启一次机器**（见 08 章 8.6）。
+豁免的代价是 runner 会一直用旧库，直到下次重启。所以要配一条运维纪律：每月找一个没有 job 的时间重启一次机器（见 08 章 8.6）。有多台机器时一台一台来（08 章 8.7）。
 
 `unattended-upgrades` 默认 `Automatic-Reboot "false"`，不会自己重启机器，这一项不用改。
 
@@ -493,24 +695,53 @@ $nrconf{override_rc}->{qr(^actions\.runner\.)} = 0;   # runner 自己（2026-10 
 [Unit]
 After=docker.service docker.socket
 Wants=docker.service
-StartLimitIntervalSec=0        # ← 缺这行等于白写，见下
+# 缺这行等于白写，见下
+StartLimitIntervalSec=0
 
 [Service]
 Restart=always
 RestartSec=10
-OOMScoreAdjust=800             # 默认值，bootstrap 的 RUNNER_OOM_ADJ 可改，见下
+# 默认 800，由 bootstrap 的 RUNNER_OOM_ADJ 设，取值见下
+OOMScoreAdjust=800
 MemoryAccounting=yes
+# 参考项目的值，取值见 10 章 10.3
 MemoryMax=6G
 ```
+
+注意：systemd 的 unit 文件不支持行尾注释，`#` 只有放在行首才算注释。写在值后面会被当成值的一部分，这一行解析失败，systemd 在日志里记一条警告后直接忽略它。bootstrap 生成的 override 没有这个问题，手工照抄时要注意。
 
 四条各自的理由：
 
 - `After=docker`：出厂 unit 不写这个依赖。实测 runner 就绪只比 dockerd 晚 1.3 秒，而且两者完全无序。重启后 runner 可能先接到 job，docker 才起来。
-- `StartLimitIntervalSec=0`：systemd 默认 `StartLimitBurst=5` / `Interval=10s`。不关掉的话，`Restart=always` 在连续失败 5 次后会被标成 `failed` 并停止重试。**只写 `Restart=always` 是不够的**，这是最容易漏的一行。
-- `OOMScoreAdjust=800`：swap=0 的机器上，内存不够时进程会被 OOM kill，不会只是变慢。内核按 RSS 挑要杀的进程，不知道哪些是 CI 这样的「客人」。这一行让 CI 先被杀，别把 sshd 带走。800 是默认值，由 bootstrap 的 `RUNNER_OOM_ADJ` 设。机器上还跑着开发工具（VS Code、Claude、Codex 等）、又要它们比 CI 先被杀时，光把它们设成 1000 不够：内核按「内存占用 + adj × 总内存 / 1000」挑，8G 的机器上差 200 只抵约 1.5 GiB，大的 CI 进程照样排在前面。要保证就得满足 (1000 − 本值) / 1000 × 总内存 > `RUNNER_MEM_MAX`，8G 机器上取 200。
-- `MemoryMax`：一个失控的 job 只杀死自己。
+- `StartLimitIntervalSec=0`：systemd 默认 `StartLimitBurst=5` / `Interval=10s`。不关掉的话，`Restart=always` 在连续失败 5 次后会被标成 `failed` 并停止重试。只写 `Restart=always` 是不够的，这是最容易漏的一行。
+- `OOMScoreAdjust`：swap=0 的机器上，内存不够时进程会被 OOM kill，不会只是变慢。内核不知道哪些进程是 CI 这样的「客人」。这一行让 CI 比系统服务先被杀。取值见下面「OOM 优先级怎么定」。
+- `MemoryMax`：一个失控的 job 只杀死自己。它按 runner 进程树的实测峰值定，只跟 job 有关，换大内存的机器不用调大，取值见 10 章 10.3。
 
-注意：`MemoryMax` 只管 runner 进程树。CI 起的容器是 dockerd 的子进程，不在这个范围内。要管住它们，得用 `--cgroup-parent`，或者给服务容器加 `--memory`。
+注意：`MemoryMax` 只管 runner 的进程树。CI 起的容器由 containerd-shim 托管，cgroup 在 `system.slice/docker-<容器ID>.scope` 下，不在 runner 的 cgroup 里。docker build 的 RUN 步骤由 dockerd 执行，也不算在里面。所以：
+
+- 整机内存够不够，不能拿 `MemoryMax` 或 runner 进程树的峰值推。要在跑满一整轮 CI 时记下整机可用内存的最低值，最重的几个 job 都要跑到。用 `scripts/analysis/sysmon.sh` 记，它每 5 秒记一行，量法见 10 章 10.1。
+- 要管住容器，给容器加 `--memory`。也可以建一个带 `MemoryMax` 的 slice，用 `--cgroup-parent` 把容器放进去。Ubuntu 24.04 上 Docker 用 systemd cgroup 驱动，这里只能写 slice 名，比如 `ci.slice`。后一种做法参考项目没有实测。
+
+#### OOM 优先级怎么定
+
+内核给每个进程打一个分：内存占用 + adj × 总内存 ÷ 1000，分最高的先被杀。这里的总内存是内存加 swap，adj 的范围是 −1000 到 1000。
+
+机器只跑 CI 时，用默认值 800。CI 进程比系统服务（adj 是 0）先被杀。sshd 的监听进程会自己把自己设成 −1000，不会被选中。
+
+CI 起的容器不归 runner 的 unit 管。docker 默认给容器里的进程 0，启动时用 `--oom-score-adj` 单独设过的除外（services 写在 `options` 里）。所以只跑 CI 时，容器和系统服务一起按内存大小排。参考机的内核日志里两种情况都有：全局 OOM 杀过容器里 adj 为 0 的 node 进程；也有 adj 为 300 的容器在自己的 `--memory` 上限内被杀，那些容器是启动时单独设过的。想让容器也排在系统服务前面，就给它们加 `--oom-score-adj`。哪些容器设了、设的多少，以你的 workflow 和测试代码为准。
+
+机器上还有开发工具时（VS Code 远程服务端、Claude Code、Codex 等），又要它们比 CI 先被杀，先按 4.8 把开发会话设成 1000，再调低 runner 的值。只靠 1000 对 800 不够：两者差 200，只抵 0.2 × 总内存，8 GB 的机器上约 1.5 GiB，一个大的 CI 进程照样排在开发工具前面。runner 的值要满足：
+
+```text
+(1000 − RUNNER_OOM_ADJ) ÷ 1000 × 总内存 > RUNNER_MEM_MAX
+也就是 RUNNER_OOM_ADJ < 1000 × (1 − RUNNER_MEM_MAX ÷ 总内存)，再往下取整到百
+```
+
+单个 CI 进程最多涨到 `RUNNER_MEM_MAX`，再大就先撞上 runner 自己的上限。所以只要满足这个式子，开发工具哪怕只占一点内存，分也比任何一个 CI 进程高。容器的 adj 默认是 0，一定排在开发工具后面。启动时单独设过 adj 的容器，把式子里的 RUNNER_OOM_ADJ 换成它的 adj、RUNNER_MEM_MAX 换成它的 `--memory` 上限，满足了也排在开发工具后面。
+
+例子：`RUNNER_MEM_MAX=6G`、总内存约 7.6 GiB 时，上限约 210，取 200。别的内存档的取值见 10 章 10.3。
+
+这个式子只决定先杀谁，不解决内存不够。CI 加开发工具放不下时，调了 adj 也只是每次 OOM 改成先杀开发工具。内存够不够，按 10 章 10.2 把开发工具的占用算进去。
 
 验证：
 
@@ -528,18 +759,35 @@ ACTIONS_RUNNER_HOOK_JOB_COMPLETED   ← 顺手
 ci-cleanup.timer（每日）             ← 兜底
 ```
 
+#### 钩子怎么装才算数
+
+runner 只在启动时读 `<RUNNER_HOME>/.env`。`.env` 里这两行挂载点新加了或改了，要重启 runner 服务才生效。只改钩子脚本的内容不用重启，runner 每个 job 都会重新读一遍脚本再执行。
+
+所以 bootstrap 注册之后只装服务、不启动。systemd 加固、钩子、metadata 拦截都就位后，在最后统一启动一次。先启动的话，新 runner 一上线就会去接排队的 job，后面的重启会把它打断，而且那一轮跑的 job 没有清理钩子（09 章 A17）。手工装的时候也按这个顺序。
+
+更新钩子时，先写到 `ci-cleanup.sh.new`，以 runner 的身份按 `bash -e` 试跑一次（runner 调钩子时会加 `-e`，见 09 章 A11），跑通了再替换正式文件。`.env` 指向的是正式路径，直接覆盖的话，试跑失败时坏钩子已经生效，每个 job 都会红（09 章 B10）。手工做的话是这样：
+
+```bash
+H=/opt/actions-runner/hooks/ci-cleanup.sh       # 按你的 RUNNER_HOME 改
+# 新内容先写到 $H.new（占位符要替换好），然后：
+chown runner:runner "$H.new"; chmod 0755 "$H.new"
+sudo -u runner bash -e "$H.new" && mv -f "$H.new" "$H"
+```
+
+试跑要在没有 job 的时候做。有 job 在跑时，脚本开头的守卫会让它直接退出，试跑等于没跑。先停 runner 服务再动手（4.1 末尾）就不会遇到这种情况。
+
 #### 为什么 `JOB_STARTED` 是主力
 
 它在下一个 job 开始前运行，不管上一个 job 是怎么结束的。
 
-本章旧版给的理由是「`JOB_COMPLETED` 在 job 被 `cancel-in-progress` 取消时根本不执行」。上线后的数据推翻了这个说法：最近两周（`_diag` 只保留 14 天）里，38 个被取消的 job 都执行了两个钩子（runner 2.337.0）。
+常见的说法是「`JOB_COMPLETED` 在 job 被 `cancel-in-progress` 取消时根本不执行」。参考项目的数据不支持这个说法：`_diag` 日志由清理钩子只保留最近 14 天（脚本第 7 步），这 14 天里 38 个被取消的 job 都执行了两个钩子（runner 2.337.0）。
 
 `JOB_COMPLETED` 真正跑不到的是两种少见情况：
 
 - job 在初始化阶段就被取消；
 - runner 服务被停掉。
 
-结论不变，`JOB_STARTED` 仍是更可靠的那个，只是理由要改成上面这样。
+所以 `JOB_STARTED` 仍是更可靠的那个。
 
 #### 为什么还要 timer
 
@@ -547,58 +795,66 @@ runner 进程被杀时，两个钩子都不执行。
 
 #### 脚本里各条命令的实际作用
 
-脚本里的关键命令，以及上线一个月（约 2200 个 job）后的实际作用：
+脚本里的关键命令，以及参考项目上线一个月（约 2200 个 job）后的实际作用：
 
 | 命令 | 作用 | 状态 |
 |---|---|---|
 | `docker volume prune` | 回收匿名卷；workflow 没挂 tmpfs 时，每个起 service/minio 的 job 约 70 MB | 保留（兜底） |
-| `docker image prune`（悬空）+ 按 CI 标签的 `-a` | 同一个 tag 拉到新版本后留下的旧版本 | 保留 |
-| `docker buildx prune --filter until=24h` | — | 已删 |
+| `docker image prune`（悬空）+ 按 CI 标签的 `-a`（只删 6 小时前建的） | 同一个 tag 拉到新版本后留下的旧版本 | 保留 |
+| `docker buildx prune --filter until=24h` | 删掉的多是下次还要用的缓存，见下 | 已删 |
 | `fuser -k <app_ports>/tcp` | 上一次 run 的宿主孤儿进程 | 保留 |
 
 各条说明：
 
-- `docker volume prune`：回收匿名卷。runner 删 service 容器时用的是不带 `-v` 的 `rm --force`，会留下匿名卷（主要是 PGDATA）。workflow 没挂 tmpfs 时，每个 job 都靠这一步回收；挂了之后就不再产生这些卷（05 章 ⑫，参考项目 10-16 已改），这一步只作兜底。脚本删带 CI 标签的容器和名字以 minio 开头的容器时带 `-v`，runner 被杀后留下的这两类容器连卷一起删。
+- `docker volume prune`：回收匿名卷。runner 删 service 容器时用的是不带 `-v` 的 `rm --force`，会留下匿名卷（主要是 PGDATA）。workflow 没挂 tmpfs 时，每个 job 都靠这一步回收；挂了之后就不再产生这些卷（05 章 ⑫），这一步只作兜底。
+- 带 CI 标签的容器：脚本删的时候带 `-v`，runner 被杀后留下的容器连卷一起删。钩子认领容器只看 CI 标签，workflow 里自己用 `docker run` 起的容器都要带 `--label <CI_LABEL>`，不带的就清不到。services 容器平时由 runner 自己删，想让钩子在 runner 被杀后也能兜底，就在 services 的 `options` 里加上同样的 `--label`。
 - `docker image prune`：用 digest 钉住的旧 pin 不算悬空，清不掉，要人工退役（08 章 8.6）。按 CI 标签的那条，要 workflow 的 `docker build` 打了标签才匹配得到，否则匹配 0 个。
-- `docker buildx prune --filter until=24h`：已从脚本删除。旧版表格写它回收 5896 MB、是「主力」，但那是攒了几天之后一次性清掉的量。它删的是 24 小时没被用到的缓存，实际常常是整层几 GB 的依赖层（换了 lockfile，或者安静了一晚上），删完下一次构建就是冷的。这些空间在需要时 GC 本来就会回收。缓存上限靠 4.1 节 daemon.json 里的 GC 策略控制。
-- `fuser -k <app_ports>/tcp`：清掉上一次 run 留在宿主上的孤儿进程，见 05 章 ⑨。这种情况属于「假绿」（检查本该失败，却显示通过）：测试实际跑在上一次 run 留下的孤儿进程上，CI 却显示通过。
+- `docker buildx prune --filter until=24h`：已从脚本删除。它一次回收过 5896 MB，但那是攒了几天的量，不是持续效果（09 章 B13）。它删的是 24 小时没被用到的缓存，实际常常是整层几 GB 的依赖层（换了 lockfile，或者安静了一晚上），删完下一次构建就是冷的。这些空间在需要时 GC 本来就会回收。缓存上限靠 4.1 节 daemon.json 里的 GC 策略控制。
+- `fuser -k <app_ports>/tcp`：清掉上一次 run 留在宿主上的孤儿进程，见 05 章 ⑨。这种情况属于「假绿」：测试实际跑在上一次 run 留下的孤儿进程上，本该失败的检查却显示通过。
 
 #### 钩子不能撞上正在跑的 job
 
-runner 自己调用钩子时，本机只有这一个 job，没有问题。但每日 timer、`verify.sh`、手工执行都可能正好撞上一个在跑的 job，这时钩子会删掉它的容器、杀掉它的 e2e 进程。
+一台机器只跑一个 runner 时，runner 自己调用钩子，本机只有这一个 job，没有问题。但每日 timer、`verify.sh`、手工执行都可能正好撞上一个在跑的 job，这时钩子会删掉它的容器、杀掉它的 e2e 进程。
 
 防护做法：
 
-- 脚本开头有一道守卫：父进程不是 `Runner.Worker`，且有 `Runner.Worker` 在跑，就直接退出。
+- 脚本开头有一道守卫。runner 自己调用时（父进程是 `Runner.Worker`），本机只有这一个 job 才往下走。从其他路径调用时，本机没有任何 job 才往下走。条件不满足就直接退出。
 - 判断有没有 job 要用 `pgrep -x Runner.Worker`（按进程名精确匹配），别用 `-f`。`-f` 匹配整条命令行，有人正在执行 `grep Runner.Worker` 时就会误判。
 - timer 的 unit 要写 `User=runner`。钩子文件归 runner 所有、runner 可写，不应以 root 执行它。
 
-> 注意：**绝不裸跑 `docker system prune`，绝不用不带 label 的 `-a`**。这样会连基础镜像一起删掉，让「稳态 Docker Hub 消耗 ≈0」变回每次冷拉。
+这个钩子按一台机器一个 runner 写。同一台机器装了多个实例时，守卫发现本机有别的 job 就整段跳过，不会误删别人的东西，但清理多数时候不跑。要在一台机器上跑多个实例，钩子得先改成只清本 job 的资源，前提和改法见 10 章 10.6。
+
+> 注意：绝不裸跑 `docker system prune`，也绝不用不带 label 的 `-a`。这样会连基础镜像一起删掉，让「稳态 Docker Hub 消耗 ≈0」变回每次冷拉。
 
 ### 4.5 挡住 CI 读云 metadata
 
 本节用两条 iptables 规则，阻止 CI 读取云 metadata 服务。
 
-云 metadata 服务（`169.254.169.254`）对 CI job 和容器都是可达的，里面常有初始 root 口令、公钥、网络配置。两条规则一条管容器，一条管宿主进程：
+云 metadata 服务对 CI job 和容器都是可达的，里面常有初始 root 口令、公钥、网络配置。多数云的地址是 `169.254.169.254`，包括 AWS、GCP、Azure、Hetzner、DigitalOcean、华为云。也有例外：阿里云是 `100.100.100.200`，腾讯云是 `169.254.0.23`。用之前查一下你那家云的文档。bootstrap 用 `METADATA_IP` 参数指定地址，默认 `169.254.169.254`。传过一次就会落盘到 `/etc/ci-runner.env`，重跑时不用再传。旧版 bootstrap 不落盘这一项，这样的机器第一次用新版重跑时要显式传一次。
+
+两条规则一条管容器，一条管宿主进程：
 
 ```bash
-iptables -I DOCKER-USER -d 169.254.169.254 -j DROP
-iptables -I OUTPUT -d 169.254.169.254 -m owner --uid-owner $(id -u runner) \
+M=169.254.169.254        # 按你那家云改
+iptables -I DOCKER-USER -d "$M" -j DROP
+iptables -I OUTPUT -d "$M" -m owner --uid-owner "$(id -u runner)" \
          -j REJECT --reject-with icmp-port-unreachable
 netfilter-persistent save
 ```
 
 两条都要。`DOCKER-USER` 只管容器流量，而 CI job 的 shell 是宿主进程，`DOCKER-USER` 管不到它。
 
-root 仍然可以读 metadata（cloud-init 要用）。
+root 仍然可以读 metadata（cloud-init 要用）。这两条只管 IPv4。你那家云如果还开了 IPv6 的 metadata 地址，要用 `ip6tables` 照样加一遍。
 
 > 参考项目的情况：metadata 的 `vendor_data` 里确实有 cloud-init 写入的 root 口令，在容器内能取出来。但与 `/etc/shadow` 的 hash 逐位比对后不匹配：口令在 cloud-init 之后已被改过，泄露的是陈旧凭据。所以这条规则属于纵深防御，要防的并不是一个正在造成损失的漏洞。
 >
-> 判断严重程度时，比对是必须做的一步。最初提出这条时没有做比对，直接定成了「阻塞」。
+> 判断严重程度时，要做这一步比对。没比对就定级，容易把陈旧凭据当成正在发生的泄露，定得过重。
 
 ### 4.6 SSH：唯一可能把你锁在门外的动作
 
 SSH 加固是本章唯一可能把你锁在门外的操作。`bootstrap.sh` 默认不做这一条，要加 `--harden-ssh` 才执行。
+
+下面的命令按 Ubuntu、Debian 写，SSH 服务名是 `ssh`。别的发行版多叫 `sshd`，命令里相应地换掉。
 
 #### 动手前：查登录方式
 
@@ -625,7 +881,7 @@ PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
 ```
 
-注意：文件名必须以 `00-` 开头。`sshd_config.d` 里同一项以首次出现的为准，这个文件必须排在 cloud-init 写的 `50-cloud-init.conf`（里面是 `PasswordAuthentication yes`）之前。
+注意：文件名要以 `00-` 开头。`sshd_config.d` 里同一项以首次出现的为准，这个文件要排在其他文件之前，比如 cloud-init 写的 `50-cloud-init.conf`（里面是 `PasswordAuthentication yes`）。前提是主配置 `/etc/ssh/sshd_config` 的 `Include` 行在最前面，Ubuntu 和 Debian 的默认配置是这样。
 
 #### 生效与验证
 
@@ -633,13 +889,13 @@ KbdInteractiveAuthentication no
 
 1. `sshd -t`
 2. `systemctl reload ssh`（reload 不踢现有连接）
-3. `sshd -T` 确认
+3. `sshd -T | grep -E '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication)'` 确认
 4. **另开一个终端验证能登入**
 
 第 4 步的验证命令：
 
 ```bash
-ssh -o PasswordAuthentication=no root@<IP>   # 强制不用口令，能进说明公钥这条路通
+ssh -o PasswordAuthentication=no -p <SSH 端口> root@<IP>   # 强制不用口令，能进说明公钥这条路通
 ```
 
 进不去的话，在当前还活着的会话里回滚：
@@ -650,35 +906,109 @@ rm -f /etc/ssh/sshd_config.d/00-hardening.conf && systemctl reload ssh
 
 #### 可选的安全网
 
-如果担心改完之后、验证之前会话就断了，可以挂一个安全网：用 `scripts/ssh-guard.sh` 配一个 3 分钟的 timer。它只在一条 SSH 会话都不剩时才回滚：
+如果担心改完之后、验证之前会话就断了，可以挂一个安全网：`scripts/ssh-guard.sh` 每 3 分钟查一次，只在一条 SSH 会话都不剩时才回滚。
 
 - 你正常连着时，它不会动配置；
-- 你真被踢下线且进不来时，它会自动回滚，自行恢复。
+- 你被踢下线又进不来时，它会自动回滚。
+
+它数的是 sshd 实际监听端口上的已建立连接。端口从 `sshd -T` 和 sshd 正在监听的端口读，SSH 不在 22 端口也能用。在云控制台的网页终端里操作时，它数不到 SSH 会话，3 分钟内就会回滚，所以加固要在 SSH 会话里做。
+
+安全网要在加固之前装好。`bootstrap.sh --harden-ssh` 写完配置马上 reload，中间不停顿。
 
 ```bash
 install -m 0755 scripts/ssh-guard.sh /usr/local/bin/ssh-guard.sh
 touch /root/.ssh-hardening-unconfirmed          # 「还没确认」的标记
-# 配一个 OnUnitActiveSec=3min 的 systemd timer 跑它
-# 你验证能登入之后：rm 掉标记文件 + 停掉 timer，加固即永久生效
+systemd-run --unit=ssh-guard --on-active=3min --on-unit-active=3min /usr/local/bin/ssh-guard.sh
+# 然后再加固：bootstrap.sh --harden-ssh，或者按上面手工写 00-hardening.conf
+# 另开终端确认能登入之后：
+rm /root/.ssh-hardening-unconfirmed
+systemctl stop ssh-guard.timer
 ```
 
-### 4.7 云防火墙：唯一挡得住 Docker 的那一层
+`systemd-run` 建的是临时 timer，机器重启后就没了，不用另外清理。回滚之后脚本会自己停掉 `ssh-guard.timer`。自己写 timer unit 的话，`OnUnitActiveSec=` 要和 `OnActiveSec=` 一起写。只写前者时，对应的服务一次都没跑过，timer 没有起算点，可能一次都不触发。
 
-云防火墙必须去云厂商控制台配置，脚本做不了。
+### 4.7 云防火墙：挡得住 Docker 端口的那一层
+
+云防火墙要去云厂商控制台配置，脚本做不了。
 
 不能只靠宿主 ufw 的原因：Docker 会自己往 iptables 写 DNAT 规则，从结构上绕过 ufw。对容器端口来说，「在防火墙封了 3000」多半不生效。云防火墙在虚拟机外面，Docker 改不了它。
 
 它挡的是容器端口绑回环也盖不住的部分，也就是 CI 里在宿主上监听的进程，比如 e2e 直接 `spawn` 起来的应用服务器。这类进程不是容器，没有 `-p` 可以绑。
 
-配置：**入方向只放行 22**（建议限来源 IP），出方向全放。
+配置：入方向只放行 SSH 端口（默认 22，建议限来源 IP），出方向全放。
 
 对 CI 的影响为零。runner 是出站长轮询去 GitHub 领活，不需要任何入站端口。但要注意：以后想在这台机上跑任何对外服务，得回控制台加规则。
+
+#### 没有云防火墙时
+
+有的厂商不提供云防火墙。这时分两部分处理：
+
+- 宿主进程监听的端口，用 ufw 或 nftables 挡。宿主进程不走 Docker 的链，主机防火墙对它有效。先放行 SSH 端口再启用防火墙，否则可能断线，之后也登不进来。
+- 容器端口，靠 05 章 ② 的 `127.0.0.1` 绑定。再在 `DOCKER-USER` 链里丢掉从公网网卡进来、目标是容器的新连接，作为第二道防线：
+
+```bash
+iptables -I DOCKER-USER -i eth0 -m conntrack --ctstate NEW -j DROP   # eth0 换成你的公网网卡
+netfilter-persistent save
+```
+
+这条规则和 4.5 的规则一起持久化。参考项目没有在没有云防火墙的机器上实测过，加完之后从别的机器测一下端口，不要在本机探自己的公网 IP（09 章 A10）。
+
+### 4.8 机器上还要开发时
+
+最好不要在 CI 机上开发，8 GB 及以下的机器尤其不要。参考项目在一台 4 核、约 7.6 GiB、没有 swap 的 CI 机上开着 VS Code Remote、Claude Code、Codex 开发了两天，出了 11 次全局 OOM，被杀的大多是 CI 的进程（09 章 B17）。原因有两层。一是内存账里没算开发工具，一个 VS Code 远程服务端就占约 4 GB。二是优先级排反了：runner 是 800，开发会话是 0，内核每次先挑的都是 CI。开发搬到别的机器之后，没有再出现。
+
+一定要在 CI 机上开发时，下面几步都要做。
+
+1. 先算内存。把开发工具的占用 D 算进 10 章 10.2 的公式，算出来每台至少还能跑 1 个实例才行。参考项目一个人开发时 D 按 4–5 GiB 算，8 GB 的机器不够。
+
+2. 开发用单独的非 root 用户，不加进 docker 组。docker 组约等于 root。开发如果要用 Docker，它的容器和匿名卷会被清理钩子当成 CI 的残留删掉（不带过滤的 `docker volume prune`），这种情况就不该和 CI 共用一台机器。
+
+3. 让开发会话比 CI 先被杀。给 `ssh.service` 和 `user@.service` 各加一个 drop-in：
+
+   ```ini
+   # /etc/systemd/system/ssh.service.d/50-dev-tools-oom.conf
+   # /etc/systemd/system/user@.service.d/50-dev-tools-oom.conf 内容相同
+   [Service]
+   OOMScoreAdjust=1000
+   ```
+
+   写完执行 `systemctl daemon-reload && systemctl restart ssh`。重启 ssh 不会断开已有的连接，但已有的会话还是旧值，要重新登录。
+
+   sshd 的监听进程启动时会把自己调到 −1000，不会被杀。它为每个登录派生出的会话会恢复成 unit 上的 1000，会话里起的 VS Code 服务端、Claude Code、Codex 都继承这个值。`user@.service` 管的是 systemd 用户实例里起的进程，第 5 步的 `systemd-run --user` 就在这里。
+
+   这个设置对所有 SSH 登录都生效，包括 root 的运维会话。内存紧张时，你登进来排查用的 shell 也会先被杀，这时可以用云控制台的网页终端。用 `systemctl` 启动的服务不受影响，它们由 systemd 直接拉起，不继承会话的值。
+
+   确认：
+
+   ```bash
+   cat /proc/self/oom_score_adj                   # 在新登录的会话里执行，应为 1000
+   cat /proc/$(pgrep -o -x sshd)/oom_score_adj    # sshd 监听进程，应为 -1000
+   ```
+
+4. 调低 runner 的 OOM 优先级。按 4.3「OOM 优先级怎么定」的公式算，各内存档的取值见 10 章 10.3，约 7.6 GiB 的机器取 200。改法是带上新的 `RUNNER_OOM_ADJ` 重跑 bootstrap，重跑之前先停 runner 服务（4.1 末尾）。新值会写进 `/etc/ci-runner.env`，以后重跑不用再传。
+
+5. 吃内存的命令行工具可以单独限住。先对开发用户执行 `loginctl enable-linger <开发用户>`，再确认 systemd 用户实例拿到了内存控制器：
+
+   ```bash
+   # 以开发用户执行，输出里要有 memory
+   cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers
+   ```
+
+   Ubuntu 24.04 默认就有。有了以后这样起：
+
+   ```bash
+   systemd-run --user --scope --quiet --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% -- codex
+   ```
+
+   上限不要超过全量 CI 期间整机可用内存的最低值减 0.3 GiB。参考项目 7.6 GiB 的机器上最低可用约 1.3 GiB，所以取 1G；16 GiB 的机器上可以给到 2G。`CPUQuota=200%` 对应 10 章 10.2 里开发工具用核按 2 算。这条命令要在开发用户自己登录的 SSH 会话里执行。用 `su` 切过去的会话通常没有用户实例的环境变量，`systemd-run --user` 会报连不上 bus。
+
+6. 开发工具的磁盘占用也要算进去。VS Code 远程服务端每次客户端升级会多留一份，要定期删，见 08 章 8.6 的每月巡检。
 
 ---
 
 ## 05 workflow 改造：常驻 runner 上会坏掉的托管假设
 
-本章列出 workflow 里依赖托管 runner 特性的写法，以及在自建常驻 runner 上该怎么改。这是整本手册里最可迁移的部分：前面几章的内容换个云厂商就要调整，本章的内容对任何仓库都适用。
+本章列出 workflow 里依赖托管 runner 特性的写法，以及在自建常驻 runner 上该怎么改。本章和机器无关，对任何仓库都适用。
 
 托管 runner 给每个 job 分配一台全新的一次性 VM：
 
@@ -690,12 +1020,15 @@ touch /root/.ssh-hardening-unconfirmed          # 「还没确认」的标记
 
 几乎每个仓库的 workflow 里都积累了一批依赖这些性质的写法。它们在托管 runner 上不会出问题，所以也一直没有暴露出来。
 
-本章用到的两个说法：
+本章用到的几个说法：
 
-- N=1：只有一台自建 runner，所有 job 在这台机器上串行排队。
+- N：全仓库自建 runner 实例的总数，所有机器加起来算，也就是同时最多能跑几个 job。N=1 时所有 job 串行排队。有两台机器、每台一个实例时 N=2，job 能并行了，但同一个 run 的两个 job 仍可能先后落在同一台机器上。
+- k：一台机器上跑几个实例。现有脚本和占固定宿主端口的 workflow 都只支持每台 1 个，原因见 10 章 10.6。
 - 假绿：检查本该失败，结果却显示通过。
 
-下面 ①–⑪ 共十一条，每条按「怎么自查 → 失败是什么样 → 怎么改」组织；⑫ 是上线一个月后补充的。建议把它们当作 checklist，对照你的 workflow 逐条检查。章末有一组汇总命令，改完后用来确认。
+参考项目最初只有一台机器、一个实例（N=1），本章的实测大多是在这个条件下做的。
+
+下面 ①–⑬ 共十三条，每条按「怎么自查、失败是什么样、怎么改」组织。⑫ 是上线一个月后补的，⑬ 是准备加第二台机器时补的。建议把它们当作 checklist，对照你的 workflow 逐条检查。章末有一组汇总命令，改完后用来确认。
 
 ---
 
@@ -720,18 +1053,19 @@ The container name "/minio" is already in use by container "7eb4689c...".
 
 第 2 个 run 就会失败，而且报错和代码改动无关。
 
-同一个 run 里的两个 job 用同一个写死的名字时更严重，冲突是必然的，与概率无关：
+同一个 run 里的两个 job 用同一个写死的名字时更严重：
 
 - 托管 runner 上，两个 job 在两台独立 VM 上，互不影响。
 - N=1 的自建机上，两个 job 在同一台机器上串行。第一个 job 不清理，第二个 job 一定冲突。
+- N≥2 时，两个 job 有时分到不同机器，有时落在同一台，冲突时有时无，更难查。
 
 怎么改：
 
 ```yaml
 env:
-  # 唯一到 run × attempt × job 三级：
-  #  · run_attempt 是真判据 —— re-run 时 run_id 不变
-  #  · github.job 不可省 —— 同一个 run 里的两个 job 只到 run 级仍会自撞
+  # 名字要唯一到 run、attempt、job 三级：
+  #   run_attempt 不能省，re-run 时 run_id 不变
+  #   github.job 不能省，同一个 run 里的两个 job 只唯一到 run 级仍会撞名
   SVC_NAME: myservice-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
   CI_LABEL: com.myorg.ci=1          # 与 bootstrap.sh 的 CI_LABEL 完全一致
 steps:
@@ -744,11 +1078,11 @@ steps:
 
 要点：
 
-- **`--label` 的值必须和 bootstrap.sh 里的 `CI_LABEL` 完全一致。** 清理钩子第 1 步按这个 label 删除上一个 job 没删掉的容器。本模板原来写的是 `--label ci=1`，和任何 `CI_LABEL` 都对不上。
-- 删除容器用 `rm -fv`，不用 `rm -f`。镜像声明了 `VOLUME` 时（minio、postgres、redis、prometheus 都声明了），Docker 会建匿名卷，带 `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目沿用了这个模板，原来每个起 minio 的 job 漏 1 个卷（10-16 已改，见 ⑫）。
+- `--label` 的值必须和 bootstrap.sh 里的 `CI_LABEL` 完全一致。清理钩子第 1 步按这个 label 删除上一个 job 没删掉的容器。bootstrap 的默认值是 `com.ci.selfhosted=1`，上面的 `com.myorg.ci=1` 是示例，两边写成同一个就行。
+- 删除容器用 `rm -fv`，不用 `rm -f`。镜像声明了 `VOLUME` 时（minio、postgres、redis、prometheus 都声明了），Docker 会建匿名卷，带 `-v` 才会连卷一起删。参考项目原来用 `rm -f`，每个起 minio 的 job 漏 1 个卷，见 ⑫。
 - `docker run --rm` 解决不了漏卷。实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下。`--rm` 只在容器自己退出或被 `docker stop` 时生效。
 - `rm -fv` 只在清理步骤真的跑了时有用。runner 进程被杀时 `if: always()` 也不执行，容器留给钩子删。更稳的是在镜像的 VOLUME 路径挂 tmpfs，一开始就不建卷，写法和注意事项见 ⑫。
-- 清理钩子并非只按 label 过滤。它的第 6 步是一条不带过滤的 `docker volume prune`，用来兜底回收匿名卷（本模板原来说「绝不裸 prune」，这个说法不对）。workflow 里写对了，就不必依赖它。service 容器的卷见 ⑫。
+- 清理钩子并非只按 label 过滤。它的第 6 步是一条不带过滤的 `docker volume prune`，用来兜底回收匿名卷。workflow 里写对了，就不必依赖它。service 容器的卷见 ⑫。
 
 ---
 
@@ -775,6 +1109,13 @@ services:
 ```
 
 确认：localhost 可以连上，从公网连接返回 `Connection refused`。
+
+上面的 `5433` 是固定的宿主端口。每台机器只跑一个 runner 实例时没有问题，机器再多也一样，每台各有一套端口。一台机器跑多个实例时，两个 job 会抢同一个宿主端口，后起的 service 起不来。到那一步有两种改法：
+
+- 让 Docker 随机分配宿主端口：写成 `ports: ['127.0.0.1::5432']`，job 里用 `${{ job.services.postgres.ports['5432'] }}` 读出实际端口。runner 能不能正确处理这种写法，参考项目没有实测，先在测试分支上验证。
+- job 跑在 `container:` 里，用服务名直连（`postgres:5432`），不发布宿主端口。
+
+测试在宿主上起的进程（⑨ 里的 API）也一样，每个实例要用不同的端口。不占固定宿主端口是一台机器跑多个实例的前提之一，其余几条见 10 章 10.6。
 
 ---
 
@@ -816,7 +1157,7 @@ grep -rhoE '\b(gh|jq|yq|aws|az|gcloud|make|cmake|gcc|zstd|unzip)\b' .github/work
 失败分两级，第二级更麻烦：
 
 - 命令后面没有 `||` 兜底：步骤直接失败（`bash -e`），至少能看到。
-- 命令后面有 `|| fallback`：静默降级。表现为路径门控退化成全跑、定时任务每次都跑、某个检出被跳过。**门禁看起来还在跑，实际已经失效。**
+- 命令后面有 `|| fallback`：静默降级。表现为路径门控退化成全跑、定时任务每次都跑、某个检出被跳过。门禁看起来还在跑，实际已经失效。
 
 怎么改：把缺的工具装上，并把工具清单写进你的 bootstrap，不要靠记忆。
 
@@ -838,7 +1179,7 @@ grep -rhoE '\b(gh|jq|yq|aws|az|gcloud|make|cmake|gcc|zstd|unzip)\b' .github/work
 怎么改：先想清楚回退。去掉缓存后，回落到托管 runner 时每个 job 要多付一次冷装（约 52 秒）。想用条件表达式两头兼顾，做不到：
 
 ```yaml
-cache: ${{ vars.CI_RUNNER && '' || 'pnpm' }}     # ❌ 不成立
+cache: ${{ vars.CI_RUNNER && '' || 'pnpm' }}     # 错误写法，不成立
 # GitHub 表达式里 && / || 返回操作数的值，而空串是 falsy：
 # CI_RUNNER 已设 → (CI_RUNNER && '') = '' → '' 是 falsy → ('' || 'pnpm') = 'pnpm'
 # 永远产出 'pnpm'。写 'none' 之类会让 setup-node 直接报错。
@@ -865,12 +1206,12 @@ job 被取消时，写在最后一步、又没带 `if: always()` 的清理步骤
 
 ### ⑦ `timeout-minutes` 的含义变了
 
-在 N=1 的自建 runner 上，`timeout-minutes` 决定了一个卡死的 job 最多能让全组 CI 停多久，所以要对照实测时长重新检查。
+在自建 runner 上，`timeout-minutes` 决定了一个卡死的 job 最多能占住一个实例多久。N=1 时，这就是全组 CI 最多停多久，所以要对照实测时长重新检查。
 
 | 环境 | `timeout-minutes` 的含义 | job 跑飞的后果 |
 |---|---|---|
 | 托管 runner | 这个 job 最多烧多少钱 | 只烧掉自己那台一次性 VM |
-| N=1 自建 runner | 全组 CI 停摆的上界 | 独占唯一的 runner，后面所有 PR 一起等 |
+| 自建 runner，共 N 个实例 | 一个实例最多被占住多久，N=1 时就是全组 CI 停摆的上界 | 少一个可用实例，排队变长；N=1 时后面所有 PR 一起等 |
 
 自查：
 
@@ -879,6 +1220,8 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 ```
 
 > 参考项目：现值是实测时长的 8–150 倍（lint 15 min / 实测 22 s = 41×；build 30 min / 实测 12–70 s = 26–150×）。一次 ci run 最坏占用 15+15+30+30 = 90 分钟。按「实测 p95 × 4」重设后是 29 分钟。
+
+实测时长要记下是在哪台机器上量的。换到单核更慢的机器，同样的 `timeout-minutes` 余量会缩水，单核受限的 job（限了 1 个 CPU 的测试容器、单线程的类型检查）最先超时。加机器或换机器之前，按 02 章 2.7 核对：最长实测耗时 × R ≤ timeout-minutes × 2/3，R 是新机器和参考机的耗时比。
 
 注意：`timeout-minutes` 从 job 开始执行才计时，排队时间不算。机器宕机导致排队 24 小时这种情况它管不了，要靠哨兵（06 章 6.4）。
 
@@ -890,6 +1233,7 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 
 - 托管 runner 上，多个 job 并行是免费的（各自一台 VM）。
 - N=1 上，它们串行排队，每多一个 job 就多付一次脚手架。
+- N≥2 时，同一个 run 的 job 又能分到几个实例上并行，合并的收益比 N=1 时更小。
 
 不要急着合并 job。先量两个数，即托管和自建机上各自的每 job 脚手架时间：
 
@@ -899,9 +1243,9 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 
 > 参考项目：托管上脚手架约 52 秒/job（合并 4→1 省 156 秒）；自建机上只有约 16 秒/job（合并只省 48 秒），因为常驻机器上依赖早就在盘上了。收益缩水 3 倍，而代价（文档同步、required check 粒度、回退时降级）一点没少。
 
-判断方法：用真实事件时间戳做排队仿真（08 章 8.1），比较「合并 job」和其他提速手段的实际收益。
+判断方法：用真实事件时间戳做排队仿真（08 章 8.1），比较「合并 job」和其他提速手段的实际收益。现有的仿真脚本只模拟一个 runner，也就是 N=1 的情况。
 
-参考项目的结论：合并 job 与「修 Dockerfile 层序 + 去 cache」效果相当（最忙那天 11.7 vs 11.2 分钟），而后者不用改任何文档。**先做后者。**
+参考项目的结论：合并 job 与「修 Dockerfile 层序 + 去 cache」效果相当（最忙那天 11.7 vs 11.2 分钟），而后者不用改任何文档，所以先做后者。
 
 ---
 
@@ -916,24 +1260,25 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 ```text
 [api:err] Error: listen EADDRINUSE: address already in use 0.0.0.0:3100   ← 只在 stderr 留一行，不失败
  Test Files  1 failed | 8 passed (9)
-      Tests  1 failed | 220 passed (221)                                  ← 220 个测试跑在**孤儿**上
+      Tests  1 failed | 220 passed (221)                                  ← 220 个测试跑在孤儿进程上
 ```
 
 > 实测：用一个孤儿进程占住端口后跑 e2e，221 条里 220 条通过，唯一失败的那条还指向认证代码，而不是真实原因。换一个对状态不敏感的孤儿进程，结果就是全绿。
 
-**也就是说，整套 e2e 跑在上一次 run 的代码上，而 CI 是绿的。**
+也就是说，整套 e2e 跑在上一次 run 的代码上，CI 却是绿的。
 
 孤儿进程的来源：
 
 - `teardown` 只有一行 `proc.kill()`，而 job 被取消时它不执行。
-- runner 的 `KillMode=process` 也不杀子进程。
+- runner 自己的兜底没有接住。job 结束时，runner 会杀掉环境变量里带本 job `RUNNER_TRACKING_ID` 的进程，日志里显示为 `Cleaning up orphan processes`。有几种情况它认不出来：测试代码 spawn 子进程时传了一份新的 env，没继承这个变量；workflow 把这个变量设成了空串；runner 进程本身被杀了。参考项目当时的孤儿属于哪一种，没有核对过。
+- runner 服务的 `KillMode=process` 只决定停服务时杀不杀子进程，和 job 结束没有关系。
 
 怎么改：分三层，至少做前两层。
 
 第一层（代码注释中的 ①）：起进程之前，先确认端口没被占用。
 
 ```ts
-// ① 起之前先确认端口没被占 —— 用裸 TCP 连接，不依赖对方回什么
+// ① 起之前先确认端口没被占。用裸 TCP 连接，不依赖对方回什么
 async function assertPortFree(port: number) {
   const busy = await new Promise<boolean>((res) => {
     const s = connect({ port, host: '127.0.0.1' });
@@ -943,7 +1288,7 @@ async function assertPortFree(port: number) {
     s.once('timeout', () => done(false));
     s.once('error',   () => done(false));
   });
-  if (busy) throw new Error(`端口 ${port} 已被占用——多半是上一次 run 的孤儿进程。先清掉再跑。`);
+  if (busy) throw new Error(`端口 ${port} 已被占用，多半是上一次 run 的孤儿进程，先清掉再跑。`);
 }
 ```
 
@@ -951,6 +1296,7 @@ async function assertPortFree(port: number) {
 
 ```bash
 # ② runner 的 JOB_STARTED 钩子里清孤儿
+# 3100、3101 是参考项目 e2e 的端口，换成你的 CI_APP_PORTS（03 章 3.1）
 fuser -k 3100/tcp 3101/tcp 2>/dev/null || true
 ```
 
@@ -999,7 +1345,7 @@ grep -rn 'image:' .github/workflows/ | grep -v '@sha256'  # 有几个镜像没�
 
 ```bash
 docker volume ls -q | wc -l                       # 在一台常驻 runner 上看；钩子没在跑的话会一直涨
-grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为空
+grep -rn 'docker rm -f ' .github/workflows/ <CI 用的脚本目录> | grep -v -- '-fv'   # 应为空
 ```
 
 机制：镜像声明了 `VOLUME`、启动时又没挂 `-v`/`--mount`/`--tmpfs`，Docker 就建一个匿名卷；删容器时不带 `-v`，卷就留下。卷有两处来源：
@@ -1009,9 +1355,9 @@ grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为
 | `services:` 里的 postgres / redis | runner 自己，`docker rm --force`，不带 `-v` | 能，挂 tmpfs（见下） |
 | 步骤里 `docker run -d` 起的（minio、prometheus…） | workflow 的 `docker rm -f` | 能，挂 tmpfs，删除时用 `rm -fv`（见 ①） |
 
-参考项目里，每个用到数据库的 job 原来漏 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA；跑了监控冒烟的 build job 还会给 prometheus 漏 1 个（改了监控配置时跑；碰到 packages/、lockfile、根 package.json 等共享面，或手动触发时也全跑）。那台机器上卷数始终是 0，因为清理钩子的 `docker volume prune` 在每个 job 前后都在回收。这是钩子在兜底，workflow 本身并没有写对。换一台没装钩子的常驻 runner，卷数就会一直涨。
+参考项目里，每个用到数据库的 job 原来漏 3 个卷（postgres、redis、minio，约 70 MB，大头是 PGDATA），跑监控冒烟的 job 还会给 prometheus 漏 1 个。那台机器上卷数始终是 0，是因为清理钩子的 `docker volume prune` 在每个 job 前后都在回收，workflow 本身并没有写对。换一台没装钩子的常驻 runner，卷数就会一直涨。
 
-参考项目 2026-10-16 按下面的写法改完（metta-app #269）：postgres、redis、minio、prometheus 都挂 tmpfs，起这些容器的 job 都在起完后核对没挂卷。合并前在 runner 上记了约 15 分钟 `docker events`，覆盖 nightly 的两个 job 和 build job 的两个冒烟，这些容器照常建了又删，期间没有新建卷。
+参考项目 2026-10-16 按下面的写法改完：postgres、redis、minio、prometheus 都挂 tmpfs，起这些容器的 job 都在起完后核对没挂卷。合并前在 runner 上记了约 15 分钟 `docker events`，期间跑了几个起这些容器的 job，容器照常建了又删，没有新建卷。
 
 怎么改：给 service 容器挂 tmpfs，从源头上不产生卷。2026-10-16 在参考机上实测：postgres 正常启动，`docker inspect` 的 Mounts 为空，删容器后新增卷 0 个。
 
@@ -1031,7 +1377,7 @@ services:
 
 - postgres 18 的镜像声明的是 `/var/lib/postgresql`，不是常见的 `/var/lib/postgresql/data`。后者是 17 及以前的路径；18 起 PGDATA 在 `/var/lib/postgresql/<大版本>/docker`。
 - 路径写错不会报错，只是卷照样建、照样漏。
-- tmpfs 占内存（参考项目约 50–120 MB/job）。它记在容器的 cgroup 上，不在 runner 的 MemoryMax 里；但在没有 swap 的机器上它占的是真内存，所以 `size=` 必须写。
+- tmpfs 占内存（参考项目约 50–120 MB/job）。它记在容器的 cgroup 上，不在 runner 的 MemoryMax 里；但在没有 swap 的机器上它占的是真内存，所以 `size=` 必须写，量单 job 整机峰值 J 时也要把它算进去（10 章 10.1）。
 - 镜像以非 root 用户运行时，tmpfs 要加 `mode=1777`。prometheus 以 nobody 运行，不加的话报 `/prometheus/queries.active: permission denied`，起不来。postgres、redis 的入口脚本会先以 root 改属主，不用加。
 - 步骤里起的容器同样挂：`docker run -d ... --tmpfs /data:size=256m <minio 镜像> server /data`。参考机上实测 minio 在 tmpfs 上写 20 MB 对象、读回逐字节一致。
 
@@ -1056,6 +1402,34 @@ services:
 
 ---
 
+### ⑬ 容器写进工作区的文件，runner 删不掉（准备加第二台机器时补）
+
+常驻机器上工作区跨 job 复用，下一个 job 的 checkout 要先删掉上一次留下的文件。CI 容器往挂进去的工作区写文件时，文件属主是容器里进程的 uid。这个 uid 和 runner 用户对不上，runner 就删不掉这些文件。托管 runner 每个 job 都是新 VM，碰不到这个问题。
+
+自查：
+
+```bash
+# 在每台 runner 上跑。runner 和 /opt/actions-runner 按你的 RUNNER_USER、RUNNER_HOME 换
+id -u runner                                              # 各台机器应该相同
+find /opt/actions-runner/_work -not -user runner | head   # 应为空
+```
+
+失败是什么样：`actions/checkout` 清理工作区时报 `EACCES: permission denied`，job 在第一步就失败，和代码改动无关（09 章 A19）。
+
+文件归谁，看容器以哪个用户运行：
+
+- node 官方镜像默认以 root 运行，只是自带一个 uid 1000 的 `node` 用户，要用 `--user node` 才会切过去。很多镜像里的普通用户也是 uid 1000。
+- 以 root 运行的容器写下的文件属于 uid 0，runner 是哪个 uid 都删不掉。
+- job 用 `container:` 跑时，步骤在容器里以镜像的默认用户执行，常常是 root，写进工作区的文件也归 root。
+
+怎么改：
+
+- 所有 runner 机器上 runner 用户的 uid 保持一致，参考项目用 1000。bootstrap 按 `RUNNER_UID` 建用户；装机顺序，以及云镜像自带 uid 1000 用户时怎么处理，见 03 章 3.3。
+- 自己 `docker run` 又挂了工作区的容器，用 runner 的身份运行：`docker run --user "$(id -u):$(id -g)" -v "$GITHUB_WORKSPACE:/w" ...`。这样文件直接归 runner，不依赖镜像里有没有 uid 1000 的用户。
+- 必须以 root 运行的容器，在 `if: always()` 的清理步骤里把属主改回来：`docker run --rm -v "$GITHUB_WORKSPACE:/w" <同一个镜像> chown -R "$(id -u):$(id -g)" /w`。runner 进程被杀时这一步也不会执行，下一个 job 会在 checkout 失败，这时要登上机器用 root 删掉那些文件。
+
+---
+
 ### 改造完的自查
 
 改完后跑下面这组命令确认，每行末尾的注释是期望结果。
@@ -1068,6 +1442,8 @@ grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理�
 grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
 grep -rn -- '--tmpfs'        .github/workflows/                        # 每个声明了 VOLUME 的镜像都应有一条（⑫）
 grep -rn '容器没有挂卷'       .github/workflows/                        # 起了这些容器的 job 都应有这一步（⑫）
+grep -rnE '127\.0\.0\.1:[0-9]+:' .github/workflows/                    # 一台机器跑多个实例时应为空（②）
+find /opt/actions-runner/_work -not -user runner | head                # 在每台 runner 上跑，应为空（⑬）
 ```
 
 ---
@@ -1101,17 +1477,19 @@ runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
 
 ```bash
 # 开
-gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64","ci"]'
+gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64","myproj-ci"]'
 # 关
 gh variable delete CI_RUNNER --repo owner/repo
 ```
+
+变量里的标签要和 runner 注册时的 `RUNNER_LABELS` 对上（03 章 3.1）。变量里的每个标签 runner 都得有，job 才会派给它。上面的 `myproj-ci` 要换成你的项目标签。bootstrap 注册完会按本机的 `RUNNER_LABELS` 打印这条命令，可以直接用。有多台机器时，各台的标签要完全一致。缺了一个标签的那台领不到这些 job，也不会报错，只是一直闲着。
 
 ### 6.2 变量值必须是合法 JSON
 
 `CI_RUNNER` 的值会被 `fromJSON` 解析，写成裸字符串会出错。错误示例：
 
 ```bash
-gh variable set CI_RUNNER --body 'ubuntu-latest'      # ❌ 裸字符串
+gh variable set CI_RUNNER --body 'ubuntu-latest'      # 错误：裸字符串
 ```
 
 这种错误很难排查。现象和「回退没生效」不同，具体是：
@@ -1122,7 +1500,7 @@ gh variable set CI_RUNNER --body 'ubuntu-latest'      # ❌ 裸字符串
 
 正确写法：
 
-- 多个标签写成数组：`'["self-hosted","linux","x64","ci"]'`
+- 多个标签写成数组：`'["self-hosted","linux","x64","myproj-ci"]'`
 - 单个值要带引号：`'"ubuntu-latest"'`
 
 ### 6.3 开关救不了已经排队的 job
@@ -1136,7 +1514,7 @@ gh variable set CI_RUNNER --body 'ubuntu-latest'      # ❌ 裸字符串
 3. 在 t+20/40/60/80/100/120 秒检查，那个 job 一直是 `queued`，没有任何变化。
 4. runner 恢复后，这个 job 才被执行。
 
-GitHub 对排队 job 的自动取消时间是 24 小时。如果机器半夜宕机，全组的 PR 会一直卡到有人醒来处理。
+GitHub 对排队 job 的自动取消时间是 24 小时。如果机器半夜宕机（有多台时是全部宕机），全组的 PR 会一直卡到有人醒来处理。
 
 `timeout-minutes` 帮不上忙，它从 job 开始执行时才计时，排队时间不算。
 
@@ -1144,23 +1522,27 @@ GitHub 对排队 job 的自动取消时间是 24 小时。如果机器半夜宕�
 
 ```bash
 gh variable delete CI_RUNNER --repo owner/repo                       # 1. 新 run 立刻走托管
-gh run list --status queued --json databaseId -q '.[].databaseId' \
+gh run list --repo owner/repo --status queued -L 200 --json databaseId -q '.[].databaseId' \
   | xargs -r -I{} gh run cancel {} --repo owner/repo                 # 2. 取消卡住的排队 run
 # 3. 在各 PR 上 Re-run，或推一个空 commit
 ```
+
+第 2 步的 `gh run list` 要带 `--repo`。不带时它查的是当前目录所在的仓库，在别的目录里执行就会查错或者报错。`-L 200` 是因为它默认只列 20 条，排队多时取消不全。
+
+只查 `queued` 会漏掉一种 run：里面已经有 job 开跑或跑完，剩下的 job 还在等 runner。按 GitHub 的状态定义，这种 run 的状态是 `in_progress`，不是 `queued`。比如所有机器在一个 run 跑到一半时挂掉，剩下的 job 就是这样。这类 run 要在页面上手动取消，或者用 `gh run list --repo owner/repo --status in_progress` 列出来逐个看。参考项目没有实际碰到过这种情况。
 
 ### 6.4 哨兵：机器挂了要有人知道
 
 自建 runner 下线时必须有告警。这里的「哨兵」指定期检查 runner 是否正常、发现异常就发出提醒的机制。
 
-原因：只有一台自建机器（N=1）就是单点，而 6.3 说明了它挂掉的代价是 24 小时。
+原因：只有一台自建机器时，它就是单点，6.3 说明了它挂掉的代价最长是 24 小时。有两台以上机器时，一台下线不会让 CI 停，但容量少了，排队会变长，也要有人知道。所以下面两层的分工是：① 机器侧心跳每台各报各的，发现的是哪一台挂了；② 排队哨兵发现的是所有机器都挂了，或者剩下的机器忙不过来。
 
 注意：在托管上跑高频定时哨兵，费用承受不了。
 
 一个流传很广的方案是「配一个跑在托管上的哨兵，每 13 分钟查一次排队队列」。它的费用问题如下：
 
 - 托管按每个 job 向上取整计费，这样每月要 3323 计费分钟。
-- 这已经超过整个免费额度（2000 分钟）。
+- 这已经超过 GitHub Free 私有仓库每月的免费额度（2000 分钟）。
 - 改用自建 runner 本来是为了节省额度，这样的哨兵会把额度全部用掉，两者矛盾。
 
 不同频率的费用如下：
@@ -1184,7 +1566,7 @@ dead-man's-switch 指机器定期向外部服务发心跳，心跳停了由外�
 # /etc/systemd/system/ci-heartbeat.service
 [Service]
 Type=oneshot
-# 只有 runner 服务真的在跑时才上报 —— 机器活着但 runner 死了也要能发现
+# 只有 runner 服务在跑时才上报。机器活着、runner 停了，心跳也会断
 ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -m 10 --retry 3 https://hc-ping.com/<UUID> >/dev/null'
 ```
 
@@ -1193,6 +1575,10 @@ ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -
 - 机器宕机
 - 网络断开
 - runner 进程退出
+
+有多台机器时，每台在心跳服务上单独建一个检查，用各自的 UUID，检查名带上主机名或 `RUNNER_NAME`，告警时能看出是哪一台。几台共用一个检查的话，只要还有一台在报，别的机器挂了也发现不了。撤掉一台机器时，要同时删掉它的检查，不然它会一直告警，步骤见 08 章 8.7。
+
+心跳只看 runner 服务是不是 active。服务 active 只说明进程还在，这台机器能不能领到 job、跑得对不对，心跳看不出来。这些要看 verify.sh 的 GitHub 侧检查（07 章）、ci-health 的产出告警（服务 active 但本机的 job 连续失败），以及每台机器最近有没有领到过 job（08 章 8.7）。
 
 #### ② 兜底层：挂在已有 workflow 上（0 新增计费 run）
 
@@ -1210,11 +1596,18 @@ ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -
                --jq '.workflow_runs[].created_at' 2>/dev/null); do
       [ $(( now - $(date -u -d "$t" +%s) )) -gt 900 ] && stuck=$((stuck+1))
     done
-    [ "$stuck" -gt 0 ] && echo "::warning::有 $stuck 个 run 排队超过 15 分钟——自建 runner 可能已下线"
-    exit 0    # 哨兵绝不让宿主 workflow 变红 —— 它是金丝雀，不是门禁
+    [ "$stuck" -gt 0 ] && echo "::warning::有 $stuck 个 run 排队超过 15 分钟，自建 runner 可能全部下线或全部占满"
+    exit 0    # 哨兵只提醒，不让宿主 workflow 变红
 ```
 
-局限：只有在有人开 PR 时才会运行，没有 PR 的时段覆盖不到。这段时间靠 ① 主层。
+这个 step 用 `github.token` 调 API，需要 `actions: read` 权限，最稳的是在这个 job 的 `permissions:` 里显式写上。两种情况下拿不到这项权限：workflow 顶层写了 `permissions:` 但没列它；仓库或组织把 GITHUB_TOKEN 的默认权限设成了受限。在 job 上写 `permissions:` 时，没列出的权限都会变成 none，这个 job 原来用到的权限要一起列上。私有仓库里缺这项权限时，`gh api` 返回 403，被 `2>/dev/null` 吞掉，哨兵永远不响。
+
+有多台机器时，这个哨兵响了，说明所有机器都挂了，或者都忙了 15 分钟以上。只挂一台时它不会响，要靠 ① 的心跳。
+
+局限：
+
+- 只有在有人开 PR 时才会运行，没有 PR 的时段覆盖不到。这段时间靠 ① 主层。
+- 和 6.3 的取消命令一样，它只查 `queued` 的 run，看不到状态是 `in_progress`、里面还有 job 在排队的 run。要查全，就把 `in_progress` 的 run 也列出来，逐个查它的 jobs 里有没有排队太久的。这个写法参考项目没有实测过。
 
 > 注意：判断 runner 是否下线要查排队队列，不要查 `/actions/runners` 返回的 online 状态。实测 `systemctl stop` runner 之后，这个字段仍然显示 online，有分钟级的延迟，不能作为可靠信号。
 
@@ -1233,41 +1626,59 @@ ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -
 按下面四步上线。第 2 步合入后变量还没设置，行为应与合并前完全相同，先确认这一点再打开开关。
 
 ```bash
-# 1. 确认 runner 在线且空闲
-gh api repos/OWNER/REPO/actions/runners --jq '.runners[]|{name,status,busy}'
+# 1. 确认各台 runner 都在线、空闲，标签一致
+gh api repos/OWNER/REPO/actions/runners --jq '.runners[]|{name,status,busy,labels:[.labels[].name]}'
 
-# 2. 合入改好的 workflow（此时变量未设 ⇒ 行为与合并前逐字相同，先验证这一步不改变任何东西）
+# 2. 合入改好的 workflow（此时变量未设，行为与合并前逐字相同，先确认这一步不改变任何东西）
 
 # 3. 打开开关
-gh variable set CI_RUNNER --repo OWNER/REPO --body '["self-hosted","linux","x64","ci"]'
+gh variable set CI_RUNNER --repo OWNER/REPO --body '["self-hosted","linux","x64","myproj-ci"]'
 
 # 4. 开一个空改动的测试 PR，确认各 check 都出现、都落到你的 runner、都绿
-#    ★ 再开第二个 PR —— 那才是验证「容器名冲突」修复的地方
+#    再开第二个 PR，容器名冲突的修复要在第二个 PR 上才能验证
 ```
-
-注意：第 4 步还要再开第二个 PR，「容器名冲突」的修复要在第二个 PR 上才能验证。
 
 ---
 
 ## 07 验证
 
-本章说明装完之后怎么确认 runner 真的可用：先跑机器侧自检脚本，再用真实 PR 验证，然后做破坏性验证和重启演练。
+本章说明装完之后怎么确认 runner 真的可用：先跑机器侧自检脚本，再用真实 PR 验证，然后做破坏性验证和重启演练。加第二台及以后的机器时，再对一遍 7.5 的清单。
 
 机器侧的全部检查用一条命令跑完：
 
 ```bash
-GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
+bash scripts/verify.sh
 ```
 
 重启之后也只需要跑这一条。它会逐项核对开机恢复路径是否真的自愈。
 
+脚本从 `/etc/ci-runner.env` 读回 bootstrap 落盘的参数，比如 `RUNNER_HOME`、`RUNNER_USER`、`RUNNER_UID`、`RUNNER_OOM_ADJ`、`METADATA_IP`、磁盘阈值和 `GH_REPO`，读法和 bootstrap 相同。所以用了非默认参数的机器不用再传一遍。环境变量里显式给的值优先。
+
+旧版 bootstrap 不落盘 `METADATA_IP`。这样的机器在用新版 bootstrap 重跑之前，如果云 metadata 地址不是默认的 `169.254.169.254`（比如阿里云、腾讯云，见 04 章 4.5），跑 verify 时要显式传，比如 `METADATA_IP=<你那家云的地址> bash scripts/verify.sh`，否则网络加固那几项会报假 FAIL。
+
+最后一组「GitHub 侧」查本机的 runner 在 GitHub 上是不是 online，需要一个 token。列 runner 的接口要求目标仓库的 `Administration: read` 权限，所以单独建一个 fine-grained token，只授权这个仓库，只给这一项读权限。不要拿注册用的读写 token。
+
+这一项最好在 CI 机以外查，比如在笔记本上，这样 token 不用上 CI 机，做法见 7.1 末尾。一定要在 CI 机上查时，token 用 `read -s` 输入，不要写在命令行上，否则会留在 shell 历史里：
+
+```bash
+read -rsp 'token: ' GH_TOKEN; echo; export GH_TOKEN
+bash scripts/verify.sh
+unset GH_TOKEN
+```
+
+脚本把 token 经标准输入交给 curl，不放进命令行参数（09 章 B19）。不给 token 时这一组是 SKIP。
+
 > 注意：`verify.sh` 不是纯只读的。
 >
-> 「钩子实跑」这一项会真的执行一次清理钩子：删带 CI 标签的容器、删 minio、杀 e2e 端口上的进程。有 job 在跑时执行，会打断那个 job。
+> 「钩子实跑」这一项会真的执行一次清理钩子：删带 CI 标签的容器，杀 `CI_APP_PORTS` 端口上的进程，删没有容器在用的匿名卷。有 job 在跑时执行，会打断那个 job。
 >
-> 因此脚本会先检查有没有 `Runner.Worker` 进程。如果有，就把「钩子实跑」和「无残留容器」两项标为 SKIP。看到 SKIP，说明当时机器在忙，等空闲后再跑一次，拿到完整结果。
+> 因此脚本会先检查有没有 `Runner.Worker` 进程。如果有，就把「钩子实跑」和「无残留容器」两项标为 SKIP。这时等空闲后再跑一次，拿到完整结果。
 >
-> 背景：这个脚本原来自称「只读」，08 章又把它列为日常巡检。两者叠在一起是个陷阱，2026-10-16 才发现。
+> 背景：这个脚本原来自称「只读」，08 章又把它列为日常巡检。两者叠在一起会打断 job，2026-10-16 才发现（09 章 B14）。
+
+SKIP 有两种。一种是上面说的机器在忙，跳过了会打断 job 的检查。另一种是提醒，不算失败，比如口令登录还开着、没配告警推送、有待重启的更新、根分区低于 WARN 线。通过与否只看 FAIL 的个数。
+
+用 `--skip-runner` 装、还没注册的机器，「找不到 runner 服务单元」会是 FAIL，给了 token 的话 GitHub 侧也是 FAIL。注册之后再跑一次。
 
 ### 7.1 `verify.sh` 查什么
 
@@ -1276,28 +1687,34 @@ GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
 | 分组 | 检查项 | 不通过意味着 |
 |---|---|---|
 | 服务与开机自启 | docker / containerd / runner 三个 unit `active + enabled` | 重启后回不来 |
-| runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust` 等于 `/etc/ci-runner.env` 里的 `RUNNER_OOM_ADJ`（没写按 800）且大于 0、`After=docker` | 见 04 章各条的后果 |
+| runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust` 等于 `RUNNER_OOM_ADJ`（没写按 800）且大于 0、`After=docker`；runner 用户的 uid 等于 `RUNNER_UID`（默认 1000） | 前几项见 04 章 4.3。uid 不一致只提示（SKIP），原因见 03 章 3.3 |
 | Docker | `live-restore=true`；BuildKit GC 有 Max Used 与 Min Free 两项 | 见表下说明 |
-| 清理与监控 | 共 9 项，见表下说明 | 见表下说明 |
-| 部署参数与系统更新 | `/etc/ci-runner.env` 存在且与钩子的 CI 标签一致；needrestart 豁免 runner；有没有待重启的更新 | 见表下说明 |
+| 清理与监控 | 共 11 项，见表下说明 | 见表下说明 |
+| 部署参数与系统更新 | `/etc/ci-runner.env` 存在；里面的 CI 标签和钩子一致；里面的 `RUNNER_NAME` 和本机注册名一致；needrestart 豁免 runner；有没有待重启的更新 | 见表下说明 |
 | 网络加固 | DOCKER-USER + OUTPUT 两条 metadata 规则；已持久化；实拨容器验证 | 少一条就有一条路通 |
-| SSH | 口令登录是否关闭 | — |
-| 干净度 | 无残留容器（有 job 时 SKIP）；匿名卷没有累积；磁盘余量 | 清理没生效 |
-| GitHub 侧 | runner `online` | 注册或网络问题 |
+| SSH | 口令登录是否关闭 | 开着时只提示（SKIP），关不关见 04 章 4.6 |
+| 干净度 | 无残留容器（有 job 时 SKIP）；匿名卷没有累积；根分区可用空间 | 清理没生效，或者 Docker 以外的东西在吃盘 |
+| GitHub 侧 | 按本机 `.runner` 里的注册 ID 找到自己那一条，状态为 online | 查不到：没注册，或者网络问题。同名那条的 ID 不是本机的：本机的注册被另一台用同名 `--replace` 顶掉了（09 章 A18） |
 
-Docker 组：如果 BuildKit GC 只有 Reserved，说明你用了 `defaultKeepStorage`，Min Free 保护就丢了。
+Docker 组：如果 BuildKit GC 只有 Reserved，说明你用了 `defaultKeepStorage`，Min Free 保护就丢了（09 章 A1）。
 
-清理与监控组的 9 个检查项：
+干净度组：根分区那一项和 ci-health 用同一套阈值，都从 `/etc/ci-runner.env` 读。低于 `CI_DISK_CRIT_MB`（默认 10 GiB）是 FAIL；低于 `CI_DISK_WARN_MB`（BuildKit 的 Min Free 加 1 GiB）只提示。这样盘大小不同的机器不会误报，两个值怎么取见 10 章 10.4。匿名卷的上限默认 6 个，是按参考项目定的：三个服务容器，workflow 没给它们挂 tmpfs 时，每个 job 会短暂留下约 3 个匿名卷。别的项目取每个 job 的服务容器数乘 2，跑 verify 时用 `CI_MAX_VOLUMES=<上限> bash scripts/verify.sh` 传入。
 
-- 钩子按 `bash -e` 实跑一次能退出 0（有 job 时 SKIP）
-- 钩子带运行中 job 守卫
-- 占位符已替换
-- 清理钩子文件就位
-- 两个钩子都挂
-- timer active 且以 runner 身份运行
-- 监控量的是 `/var/lib/containerd`
-- 磁盘阈值与 GC 对齐
-- 告警推送已配
+`verify.sh` 只检查本机第一个 `actions.runner.*` 服务。一台机器装了多个实例时，脚本会打一行提示，其余实例查不到，前提见 10 章 10.6。
+
+清理与监控组的 11 个检查项，按脚本里的顺序：
+
+1. 清理钩子文件就位
+2. 钩子按 `bash -e` 实跑一次能退出 0（有 job 时 SKIP）
+3. 钩子带运行中 job 的守卫
+4. 占位符已替换
+5. 两个钩子都挂（`JOB_STARTED` 和 `JOB_COMPLETED`）
+6. `ci-cleanup.timer` active
+7. 健康监控已装（脚本和 `/etc/cron.d` 条目都在）
+8. 监控量的是 `/var/lib/containerd`
+9. 磁盘告警阈值与 GC 对齐
+10. 告警推送已配（没配是 SKIP，不算 FAIL）
+11. 每日清理以 runner 身份运行
 
 这一组不通过的后果：
 
@@ -1305,17 +1722,20 @@ Docker 组：如果 BuildKit GC 只有 Reserved，说明你用了 `defaultKeepSt
 |---|---|
 | 钩子在 `-e` 下非零退出 | 每个 job 全红（原因见下文） |
 | 钩子没有 job 守卫 | timer 撞上 job 时会删它的容器 |
+| 只挂了一个钩子 | job 在初始化阶段被取消、或者 runner 服务被停掉时，残留没人清 |
 | 阈值没与 GC 对齐 | 每小时误报 |
 | 没配告警推送 | 告警没有接收方 |
+| 每日清理以 root 运行 | root 执行一个 runner 可写的脚本，runner 能借此拿到 root |
 
 部署参数与系统更新组不通过的后果：
 
 - 参数没落盘：下次重新部署时会静默改回默认值。
+- `RUNNER_NAME` 和注册名对不上：这个文件多半是从别的机器拷来的，里面的基线和 BuildKit 上限也是那台的。照 03 章重新定参数，这个文件不要跨机器拷（03 章 3.6）。
 - needrestart 没豁免 runner：安全更新会在 job 中途重启 runner。
 
-#### 为什么「清理与监控」的第一项要实跑钩子
+#### 为什么要实跑一次钩子
 
-2026-09-07 到 09-14，这台机器连续 7 天、21 个 job 全部失败，而这张表当时报的是 24 PASS / 0 FAIL。
+参考机在 2026-09-07 到 09-14 连续 7 天、21 个 job 全部失败，而这张表当时报的是 24 PASS / 0 FAIL。
 
 原因是当时的三条钩子检查都是结构性的：
 
@@ -1327,7 +1747,24 @@ Docker 组：如果 BuildKit GC 只有 Reserved，说明你用了 `defaultKeepSt
 
 runner 调用钩子时会强加 `-e`，钩子非零退出就会把 job 判为失败（详见 09 章 A11）。钩子「装上了」和「真能用」之间差一次真实调用，当时的检查只验证了前者。
 
-这条规则适用于所有自检：**凡是非零退出会产生后果的东西，自检必须用与调用方完全相同的方式执行它一次。** 只检查它存在，等于没检查。
+这条规则适用于所有自检：凡是非零退出会产生后果的东西，自检必须用和调用方完全相同的方式执行它一次。只检查它存在，等于没检查。
+
+#### 在 CI 机以外查 GitHub 侧
+
+在装了 `gh` 的笔记本或运维机上列出仓库的所有 runner：
+
+```bash
+gh api repos/OWNER/REPO/actions/runners \
+  --jq '.runners[] | "\(.id) \(.name) \(.status) busy=\(.busy) \([.labels[].name] | join(","))"'
+```
+
+再在每台 runner 上看它自己的注册 ID：
+
+```bash
+sudo grep -o '"agentId": *[0-9]*' /opt/actions-runner/.runner    # RUNNER_HOME 不是默认值的换成你的
+```
+
+每台机器的 agentId 都要出现在列表里，对应那一条的名字是这台的名字，状态是 online。名字对得上而 ID 对不上，说明这台的注册被另一台用同名顶掉了（09 章 A18）。
 
 ### 7.2 机器侧之外：必须用真实 PR 验的四件事
 
@@ -1340,6 +1777,8 @@ gh api repos/OWNER/REPO/actions/runs/<id>/jobs --jq '.jobs[]|"\(.name) \(.conclu
 ```
 
 输出里的 `runner_name` 应该是你的 runner 名，而不是 `GitHub Actions ####`。
+
+仓库里已经有别的自建机器时，新机器要单独确认两件事：上面的输出里出现了新机器的名字；每种重 job（构建、类型检查、带数据库的测试、e2e）都在它上面至少绿过一次。GitHub 把 job 派给空闲的那台，新机器不一定马上轮到。想让 job 尽快落到新机器上，可以等老机器空闲（`pgrep -x Runner.Worker` 没有输出）时停掉它的 runner 服务几分钟，验完再启动。
 
 #### ② 第二个测试 PR：验证容器名冲突的修复
 
@@ -1359,8 +1798,8 @@ gh api repos/OWNER/REPO/actions/runs/<id>/jobs --jq '.jobs[]|"\(.name) \(.conclu
 
 #### ④ 开关双向
 
-- 变量未设时开 PR ⇒ 应落 `ubuntu-latest`
-- 变量设了再开 PR ⇒ 应落你的 runner
+- 变量未设时开 PR，应落在 `ubuntu-latest`
+- 变量设了再开 PR，应落在你的 runner
 
 #### 参考项目的实际验证记录
 
@@ -1384,18 +1823,19 @@ kill -9 $(systemctl show <runner-unit> -p MainPID --value)
 # 期望：10–30 秒内自动拉起，MainPID 变了
 ```
 
-实测 30 秒内恢复。修改前（`Restart=no`）runner 会一直停着，不会再起来。
+参考项目实测 30 秒内恢复。修改前（`Restart=no`）runner 会一直停着，不会再起来。
 
 #### 公网暴露
 
 在 CI 跑着服务容器时验证，或者手动起一个绑法相同的容器再验证。
 
 ```bash
-# 用外部节点探，别在本机探自己的公网 IP —— 那只走本地路由栈，证明不了外部可达性
-curl -s -H "Accept: application/json" "https://check-host.net/check-tcp?host=<你的IP>:5433&max_nodes=4"
+# 用外部节点探。在本机探自己的公网 IP 只走本地路由栈，证明不了外部可达性（09 章 A10）
+# 端口换成你的服务容器映射到宿主的端口，参考项目是 Postgres 的 5433
+curl -s -H "Accept: application/json" "https://check-host.net/check-tcp?host=<你的IP>:<端口>&max_nodes=4"
 ```
 
-实测结果：
+参考项目的实测结果：
 
 - 修复前：四个境外节点全部成功连上，并收到 Postgres 认证响应。
 - 修复后：全部 `Connection refused`。
@@ -1408,10 +1848,25 @@ curl -s -H "Accept: application/json" "https://check-host.net/check-tcp?host=<�
 # 先用一个进程占住端口，再跑测试。期望：当场失败并指名道姓，而不是跑出一堆绿
 ```
 
-实测结果：
+参考项目的实测结果：
 
 - 修复前：220/221 通过，测到的其实是孤儿进程。
 - 修复后：退出码 1，并给出明确报错。
+
+#### OOM 顺序（机器上还跑着开发工具时做）
+
+目的是确认内存不够时内核先杀开发工具，不杀 CI。配置步骤见 04 章 4.8。最好在一个重 job（类型检查、打包）跑到一半时执行：
+
+```bash
+# 按 oom_score 从高到低列前 15 个进程：分数、adj、常驻内存（MB）、用户、进程名
+for d in /proc/[0-9]*; do
+  s=$(cat "$d/oom_score" 2>/dev/null) || continue
+  printf '%6s %6s %7s  %-10s %s\n' "$s" "$(cat "$d/oom_score_adj")" \
+    "$(awk '/^VmRSS/{print int($2/1024)}' "$d/status")" "$(stat -c %U "$d")" "$(cat "$d/comm")"
+done 2>/dev/null | sort -rn | head -15
+```
+
+分数越高越先被杀。开发会话里起的进程（VS Code 远程服务端的 node、Claude Code、Codex 等）adj 应为 1000，分数要排在 runner 用户名下最大的 node、tsc 进程前面。顺序反了，先查开发会话的 adj 是不是 1000（04 章 4.8 第 3 步），再按 04 章 4.3 的公式调低 `RUNNER_OOM_ADJ`。
 
 #### 开机恢复
 
@@ -1426,41 +1881,74 @@ curl -s -H "Accept: application/json" "https://check-host.net/check-tcp?host=<�
 ```bash
 # 重启前：记基线
 systemctl is-enabled docker containerd <runner-unit>
-iptables -S | grep -c 169.254.169.254
+iptables -S | grep -c 169.254.169.254      # metadata 地址，和你的 METADATA_IP 一致
 systemctl list-timers --no-pager | grep ci-
 
+# 等机器空闲（下面这条没有输出）再停 runner，免得重启时正好在跑 job
+pgrep -x Runner.Worker
+sudo systemctl stop <runner-unit>
 sudo reboot
 
-# 回来之后：一条命令
-GH_REPO=owner/repo GH_TOKEN=<token> bash scripts/verify.sh
+# 回来之后：一条命令（GitHub 侧那一组要 token，见本章开头）
+bash scripts/verify.sh
 ```
 
-**注意：如果你的 CI 助手或终端就跑在这台机上，重启会把它一起杀掉，所以把重启排在最后一步。**
+有多台机器时一次只重启一台。等它回来、`verify.sh` 通过、GitHub 上显示 online，再重启下一台，这样任何时候都有机器在接 job（08 章 8.7）。
+
+注意：如果你的终端或 CI 助手就跑在这台机器上，重启会把它一起断掉，所以重启放在最后一步。
+
+### 7.5 加一台机器时的验收清单
+
+操作步骤见 08 章 8.7，这里只列要核对的结果。
+
+注册之前（`bootstrap.sh --skip-runner` 跑完之后）：
+
+- `machine-check.sh` 带上现有 runner 的 REF 判为合格。判为有保留的，按 02 章 2.7 逐个 job 核过超时余量。
+- 最慢的 job 以 runner 用户回放过，算出的 R 代进 02 章 2.7 的式子，所有跑在自建机上的 job 都满足。
+- runner 用户的 uid 和其他 runner 机器相同，在各台上执行 `id runner` 比一下（03 章 3.3）。
+- `/etc/ci-runner.env` 是在这台机器上跑 bootstrap 生成的，不是从别的机器拷来的。里面的 `RUNNER_NAME` 和已有的机器都不同，`CI_FIXEDWORK_BASELINE` 是这台自己用 preflight 测的。
+
+注册之后：
+
+- `verify.sh` 没有 FAIL，GitHub 侧那一项按注册 ID 找到了本机。
+- GitHub 上几台都在，名字各不相同，标签相同。老机器那一条的 ID 没变，说明新机器没有用同名把它顶掉（09 章 A18）。在 CI 机以外查的命令见 7.1 末尾。
+- 7.2 ① 的查询里出现了新机器的名字，每种重 job 都在新机器上至少绿过一次。
+- 新机器的 ci-health 只统计自己的 job。执行 `grep -o 'jobs=[^ ]*' /var/log/ci-health.log | tail -3`，应是 `streak=` 开头。`skip` 是没配只读 token；`skip:no-runner` 是 ci-health 在注册之前装的，注册时没有重跑 bootstrap；`error:no-runner-name` 是读不到本机的 `.runner`。
+- 告警推送的标题里带主机名，几台推到同一个群也分得清。
+- 新机器在心跳服务上有自己的检查项（06 章 6.4）。
 
 ---
 
 ## 08 运维与容量
 
-本章讲上线之后的长期工作：怎么估算排队和容量、磁盘和 CPU 怎么监控、构建缓存怎么优化、什么时候该加机器，以及日常和每月的巡检步骤。
+本章讲上线之后的长期工作：怎么估算排队和容量、磁盘和 CPU 怎么监控、构建缓存怎么优化、什么时候该扩容、日常和每月的巡检步骤，以及有多台机器时怎么加、怎么撤、怎么更新。一台机器该跑几个实例、参数按规格怎么取，见 10 章。
+
+本章的 N 指整个仓库的 runner 实例总数，k 指一台机器上的实例数。现有脚本每台机器只装一个实例，所以眼下 N 就是机器台数。
 
 ### 8.1 容量：用仿真，别套公式
 
 估算排队时间和 runner 数量，要拿真实事件做仿真，不要套排队公式。
 
-最常见的错误是套 `ρ = λ × S`（到达率 × 服务时长），再按 M/M/1 模型算排队。**在有 `cancel-in-progress` 的仓库里，这个模型不成立。** 原因如下：
+最常见的错误是套 `ρ = λ × S`（到达率 × 服务时长），再按 M/M/1 模型算排队。在有 `cancel-in-progress` 的仓库里，这个模型不成立，原因如下：
 
 - 同分支的新 push 会取消旧 run，排队中的和正在跑的都会被取消。
 - 所以到达的 run 变多，不等于要做的工作变多。新 run 有很大一部分是在替换旧 run。
 
-做法：拿真实事件的时间戳做仿真，脚本是 `scripts/analysis/queue_sim.py`。
+做法：拿真实事件的时间戳做仿真，脚本是 `scripts/analysis/queue_sim.py`。在仓库根目录运行：
 
 ```python
-import sys; sys.path.insert(0,'scripts/analysis')
+import sys; sys.path.insert(0, 'scripts/analysis')
 from queue_sim import ts, simulate
-events = [(ts(r['created_at']), r['name'], r['head_branch']) for r in runs]   # 从 /actions/runs 拿
-svc    = {'ci': 305, 'main-post-merge': 276, 'pr-meta': 12}                    # 本机实测的服务时长
+# runs 是 /repos/{owner}/{repo}/actions/runs 返回的 workflow_runs 列表
+events = [(ts(r['created_at']), r['name'], r['head_branch']) for r in runs]
+svc    = {'ci': 305, 'main-post-merge': 276, 'pr-meta': 12}   # 参考项目各 workflow 的实测时长（秒），换成你的
 r = simulate(events, svc)
 ```
+
+这个脚本有两处限制，用之前要知道：
+
+- 它只模拟一个 runner。要比较 N=1 和 N=2，先把 `simulate()` 改成多个 runner 同时从队列取活。
+- workflow 的名字和 concurrency 规则是按参考项目写死的（`ci`、`pr-meta`、`main-post-merge`、`nightly`）。事件里出现别的 workflow 名会直接报 KeyError。用到你的仓库，先按你的 workflow 改 `CANCEL_RUNNING` 和 `group()`。
 
 #### 仿真时要注意的两个口径
 
@@ -1482,13 +1970,13 @@ r = simulate(events, svc)
 
 下面这些决策都应该用仿真来回答，不要凭感觉估：
 
-- N 该是几
+- 全仓库要几个 runner 实例，也就是 N 该是几（先把脚本改成能模拟多个 runner）
 - 要不要合并 job（比较它与别的提速手段的实际收益）
 - 能不能把某个检查加到 PR 路径上
-- 团队扩到 N 人时会怎样
-- 需求回弹（CI 恢复后大家推得更勤）会不会顶穿（超出单机容量）
+- 团队人数翻倍时会怎样
+- 需求回弹（CI 恢复后大家推得更勤）会不会顶穿（超出现有 runner 的容量）
 
-参考项目的仿真结果如下。数据取历史最忙的一天，单位是分钟。
+参考项目的仿真结果如下，都是一个 runner 的结果。数据取历史最忙的一天，单位是分钟。
 
 | 场景 | 中位 | p90 | 最长 |
 |---|---|---|---|
@@ -1499,8 +1987,8 @@ r = simulate(events, svc)
 
 结论：
 
-- 天花板约在 4 人。
-- 到 8 人时该加第二台机器。在同一台机器上加第二个 runner（N=2）的方案已经被实验证伪，见 8.5。
+- 只有一个 runner 时，天花板约在 4 人。
+- 到 8 人时要加 runner。参考项目的第一台是 4 核、约 7.6 GiB，在它上面同机跑两个实例的实验失败了，所以参考项目扩容是加机器，每台一个实例（8.5）。更大的机器一台能跑几个，见 10 章 10.2 和 10.6。
 
 ### 8.2 磁盘：各类占用分别由谁清理
 
@@ -1547,7 +2035,7 @@ r = simulate(events, svc)
 稳态可用 ≈ max(Min Free, 盘总量 − 上式)
 ```
 
-缓存工作集由构建频率与层序决定（见 8.4）。它填满 Max Used 之后就不再增长，可用空间会停在一个稳定值上。**这是设计行为，不该触发告警。**
+缓存工作集由构建频率与层序决定（见 8.4）。它填满 Max Used 之后就不再增长，可用空间会停在一个稳定值上。这是设计行为，不该触发告警。
 
 Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把可用空间挤到 Min Free 附近时，GC 才会为了保底而驱逐缓存。这种情况才值得告警。
 
@@ -1561,12 +2049,12 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
   - WARN < 40 GB：在设计稳态下每小时都会触发，一个月响了 309 次，没有送达任何人。
   - CRIT < 20000 MB：只比 Min Free（20480 MiB）低 480 MiB。
   - 现在的阈值：WARN = Min Free + 1 GiB，对应可用空间被挤到 Min Free 附近、GC 开始为保底驱逐缓存的时刻；CRIT = 10 GiB。
-  - bootstrap 会从 `BUILDKIT_MIN_FREE` 自动算出阈值，写进 `/etc/cron.d/ci-health`。
-- 告警要送到人。只写本机 journal 等于没有告警。在 `/etc/ci-health.env` 里配置 `CI_ALERT_WEBHOOK`（飞书自定义机器人）后，告警集合一有变化就推送，持续存在的告警每 24 小时提醒一次。
-- 失败连续计数只统计跑在本机上的 run。如果统计全仓库，会把 GitHub 托管的检查（PR 标题之类）也算进来。
+  - bootstrap 会从 `BUILDKIT_MIN_FREE` 自动算出阈值，写进 `/etc/cron.d/ci-health`，同时落盘到 `/etc/ci-runner.env`。以后改了 `BUILDKIT_MIN_FREE`，这个阈值不会跟着重算，做法见 10 章 10.4。
+- 告警要送到人。只写本机 journal 等于没有告警。在 `/etc/ci-health.env` 里配置 `CI_ALERT_WEBHOOK` 后，告警集合一有变化就推送，持续存在的告警每 24 小时提醒一次。消息标题带主机名，几台机器推到同一个群也分得清。脚本目前只实现了飞书自定义机器人的消息格式和签名，换成 Slack、钉钉、企业微信，要改 `ci-health.sh` 里的 `notify()`。
+- 失败连续计数只看落在本机上的 job，按本机的 runner 名匹配。按整个 run 的结论统计会有两种误报：GitHub 托管的检查（PR 标题之类）失败会被算进来；多台机器共用一套标签时，同一个 run 的 job 会分到几台机器上，别的机器上的 job 红了，这台也会报连续失败。读不到本机的 runner 名时，这一项报采样失败，不会退回去统计全仓库；用 `--skip-runner` 装、还没注册的机器上，这一项跳过。
 - 除了水位，也要看增量。日增超过预期两倍时，检查是不是哪个构建的层序坏了。
 
-> 注意：CI 机上不要常驻开发工具；要常驻，就把它们算进磁盘和内存预算。参考机上，VS Code 远程服务端每次客户端升级就多一份（约 650 MB），一个月攒了 5 份。它和 AI 助手一起常驻约占 2–3 GB 内存，而这台机器没有 swap，runner 又被设成 OOM 时第一个被杀。偶尔连上来排查可以，用完断开。
+> 注意：开发工具（VS Code 远程服务端、Claude Code、Codex 等）在 CI 机上同时占磁盘和内存。磁盘方面，VS Code 远程服务端每次客户端升级就多留一份，参考机上一份约 650 MB，一个月攒了 5 份，要在每月巡检时删（8.6）。内存方面后果更重，参考项目在 8 GB 的 CI 机上开发了两天，出了 11 次全局 OOM。最好不在 CI 机上开发；一定要开发，按 04 章 4.8 配置。
 
 ### 8.3 CPU 争抢监控
 
@@ -1576,6 +2064,8 @@ CPU 争抢要常态化采点监控，上线前查一次不够。
 2. 不能用的话，就采集定长任务的墙钟时间，超过基线 1.4 倍时报警。`ci-health.sh` 已经按这个方式实现。
 
 注意：共享 vCPU 的邻居会变。今天不拥挤，只能说明此刻不拥挤。
+
+基线只在同一台机器上有意义，不能拿来比较两台机器。`ci-health.sh` 和 `preflight.sh` 用的 sha256 定长任务，速度主要看 CPU 有没有 SHA 指令扩展。参考项目的 Intel Skylake 候选机没有这条扩展，现有的 AMD EPYC 有，sha256 显示 Intel 那台慢约 5 倍，实际单核只慢约 2 倍。反过来也会错：另一台同为 EPYC 的候选机，sha256 和现有 runner 只差约 4%，Python 循环却慢 15–25%。所以每台用自己的 preflight 结果当基线；换机、换规格，或者 `lscpu` 显示的 CPU 型号变了，都要重测。要比较两台机器的单核速度，用 02 章 2.7 的方法。
 
 ### 8.4 构建缓存的层序（性价比最高的一次性优化）
 
@@ -1629,30 +2119,33 @@ ARG APP_FILTER          # 需要的话放到 install 之后
 
 注意：`pnpm fetch` + `--offline` 解决不了这个问题。实测冷构建 65 秒里，`pnpm install` 整步（含下载）只占约 12–13 秒，大头是导出和解包 1.15 GB 的 node_modules 层（约 50 秒）。管用的办法只有两个：别让 install 层失效，别把它存两份。
 
-收益：这项优化只影响速度和磁盘，不涉及正确性。参考项目 10-10 至 10-16 这一周，冷装共占约 85 分钟 runner 时间（install 约 25 分钟，导出与解包新的依赖层约 60 分钟），约占同期全部 job 时长的 3.2%。改完能省下其中大部分，lockfile 真变了的那几次仍要重装。改完还能让 BuildKit 的 Max Used 从 20 GiB 降下来，腾出 10 GB 以上磁盘。参考项目把这项并进了它的镜像瘦身卡（metta-app 09a-3，#271）。
+收益：这项优化只影响速度和磁盘，不涉及正确性。参考项目 10-10 至 10-16 这一周，冷装共占约 85 分钟 runner 时间（install 约 25 分钟，导出与解包新的依赖层约 60 分钟），约占同期全部 job 时长的 3.2%。改完能省下其中大部分，lockfile 真变了的那几次仍要重装。改完还能让 BuildKit 的 Max Used 从 20 GiB 降下来，腾出 10 GB 以上磁盘。
 
-**先改 Dockerfile，再降 Max Used。** 顺序反过来只会让构建更冷。
+顺序是先改 Dockerfile，再降 Max Used。反过来的话，缓存工作集还没变小就先缩了上限，构建只会更冷。
 
-### 8.5 什么时候该加第二台机器
+### 8.5 什么时候该扩容
 
-出现下面任一信号，就该算账评估加机器：
+出现下面任一信号，就该算账评估扩容：
 
-- 排队等待的 p90 超过单 run 时长
+- 排队等待的 p90 超过单个 run 的时长
 - 团队规模翻倍（用 8.1 的仿真验证，别猜）
 - 想把重检查加进 PR 路径，但仿真显示会顶穿
 
-**扩容要加第二台机器。** 在同机加第二个 runner（N=2）的方案已被实验证伪，出现了两种不同的失败模式：CPU 饥饿导致的随机失败（flake，同一份代码时红时绿），以及 OOM。
+扩容有两条路：加机器，每台跑一个实例；或者在一台大机器上跑多个实例。全仓库要几个实例（N）用 8.1 的仿真估，一台机器放几个（k）按 10 章 10.2 算。
 
-如果一定要在同机加第二个 runner，需要满足下面的前置条件（通常都不满足）：
+现在先加机器。现有脚本支持多台机器共用一套标签，workflow 和开关变量都不用改，一台挂了其他台照常接 job。步骤见 8.7。
 
-- ① 修掉所有固定超时的测试；
-- ② 第二个 runner 打独立 label，只接秒级、无 DB、无 docker build 的活；
-- ③ 独立的 `_work` 与端口；
-- ④ 必须复测。
+参考项目在第一台（4 核、约 7.6 GiB）上试过同机跑两个实例，两次出了两种不同的失败：CPU 不够导致的随机超时，以及 OOM（02 章 2.1）。这个结论只对那台机器成立。核数和内存更多的机器，资源上能跑几个，按 10 章 10.2 算。
+
+资源够了也不能马上在一台机器上跑多个实例。参考项目的 workflow 给服务容器发布了固定的宿主端口，清理钩子也是按一台机器一个 job 写的，两个实例同时跑会抢端口。钩子现在发现本机有别的 job 就整段跳过，不会误删，但清理基本不再执行；去掉这道守卫，又会删掉对方的容器、杀掉对方的进程。要等 workflow 不再发布固定宿主端口、钩子只清自己这个 job 的资源、脚本能按实例分别安装之后，才能换一台大机器跑 k 个实例。完整的前提和扩容路线见 10 章 10.6。
+
+还有一个折中做法：第二个实例打独立的标签，只接秒级、不用数据库、不跑 docker build 的轻 job。它省的只是 CPU 和内存，端口、钩子和按实例安装这几条照样要先满足。
+
+参考项目现在选的是两台 4 核 8 GB 的机器，每台一个实例。等 workflow 和钩子按 10.6 改完，再考虑换成一台大机器跑多个实例。
 
 ### 8.6 日常巡检
 
-日常巡检用下面四条命令；另有三项工作每月做一次。
+日常巡检用下面四条命令；另有几项工作每月做一次。有多台机器时每台各做一遍。
 
 ```bash
 bash scripts/verify.sh                    # 全面自检（有 job 在跑时部分项会 SKIP，空闲时再跑拿完整结果）
@@ -1667,7 +2160,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 
 1. 重启机器。
    - 原因：needrestart 已经豁免了 runner（4.2 节），安全更新装上了，但 runner 还在用旧库；内核更新更是必须重启才生效。参考机上线 5 周没重启过，期间来过 3 个新内核（自动只保留最新一个）和一次 libc6，全都没生效。
-   - 做法：先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job。`live-restore` 与 `Restart=always` 会让一切自己恢复。
+   - 做法：先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job。`live-restore` 与 `Restart=always` 会让一切自己恢复。有多台机器时一次只重启一台，这台回来、`verify.sh` 通过、GitHub 上显示 online 之后再动下一台（8.7）。
    - 确认：恢复后跑 `verify.sh`。
    - 旧内核不用手动删。Ubuntu 会把重启前在用的那个内核保留作回退，`apt autoremove` 这时不会删它，等下次装新内核时才会标记为可删除。参考机 2026-10-16 重启后就是这样。
 2. 退役旧镜像。workflow 换了 pin 之后，旧版本不会被自动删除（钩子只删悬空的和打了 CI 标签的）：
@@ -1676,7 +2169,88 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
    docker image rm <旧镜像>          # 不带 -f：还有容器在用的话 Docker 会拒绝
    ```
    注意：别用 `docker image prune -a --filter until=...` 代劳。until 按镜像的创建时间算，一个两年前构建、今天还在用的 pin 会被删掉。
-3. 看一眼 Docker 以外的增长，例如 `du -sh /root/.vscode-server /root/.cursor-server /home/*/.cache`。VS Code 远程服务端可以只留正在用的那一份：用 `ls ~/.vscode-server/cli/servers/` 列出所有版本，进程在用的那个之外都能删。
+3. 看一眼 Docker 以外的增长，例如 `du -sh /root/.vscode-server /home/*/.vscode-server /root/.cursor-server /home/*/.cache`。VS Code 远程服务端可以只留正在用的那一份：用 `ls ~/.vscode-server/cli/servers/` 列出所有版本，进程在用的那个之外都能删。
+4. 核对参数。`/etc/ci-runner.env` 里的参数和按 10 章公式算出来的值是否还一致。workflow 加了重 job、机器上开始或不再有人开发、换了盘，都要按 10 章 10.7 重新量一遍。
+
+### 8.7 多台机器
+
+几台机器注册同一套标签时，GitHub 会把排队的 job 派给空闲的那台，workflow 和 `CI_RUNNER` 变量都不用改。每台机器各装各的，参数按各自的规格定。现有脚本每台只装一个实例，一台机器跑多个实例的前提见 10 章 10.6。
+
+#### 哪些必须不同，哪些必须相同
+
+- `RUNNER_NAME` 每台不同。注册时带 `--replace`，名字和已有的 runner 重复时，会直接顶掉那台的注册，不报错，那台从此接不到 job（09 章 A18）。默认值是 `ci-<主机名>`，云上新机器的主机名可能和老机器重复，有多台时显式传。
+- `/etc/ci-runner.env` 不要从一台拷到另一台，里面有 `RUNNER_NAME` 和那台机器自己测的基线。也不要拿一台已经注册过的机器做快照来克隆新机器，`RUNNER_HOME` 下的 `.runner` 和 `.credentials` 会一起带过去，两台用的是同一个注册。
+- `RUNNER_LABELS` 每台完全相同。`CI_LABEL`、`CI_APP_PORTS` 跟着 workflow 走，每台也相同。
+- runner 用户的 uid 每台相同（03 章 3.3）。
+- 和机器有关的参数每台单独定。`CI_FIXEDWORK_BASELINE` 用这台自己跑 `preflight.sh --with-load` 得到的 p50，不能抄别的机器，也不能拿来比两台的快慢（8.3）。`RUNNER_MEM_MAX`、`RUNNER_OOM_ADJ`、BuildKit 三个值按这台的内存和盘定（10 章）。
+
+监控也按台看。每台的 ci-health 只统计落在本机的 job，告警标题带主机名。verify.sh 的 GitHub 侧检查按本机 `.runner` 里的注册 ID 找自己那一条。心跳每台单独建一个检查（06 章 6.4）。06 章的排队哨兵在多台时，只有全部下线或全部忙满才会响，单台下线要靠这台自己的心跳发现。
+
+#### 加一台机器
+
+1. 选机。规格按 10 章定。拿到机器后按 03 章 3.0 用 `machine-check.sh` 测单核速度，拿现有 runner 的分数当 `REF`，不合格就删掉重开。
+2. 第一次跑 bootstrap 加 `--skip-runner`，带上这台自己的 `RUNNER_NAME` 和其余参数，只装机、不注册。
+3. 以 runner 用户回放最慢的 job，按 02 章 2.7 核对超时余量。
+4. 确认老机器上的脚本是当前版本。早期版本的 ci-health 按整个 run 统计连续失败，几台共用标签时会互相报警；早期的 verify.sh 只按名字查 GitHub 侧状态，本机注册被同名顶掉时查不出来。老机器先按下面「更新已部署的机器」更新。
+5. 输入 PAT 重跑 bootstrap 完成注册，参数从 `/etc/ci-runner.env` 读回。然后跑 `verify.sh`。
+6. 配告警：`/etc/ci-health.env` 里的只读 token 和推送地址（8.2），心跳服务上给这台单独建一个检查（06 章 6.4）。
+7. 在 GitHub 上核对。几台都在线、名字各不相同、标签相同；老机器 `.runner` 里的 agentId 还在列表里，说明它没有被顶掉。再看新机器领到了 job，每种重 job（构建、类型检查、带数据库的测试、e2e）都在它上面绿过一次。注册前后要验的完整清单见 07 章 7.5。
+
+在 CI 机以外查 runner 列表，token 要有目标仓库的 Administration 读权限：
+
+```bash
+gh api repos/OWNER/REPO/actions/runners \
+  --jq '.runners[] | "\(.id) \(.name) \(.status) busy=\(.busy) \([.labels[].name] | join(","))"'
+```
+
+`status` 有分钟级的延迟，刚停掉的 runner 可能还显示 online（06 章 6.4）。
+
+看最近 30 个 run 里每台各领了多少 job，用 Actions 读权限就够：
+
+```bash
+REPO=owner/repo
+gh run list --repo "$REPO" -L 30 --json databaseId -q '.[].databaseId' |
+while read -r id; do
+  gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+    -q '.jobs[] | select((.runner_name // "") != "") | .runner_name'
+done | sort | uniq -c
+```
+
+名字以 `GitHub Actions` 开头的是托管 runner。某台机器在线却长时间一个 job 都没领到，先查它的标签和别的机器是否一致。
+
+#### 重启和升级：一次只动一台
+
+等这台空闲（`pgrep -x Runner.Worker` 没有输出），`systemctl stop` 它的 runner 服务，再重启或升级。等它回来、`verify.sh` 通过、GitHub 上显示 online，再动下一台。动手前先确认别的机器在线，不然这段时间没有机器接 job。
+
+#### 更新已部署的机器
+
+手册仓库里的脚本更新以后，机器上已经装好的副本不会跟着变。整体更新就重跑 bootstrap：
+
+```bash
+pgrep -x Runner.Worker                         # 没有输出再往下
+systemctl stop <runner 服务>
+git -C <手册仓库目录> pull
+bash <手册仓库目录>/scripts/bootstrap.sh         # 参数从 /etc/ci-runner.env 读回；已注册的机器不需要 token
+bash <手册仓库目录>/scripts/verify.sh
+```
+
+一定要先停 runner 服务。bootstrap 只在开头查一次有没有 job，跑的几分钟里接到的 job 会被它末尾的重启打断；daemon.json 有变化时，它还会重启 docker。脚本最后会重新启动 runner。
+
+也可以只换一个文件。清理钩子按 04 章 4.4 的做法换：先写到 `.new`，试跑通过再替换，同样先停 runner 服务。`ci-health.sh` 不影响正在跑的 job，替换占位符后直接覆盖：
+
+```bash
+sed "s#__RUNNER_SVC__#<runner 服务>#" scripts/ci-health.sh > /usr/local/bin/ci-health.sh
+```
+
+#### 撤掉一台机器
+
+1. 如果这是最后一台自建机器，先按 06 章把 job 切回托管。
+2. 等它空闲，执行 `systemctl disable --now <runner 服务>`。job 会落到剩下的机器上，标签和变量都不用改。
+3. 删掉 `/etc/cron.d/ci-health`。不删的话，ci-health 每小时都会记一条「runner 服务不是 active」，配了推送的还会每 24 小时提醒一次。
+4. 停掉心跳 timer（`systemctl disable --now ci-heartbeat.timer`），再到心跳服务上删掉这台的检查，否则心跳服务会一直告警。
+5. 处理 GitHub 上的注册。撤掉的机器在列表里显示 offline，离线超过 14 天的注册 GitHub 会自动删掉。想马上删，在仓库的 Settings → Actions → Runners 里删，或者执行 `gh api -X DELETE repos/OWNER/REPO/actions/runners/<id>`（要 Administration 写权限）。
+
+14 天这条规则对临时关机的机器同样适用。一台机器停机超过 14 天，它的注册会被 GitHub 删掉，开回来之后 runner 连不上，要清掉本地的注册信息重新注册。参考项目没有遇到过这种情况，具体做法以 GitHub 的文档为准。
 
 ---
 
@@ -1684,9 +2258,11 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 
 本章记录部署和运行中踩过的坑，分三部分：
 
-- A. 环境的坑：换一台机器还会遇到。
-- B. 我们自己判断错的地方：方法论层面的问题，换个环境还会以别的形式出现，比 A 更值得读。
+- A. 环境的坑：换一台机器还会遇到。A15 以后是装新机器、准备加第二台机器时遇到的。
+- B. 判断方法上的错误：换个环境还会以别的形式出现，比 A 更值得读。
 - C. 有争议、未采纳的建议，以及不采纳的数据依据。
+
+文中的日期和数字都来自参考项目。
 
 ---
 
@@ -1704,7 +2280,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 
 另一种写法也不行：把 `reservedSpace`/`maxUsedSpace`/`minFreeSpace` 直接写在 `gc` 顶层，会被静默忽略。daemon 不报错，直接回落到出厂值。
 
-怎么做：**必须用 `policy` 数组。**
+怎么做：必须用 `policy` 数组。
 
 怎么确认：改完运行 `docker buildx inspect default | grep -A6 'rule#0'`，看这三项在不在。
 
@@ -1804,7 +2380,7 @@ runner 执行 job 钩子的真实命令是（Worker diag 原文）：
 Arguments: '-e /opt/actions-runner/hooks/ci-cleanup.sh'
 ```
 
-`ci-cleanup.sh` 第 16 行写的是 `set -uo pipefail`，不含 `-e`，但这关不掉外部传进来的 `-e`。两者叠加后，脚本里任何一条命令非零退出，都会让整个脚本当场中止。末尾那句 `exit 0   # 清理失败绝不让 job 变红` 根本执行不到。
+`ci-cleanup.sh` 开头写的是 `set -uo pipefail`，不含 `-e`，但这关不掉外部传进来的 `-e`。两者叠加后，脚本里任何一条命令非零退出，都会让整个脚本当场中止。末尾那句 `exit 0   # 清理失败绝不让 job 变红` 根本执行不到。
 
 实际触发点是第 7 步：
 
@@ -1816,7 +2392,7 @@ ls -dt bin.* 2>/dev/null | grep -vx "$cb" | tail -n +2 | xargs -r rm -rf
 
 ##### 排查和修复时要注意的三点
 
-1. GitHub 网页日志显示的命令不准。它打印 `shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}`，但那是 `ScriptHandler.PrepareExecution` 打出的装饰性 banner；钩子实际走的是 `GetScriptArgumentsFormat("sh")` = `-e {0}` 分支。**以 `_diag/Worker_*.log` 里的 `Arguments:` 为准。**
+1. GitHub 网页日志显示的命令不准。它打印 `shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}`，但那是 `ScriptHandler.PrepareExecution` 打出的装饰性 banner；钩子实际走的是 `GetScriptArgumentsFormat("sh")` = `-e {0}` 分支。以 `_diag/Worker_*.log` 里的 `Arguments:` 为准。
 2. 两个钩子指向同一个文件时，故障面加倍。`JOB_COMPLETED` 带 `always()`，前面的步骤全跳过它也照样跑，单独就足以让 job 变红。只修 `JOB_STARTED` 等于没修。
 3. 局部修补都不管用：
    - 只给出事的那两行加 `|| true`：仍然红，因为第 1 步 `docker ps | xargs` 也是管道。
@@ -1833,7 +2409,7 @@ trap 'exit 0' EXIT    # 兜底：连 set -u 触发的中止也吃掉
 
 ##### 通用规则
 
-**写 job 钩子时，始终假设调用方会加 `-e`。** 钩子的契约是「非零 = 让 job 失败」，所以清理类钩子必须自己保证退出 0，不能依赖脚本末尾的 `exit 0`。
+写 job 钩子时，始终假设调用方会加 `-e`。钩子的契约是「非零 = 让 job 失败」，所以清理类钩子必须自己保证退出 0，不能依赖脚本末尾的 `exit 0`。
 
 #### A12. `sed` 把占位符和「判断占位符有没有被替换」的守卫一起换掉了
 
@@ -1841,8 +2417,8 @@ trap 'exit 0' EXIT    # 兜底：连 set -u 触发的中止也吃掉
 
 ```bash
 # ci-cleanup.sh
-APP_PORTS="__CI_APP_PORTS__"                              # 18 行
-if [ ... ] && [ "$APP_PORTS" != "__CI_APP_PORTS__" ]; then # 30 行，守卫
+APP_PORTS="__CI_APP_PORTS__"                              # 赋值行
+if [ ... ] && [ "$APP_PORTS" != "__CI_APP_PORTS__" ]; then # 守卫行（旧写法）
 ```
 
 ```bash
@@ -1870,7 +2446,7 @@ if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 06:06:05  Stopping actions.runner.…service      ← needrestart 判定它用了旧 libssl
 ```
 
-当时正在跑的 job（`adal-fixtures (2)`）被当场打断。GitHub 上记为 Failed，下游的 adal-gate 跟着变红，只能重跑。这也是 `JOB_COMPLETED` 钩子跑不到的一个实例：runner 服务被停掉了。
+当时正在跑的一个测试 job 被当场打断。GitHub 上记为 Failed，下游的汇总检查跟着变红，只能重跑。这也是 `JOB_COMPLETED` 钩子跑不到的一个实例：runner 服务被停掉了。
 
 原因：A5 只豁免了 containerd，runner 服务本身也在 needrestart 的自动重启范围里。而 job 中途最不能重启的就是它。
 
@@ -1903,13 +2479,70 @@ if [ -n "${APP_PORTS// /}" ] && [ "${APP_PORTS#__CI_}" = "$APP_PORTS" ]; then
 
 注意：路径要用镜像实际声明的。postgres 18 是 `/var/lib/postgresql`，不是 `/var/lib/postgresql/data`。写错了不报错，卷照样漏，所以 job 里要有一步核对容器没挂卷。以非 root 运行的镜像（prometheus 是 nobody）挂 tmpfs 要加 `mode=1777`，否则写不进去、起不来。（05 章 ⑫）
 
-参考项目 2026-10-16 在 workflow 侧改完（metta-app #269），之后 job 期间新建卷为 0。钩子里的 `docker volume prune` 留着兜底。
+参考项目 2026-10-16 在 workflow 侧改完，之后 job 期间新建卷为 0。钩子里的 `docker volume prune` 留着兜底。
 
-playbook 自己为什么漏了这一点：05 章 ① 的模板写的就是 `docker rm -f`，参考项目沿用了这个模板。
+手册为什么漏了这一点：05 章 ① 原来的模板写的就是 `docker rm -f`，参考项目沿用了这个模板。
+
+#### A15. 全新的 Ubuntu 24.04 上，`dpkg -l` 对没装的包也返回 0
+
+旧版 bootstrap 用 `dpkg -l iptables-persistent` 判断要不要安装这个包。全新的 24.04 上，dpkg 里已经有这个包名的记录，状态是 `un`（未安装），`dpkg -l` 照样返回 0。于是脚本跳过安装，下一行的 `netfilter-persistent save` 找不到命令，bootstrap 在第 8 步退出，metadata 拦截规则没有持久化。
+
+这个问题在已经装好的机器上重跑发现不了，只有全新机器会踩到。参考项目是 2026-10-19 在一台全新机器上装机时遇到的。
+
+修法：用 `dpkg-query -W -f='${Status}' <包名> | grep -q 'install ok installed'` 判断，bootstrap 已经这样改了。
+
+规律：`dpkg -l` 的退出码只说明 dpkg 认得这个名字，不说明它装上了。
+
+#### A16. Node 官方 tarball 解压后归 uid 1001
+
+Node 官方 tarball 里的文件属主是 uid 1001，root 用 tar 解压时默认保留属主，于是 `/opt/node` 归 uid 1001。机器上谁恰好是 1001，谁就能改掉 CI 和 root 都会执行的 node。参考项目装新机器时，机器上的开发用户恰好就是 1001。
+
+修法：解压时加 `--no-same-owner`，bootstrap 已经这样改了。检查：`find /opt/node ! -user root | wc -l` 应为 0。
+
+#### A17. runner 一启动就会接排队的 job，而 `.env` 只在启动时读
+
+旧版 bootstrap 在第 5 步注册完就启动 runner，第 6 步加固时再重启一次，钩子到第 7 步才写进 `.env`。这带来两个问题：
+
+- 新注册的 runner 一上线就去接排队中的 job，紧接着的重启把它打断。
+- runner 只在启动时读 `.env`，重启之前接到的 job 没有清理钩子。
+
+修法：第 5 步只装服务不启动，等加固、钩子、metadata 规则都就位后，在第 8 步末尾启动一次（04 章 4.4）。
+
+规律：runner 服务的第一次启动要放在所有配置之后。它启动的那一刻，就可能在跑真实的 job。
+
+#### A18. 两台机器用了同一个 `RUNNER_NAME`，后注册的会顶掉先注册的
+
+bootstrap 注册时带 `--replace`，方便在同一台机器上重新注册。名字和仓库里已有的 runner 相同时，GitHub 会用新机器替换掉那条注册，不报错，老机器从此接不到 job。这时按名字查 GitHub 上的状态还是 online，因为在线的是新机器，很难发现。
+
+最容易出事的做法是把 `/etc/ci-runner.env` 从老机器拷到新机器，里面的 `RUNNER_NAME` 也跟着过去了。用已注册机器的快照克隆新机器也一样，注册信息会一起带过去。另一种情况是云上新机器的主机名和老机器相同，默认的 `ci-<主机名>` 就撞了。
+
+做法：每台机器显式传不同的 `RUNNER_NAME`，`/etc/ci-runner.env` 不跨机器拷贝（08 章 8.7）。核对时比 ID：本机 `.runner` 里的 agentId，要和 GitHub 上同名那条的 id 一致。verify.sh 现在就是这样查的。
+
+#### A19. runner 用户的 uid 要和容器写文件的身份对上
+
+常驻机器上工作区跨 job 复用，下一个 job 的 checkout 要先清掉上一次留下的文件。CI 容器往挂进去的工作区写文件时，文件属主是容器里进程的 uid。很多镜像里的普通用户是 uid 1000，比如 node 官方镜像自带的 `node` 用户（这个镜像默认以 root 运行，要在 workflow 里用 `--user` 切过去）。runner 也是 1000 时，这些文件归它，下一次 checkout 删得掉。runner 是别的 uid 时，清理会报 `EACCES`，job 在 checkout 这一步就失败。
+
+参考项目第一台的 runner 恰好是 1000，因为它是机器上第一个普通用户。如果先建了开发用户，runner 就会拿到 1001。
+
+做法：装机时先建 runner 用户，uid 固定为 1000（bootstrap 的 `RUNNER_UID`，默认 1000，被占用时报错退出），再建其他普通用户，多台机器保持一致（03 章 3.3）。有的云镜像自带 uid 1000 的用户，比如 AWS Ubuntu 镜像里的 `ubuntu`，要先处理掉它。
+
+#### A20. 共享 vCPU 的云上，同一个套餐开出来的 CPU 型号不一样
+
+共享 vCPU 机型的 CPU 型号由分到的宿主机决定，下单时选不了。参考项目找第二台机器时，同一个套餐先后开到两台 Intel Skylake，`machine-check.sh` 的单核分数是 4.2–4.7（分数是耗时，越大越慢），现有 runner（AMD EPYC-Rome）在跑 CI 时测的约 2.5，比值 1.7–1.9。后来开到一台同为 EPYC-Rome 的 8 核机器，型号和现有 runner 一样，真实的单核算法测试仍慢 23%。
+
+单核慢主要影响被限制在单核上跑的 job（比如测试容器只给 1 个 CPU）、单线程的类型检查和 lint，以及带固定超时的测试。核数多也补不回来。
+
+做法：拿到机器先用 `machine-check.sh` 和现有 runner 比（03 章 3.0），不合格就删掉重开。合格的也要回放最慢的 job、核对超时余量，再注册（02 章 2.7）。
+
+#### A21. 新机器 root 用口令 SSH 登不上，口令是对的
+
+Ubuntu 24.04 的 sshd 默认是 `PermitRootLogin prohibit-password`，root 只能用公钥登录。云厂商发来的 root 口令是对的，登录时也提示可以输口令，root 用口令登录照样被拒。cloud-init 写的 `PasswordAuthentication yes` 只打开了口令认证，root 能不能用口令登录由 `PermitRootLogin` 单独决定。参考项目在 Hetzner 上遇到过。
+
+做法：建机器时就填上 SSH 公钥。忘了填的，用云控制台的网页终端以口令登录，把公钥写进 `/root/.ssh/authorized_keys`（03 章 3.0）。
 
 ---
 
-### B. 我们自己判断错的地方
+### B. 判断方法上的错误
 
 这部分是方法论层面的问题，换个环境还会以别的形式出现。
 
@@ -2014,7 +2647,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 教训（这条比 A11 本身更重要）：
 
-> **结构检查 ≠ 执行检查。** 「装上了」和「真能用」之间隔着一次真实调用。凡是有「非零退出会产生后果」契约的东西，比如钩子、健康探针、`ExecStartPre`，自检必须用和调用方完全相同的方式执行它一次，不能只检查它存在。
+> 结构检查不等于执行检查。「装上了」和「真能用」之间隔着一次真实调用。凡是有「非零退出会产生后果」契约的东西，比如钩子、健康探针、`ExecStartPre`，自检必须用和调用方完全相同的方式执行它一次，不能只检查它存在。
 
 由此推出一条监控选型的原则：
 
@@ -2022,7 +2655,9 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 现在 ci-health.sh 加了 `jobs=streak=N`（最近连续失败次数），在这次故障的第 3 天就会报 CRIT。补这一条的成本是 15 行 shell。
 
-另外，MSN-0035 恰好在故障开始那天收尾，结论是「已完成 / 关键假设 12 成立 / 24 PASS 0 FAIL」。验收通过不等于系统可用，当时只测了前者。
+另外，那次部署的验收恰好在故障开始那天收尾，结论是「已完成，24 PASS 0 FAIL」。验收通过不等于系统可用，当时只测了前者。
+
+门禁放在哪一步也有讲究。2026-10 之前的 bootstrap 先把新钩子覆盖到正式路径，再试跑。`.env` 指向的就是正式路径，runner 每个 job 都现读现跑，所以在已部署的机器上，试跑失败时坏钩子已经生效，「拒绝接线」没有起作用。现在先渲染到 `ci-cleanup.sh.new`，试跑通过后再替换（04 章 4.4）。
 
 #### B11. 告警阈值没对齐设计稳态，也没有送达渠道
 
@@ -2038,6 +2673,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 - CRIT 阈值只比 Min Free（20480 MiB）低 480 MiB，可用空间稍被挤占就会触发。
 - 这些告警只写本机 journal，没有接收方。06 章说的心跳告警也从没部署。
 - 唯一一次由定时任务产生的「job 连续失败」CRIT（10-08）同样没有送达任何人，而且它本身是误报：它统计的是全仓库的 run，把 GitHub 托管的 PR 标题检查失败也算了进来。日志里另外两次 CRIT 是 09-14 修 A11 时手工测试产生的。
+- 改成只统计用到本机的 run 之后，准备加第二台机器时又发现一个问题：几台机器共用标签，同一个 run 的 job 会分到几台上，按 run 的结论算，别的机器上的 job 红了，这台也会报连续失败。现在只看落在本机的 job，按 runner 名匹配。
 
 教训：
 
@@ -2069,7 +2705,7 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 教训：
 
-> **CI 机上没有「只有 root 能读」这回事。** 落在这台机器磁盘上的任何东西，都要按「CI job 读得到」来设计。给监控用的凭据，按它真正需要的最小权限单独申请，不要顺手复用手边权限最大的那个。
+> CI 机上没有「只有 root 能读」这回事。落在这台机器磁盘上的任何东西，都要按「CI job 读得到」来设计。给监控用的凭据，按它真正需要的最小权限单独申请，不要顺手复用手边权限最大的那个。
 
 #### B13. 把一次性回收量当成持续效果
 
@@ -2119,6 +2755,60 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 > 「可以重跑」的前提是「重跑时知道上次是怎么跑的」。幂等只保证操作可以重复，参数要另外落盘保存。
 
+#### B16. 拿 sha256 定长任务比较两台机器的快慢
+
+preflight.sh 原来说它的 sha256 定长任务「跨机可比」，找第二台机器时就拿它比较候选机和现有 runner。读数把差距说大了：Intel Skylake 的候选机没有 SHA 指令扩展，现有的 AMD EPYC 有，sha256 显示 Intel 那台慢约 5 倍，实际单核只慢约 2 倍。
+
+反过来也会错。另一台同为 EPYC 的候选机，sha256 的 p50 是 0.53 秒，现有 runner 是 0.51 秒，只差约 4%，而 Python 循环慢 15–25%，真实的单核算法测试慢 23%。也就是说，sha256 换了机器之后，两个方向都会测偏。
+
+这个测法用来看同一台机器有没有被邻居抢核，仍然有效，因为同一台机器的指令集不会变。跨机器比单核速度，现在用 `machine-check.sh` 的分数，最可靠的是在候选机上回放最慢的 job（02 章 2.7）。
+
+教训：
+
+> 基准测试要像真实负载。两台机器的读数差得很多或者差得很少时，先弄清差异从哪里来，再下结论。
+
+#### B17. 在 CI 机上开发，内核先杀了 CI
+
+参考项目有两天在 CI 机（4 核、约 7.6 GiB、无 swap）上开着 VS Code 远程、Claude Code 和 Codex 开发，出了 11 次全局 OOM。被杀的大多是 CI 的 lint、typecheck，job 以 exit 137 失败。
+
+原因有两层：
+
+- 内存账没算开发工具。VS Code 远程服务端常驻约 4 GB，断线重连后新旧两套扩展进程还会并存一阵。08 章原来写的「2–3 GB」偏低。
+- OOM 优先级排反了。runner 设成 800，本意是让 CI 比系统服务先被杀，而 SSH 会话里起来的开发工具是默认的 0。内核按「内存占用 + oom_score_adj × 总内存 ÷ 1000」挑进程，800 在这台机器上相当于给 CI 多算了约 6 GiB，于是 CI 排在了开发工具前面。
+
+开发搬到别的机器之后，没有再出现。
+
+教训：
+
+> 给一个服务调 OOM 优先级时，要把机器上所有大进程放在一起排一遍，不能只和系统服务比。
+
+配置方法见 04 章 4.8，各内存档的取值见 10 章 10.3。
+
+#### B18. 把一台小机器上的实验写成了通用结论
+
+参考项目在第一台 4 核、约 7.6 GiB 的机器上试过同机跑两个 runner 实例，两次分别出了 CPU 不够导致的随机超时和 OOM（02 章 2.1）。手册据此写了「同机加第二个 runner 已被实验证伪」，读起来像是任何机器都不行。
+
+这次实验的条件是：4 核、约 7.6 GiB、workflow 发布固定的宿主端口、清理钩子按一台机器一个 job 写。换成核数和内存更多的机器，端口和清理按 job 隔开之后，结论不一定还成立。现在的写法是：资源上能跑几个按 10 章 10.2 算，要真的跑多个，先满足 10.6 的前提；在那之前扩容就加机器。
+
+教训：
+
+> 实验结论要连同它的条件一起写。
+
+#### B19. 自检脚本把 token 放进了命令行参数
+
+verify.sh 查 GitHub 侧状态时，原来用的是 `curl -H "Authorization: Bearer $GH_TOKEN"`，bootstrap 查 runner 版本和换注册 token 时也是这样。命令行参数对本机所有用户可见（`ps`、`/proc/<pid>/cmdline`），runner 用户和正在跑的 CI job 都看得到。文档里的示例还把 `GH_TOKEN=<token>` 写在命令前面，token 会留在 shell 历史里。列 runner 要求仓库的 Administration 读权限，大家顺手用的往往是注册用的读写 token，泄露的代价更大。
+
+修法：
+
+- token 经标准输入交给 curl（`printf ... | curl -H @-`），不出现在参数里，两个脚本都已经这样改了。
+- 示例改成用 `read -s` 输入 token。
+- GitHub 侧的在线状态最好在 CI 机以外用 `gh api` 查（07 章 7.1）。
+- 从别的机器远程装机、token 经临时文件传进去的，读进环境变量后立刻删掉这个文件，而且要在 runner 启动之前删。runner 一启动就可能在跑 job（A17）。
+
+教训：
+
+> 在 CI 机上，密钥不能进命令行参数和 shell 历史。必须落盘的，用完马上删。能不上 CI 机的就不上。
+
 ---
 
 ### C. 有争议、未采纳的建议
@@ -2134,10 +2824,333 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 各条的详细说明：
 
-- 把 4 个 job 合并成 1 个：三个独立方案都这么建议，论证也对（N=1 上 job 只排队不并行）。但仿真显示，它带来的排队改善与「修 Dockerfile 层序 + 去 cache」等效（11.7 vs 11.2 分钟），而后者不动一行文档，也不破坏回退时的并行。在提速之上再合并，只多省 2.2–2.6 分钟，不值 10 处文档改动。
+- 把 4 个 job 合并成 1 个：三个独立方案都这么建议，论证也对（只有一个 runner 时，job 只排队不并行）。但仿真显示，它带来的排队改善与「修 Dockerfile 层序 + 去 cache」等效（11.7 vs 11.2 分钟），而后者不动一行文档，也不破坏回退时的并行。在提速之上再合并，只多省 2.2–2.6 分钟，不值 10 处文档改动。
 - `docker image prune` 是清理主力：实测回收 0 MB。Docker 29 重打同名 tag 不留悬空镜像。原文接着说「主力是 `buildx prune`」，这半句也错了，见 B13：workflow 挂 tmpfs 之前，持续负载下一直在回收的是 `volume prune`；缓存上限靠 GC。
 - metadata 泄露 root 口令 = 阻塞项：机制属实，但把口令与 `/etc/shadow` 的 hash 逐位比对后不匹配，是陈旧凭据，因此降级为「高」。判定「凭据泄露」之前，先验证那个凭据还有效。
 - 零下载的 `docker build` 也扣 Docker Hub 配额：试着复现，没能复现（6 次操作计数一格未动）。记录在案，但不采纳。
+
+---
+
+## 10 按机器规格定参数
+
+本章回答两个问题：一台机器跑几个 runner 实例；装机时和规格有关的几个参数（`RUNNER_MEM_MAX`、`RUNNER_OOM_ADJ`、BuildKit 的三个值、磁盘告警阈值）按这台机器的核数、内存和盘怎么取。
+
+做法是先在机器上量几个数，再套公式。文中的推荐值按参考项目的 job 算，你的 job 不一样，结果也会不一样，量法和公式是通用的。
+
+本章用两个记号：
+
+- N：全仓库的 runner 实例总数，所有机器加起来算，也就是同时最多能跑几个 job。要几个用 08 章 8.1 的仿真按排队估。
+- k：一台机器上的实例数。本章的公式算的是 k。
+
+每台机器各自套公式，参数存在各自的 `/etc/ci-runner.env` 里。不要在机器之间拷这个文件（03 章 3.6）。
+
+> 注意：现有脚本和参考项目的 workflow 每台机器只支持一个实例。公式算出 k 大于 1，只说明这台机器的资源够；要真的跑多个，先满足 10.6 的前提。在那之前，提高并发就加机器（08 章 8.7）。
+
+### 10.1 先量哪些数
+
+| 记号 | 是什么 | 怎么量 | 参考项目 |
+|---|---|---|---|
+| T | 总内存，系统里看到的 MemTotal，比厂商标的数小一点 | `grep MemTotal /proc/meminfo` | 约 7.6 GiB（标 8 GB） |
+| S | 系统自己占的内存：没有 job、没有开发会话时，T 减去可用内存 | 空闲时执行 `free -m`，T 减去 available 那一列 | 约 0.5 GiB（估算） |
+| J | 一个 job 的整机峰值：最重的 job 让整机可用内存少了多少，含它起的容器、tmpfs 和 docker build | sysmon.sh，见下文 | 取 6 GiB |
+| C | 一个 job 用几个核：最重的 job 运行时平均忙几个核，向上取整 | step.sh 或 sysmon.sh，见下文 | 约 3.7 核，取 4 |
+| P | runner 进程树的峰值，不含容器，用来定 `RUNNER_MEM_MAX` | step.sh，或者读 memory.stat，见下文 | 约 3.7 GB |
+| Q | 和进程树峰值同时存在的容器占用，主要是 services 容器 | 读 memory.stat，见下文 | 约 0.6 GiB（估算） |
+| D | 开发工具占的内存：VS Code 远程服务端、Claude Code、Codex 等。不在这台机器上开发就是 0 | 见下文 | 一个人开发按 4–5 GiB |
+
+磁盘相关的几个数（缓存工作集、Docker 以外的增长、单 job 临时写盘）放在 10.4。单核速度不影响 k，但影响每个 job 的超时余量，见 02 章 2.7。
+
+#### J：用 sysmon.sh 记整机可用内存
+
+J 要按整机量。runner 单元的 `MemoryMax` 只管 runner 进程树。CI 起的容器挂在 `system.slice/docker-<id>.scope` 下，docker build 的 RUN 步骤由 dockerd 执行，都不在 runner 的 cgroup 里（04 章 4.3），只看 runner 的内存峰值会低估。
+
+在已经装好、能接 job 的机器上（还没有任何自建机器时见代码块后面的说明）：
+
+```bash
+free -m          # 先在空闲时记下 available 那一列，记作 A0（MiB）
+nohup bash scripts/analysis/sysmon.sh /var/tmp/sysmon.csv >/dev/null 2>&1 &
+# 让完整的 CI 跑几轮，最重的几个 job 都要跑到，然后停掉采样：
+pkill -f analysis/sysmon.sh
+awk -F, 'NR>1{print $11}' /var/tmp/sysmon.csv | sort -n | head -1    # 全程最低可用（MiB），记作 A1
+```
+
+J = A0 − A1，S = T − A0。
+
+- sysmon.sh 每 5 秒记一行，短暂的低点可能漏掉，算出的 J 会偏小一点。10.2 的余量要留足。
+- 量的时候机器上不要开开发工具，否则它们的占用会混进 S 和 J。开发工具单独量。
+- 多台机器共用一套标签时，job 会分到各台。sysmon 要多跑一阵，确认最重的 job 在这台机器上跑过（08 章 8.7 有按机器统计 job 的查询）。
+
+还没有任何自建机器时，J 要先有一台机器才量得出来。先按 10.5 里接近的档位开一台候选机，跑 `bootstrap.sh --skip-runner`。按 02 章 2.7 第 4 步回放最重的 job 时同时开着 sysmon.sh，services 容器按 workflow 里的参数用 `docker run` 起好，docker build 也照跑，这样量出的就是 J。再用 10.2 核对这一档够不够，不够就换一档重开。
+
+参考项目的 J 是这样来的：2026-09-14 在 7.57 GiB 的机器上完整跑了一遍 ci.yml（含两次 docker build），整机可用内存最低 1339 MB。按 S 约 0.5 GiB 算，最重的 job 约 5.8 GiB，取 6 GiB。当时机器上是否开着开发工具已经确认不了，所以这个值偏保守。早先按「进程树 + 服务容器 + 系统」加出来的 4.8 GiB 漏了 docker build（02 章 2.1）。
+
+#### C：一个 job 用几个核
+
+用 step.sh 跑最重的 job 的各个步骤（02 章 2.1），结果文件 `steps.psv` 的第 5 列是核秒除以墙钟，也就是这一步平均忙几个核。也可以从上面的 sysmon.csv 算：这个 job 运行期间，每行的 (100 − 第 5 列 − 第 6 列) × 核数 ÷ 100，就是那 5 秒里忙的核数。
+
+C 要在目标机器上量。测试框架和打包工具的 worker 数默认跟着核数走，换到 8 核的机器上，同一个 job 可能用更多的核，内存也跟着涨。量之前先把 worker 数写死（比如 Jest 的 `--maxWorkers`），4 核和 8 核机器上量出的数才能比，按 C 分核也才靠得住。参考项目在 4 核机器上量的是单 job 3.3–3.7 核，基本用满了 4 个核。
+
+#### P 和 Q：读 memory.stat
+
+P 可以用 step.sh 的峰值（02 章 2.1），也可以在最重的 job 运行期间读 runner 单元的 memory.stat。
+
+- step.sh 读的是 ci.slice 的 memory.current，里面含页缓存：这一步自己读写文件产生的，加上前几步留下、还没回收的。所以它比只算 anon 和 shmem 略大，拿来定 10.3 的下限偏保守。
+- 要精确就读 memory.stat，只取 anon 和 shmem（含 tmpfs）两项，不算页缓存，页缓存在内存紧张时可以回收。
+- `systemctl show -p MemoryPeak` 和 ci-health 记的 `mem_peak` 也含页缓存，而且 runner 服务启动以来前面各个 job 留下的页缓存都算在里面，偏得更多，不能直接拿来定 `RUNNER_MEM_MAX`。参考机上 MemoryPeak 读到 5.6 GB，step.sh 量的进程树峰值约 3.7 GB。
+
+下面每 2 秒记一行：时间、runner 进程树（MiB）、全部 CI 容器合计（MiB）。在 tmux 或 screen 里跑，断线不受影响，最重的 job 跑完后按 Ctrl-C 停：
+
+```bash
+U=$(basename "$(ls /etc/systemd/system/actions.runner.*.service | head -1)")
+G=/sys/fs/cgroup/system.slice
+m(){ awk '$1=="anon"||$1=="shmem"{s+=$2} END{print int(s/1048576)}'; }
+while sleep 2; do
+  echo "$(date +%T) $(m < "$G/$U/memory.stat") $(cat "$G"/docker-*.scope/memory.stat 2>/dev/null | m)"
+done >> /var/tmp/ci-mem.log
+```
+
+取数：`sort -k2,2n /var/tmp/ci-mem.log | tail -1` 是进程树最大的那一行，第 2 列就是 P。`sort -k3,3n /var/tmp/ci-mem.log | tail -1` 是容器最多的时候，Q 取它的第 3 列，偏保守。
+
+#### D：开发工具占多少
+
+不在 CI 机上开发，D 就是 0。一定要在上面开发时，先按人头估：
+
+| 工具 | 每人按多少算 | 参考项目实测 |
+|---|---|---|
+| VS Code 远程（含扩展里的 TS 服务、Pylance、Claude 扩展） | 4 GiB | 约 3–4.3 GiB；断线重连后，新旧两套扩展进程会并存一阵 |
+| 只在终端里用 Claude Code、Codex | 1–2 GiB | 没有单独量过 |
+| 套了 `systemd-run` 内存上限的命令行工具 | 按它的上限算 | Codex 限 1G（04 章 4.8） |
+
+再实测核对。开发用户的进程都在 `user-<uid>.slice` 下，开着平时用的工具、没有 job 的时候读几次，取最大值：
+
+```bash
+awk '$1=="anon"||$1=="shmem"{s+=$2} END{printf "%.1f GiB\n", s/2^30}' \
+  /sys/fs/cgroup/user.slice/user-$(id -u <开发用户>).slice/memory.stat
+```
+
+参考项目一个人开发时 D 按 4–5 GiB 算：VS Code 远程 4 GiB，加上限 1G 的 Codex。
+
+### 10.2 每台几个实例 k
+
+```text
+按内存：k_mem = 向下取整((T − S − D − 余量) ÷ J)     余量 = max(1 GiB, T × 10%)
+按 CPU：k_cpu = 向下取整((核数 − 开发用核) ÷ C)      有人在这台机器上开发时开发用核按 2 算，没人开发时为 0
+k = min(k_mem, k_cpu)
+```
+
+10.6 的前提都满足之前，每台按 1 个部署。k = 0 说明这台机器跑不了这套 CI 最重的 job，要么换机器，要么把开发工具搬走。
+
+几点说明：
+
+- 余量留给内核、页缓存的最低需要和 sysmon 漏掉的尖峰。没有 swap 的机器内存一超就是 OOM kill，这部分不能省。
+- 开发用核按 2 算，对应 04 章 4.8 给 Codex 限的 `CPUQuota=200%`。
+- 会把核用满的 job，同机跑多个实例之前要先给每个实例限定核数（容器的 `--cpus`、测试框架的 worker 数），再按限定后的条件重新量 C 和耗时。
+- k 是一台机器的资源上限。全仓库要几个实例（N）是另一个问题，用 08 章 8.1 的仿真按排队算。
+
+拿参考项目核对：4 核、约 7.6 GiB、不在上面开发时，k_mem = 向下取整((7.6 − 0.5 − 0 − 1) ÷ 6) = 1，k_cpu = 向下取整(4 ÷ 4) = 1。参考项目在这台机器上试过同机跑两个实例，两次分别撞上 CPU 不够和 OOM（02 章 2.1），和公式的结果一致。
+
+### 10.3 RUNNER_MEM_MAX 与 RUNNER_OOM_ADJ
+
+#### RUNNER_MEM_MAX
+
+它是 runner 单元的 `MemoryMax`，防的是一个失控的 job 拖垮整机（04 章 4.3）。它只管 runner 进程树，不管容器。
+
+```text
+下限 = 1.3 × P                  低于下限，正常的 job 也会撞上自己的上限被杀
+上限 = (T − S − D) ÷ k − Q      高于上限，失控的 job 还没撞上自己的上限，整机就先触发全局 OOM
+```
+
+下限向上取整到 G。下限高于上限说明内存不够，要减 k、把开发工具搬走，或者换大内存的机器。
+
+这个值只跟 job 有关，大内存的机器上不用调大。参考项目取 6G：P 是 3663 MB，下限约 4.7 GiB；上限 = 7.6 − 0.5 − 0 − 0.6 = 6.5 GiB。10.5 表里能跑的各档，6G 都在范围内。
+
+#### RUNNER_OOM_ADJ
+
+机器只跑 CI 时用默认值 800。
+
+机器上有开发工具、又要它们比 CI 先被杀时，先按 04 章 4.8 把开发会话设成 1000，再按 04 章 4.3 的式子调低 runner 的值：
+
+```text
+(1000 − RUNNER_OOM_ADJ) ÷ 1000 × T > RUNNER_MEM_MAX
+也就是 RUNNER_OOM_ADJ < 1000 × (1 − RUNNER_MEM_MAX ÷ T)，再往下取整到百
+```
+
+有 swap 时，T 按内存加 swap 算。单个 CI 进程最多涨到它所在实例的 `RUNNER_MEM_MAX`，所以 k 大于 1 时这个式子照样成立。
+
+`RUNNER_MEM_MAX=6G` 时各档的取值：
+
+| 机器 | 系统里看到的内存 | 式子给的上限 | 有开发工具时取 | 只跑 CI 时取 |
+|---|---|---|---|---|
+| 8 GB | 约 7.6 GiB | 约 210 | 200 | 800 |
+| 16 GB | 约 15.2–15.6 GiB | 约 605–615 | 600 | 800 |
+| 32 GB | 约 31 GiB | 约 806 | 800 | 800 |
+
+比上限小的值也满足这个式子，比如参考项目在一台 16 GB 的候选机上试装时设的是 200。
+
+这个式子只决定先杀谁。CI 加开发工具放不下时，调了它也只是每次 OOM 改成先杀开发工具，内存够不够要按 10.2 把 D 算进去。CI 起的容器不继承这个值，docker 默认给 0，见 04 章 4.3。
+
+#### 开发工具的上限和 swap
+
+开发工具里吃内存的命令行工具，按 04 章 4.8 用 `systemd-run` 套上限。上限不超过全量 CI 期间整机最低可用内存减 0.3 GiB：参考项目 8 GB 的机器上最低可用约 1.3 GiB，所以取 1G；16 GB 的机器可以给到 2G。
+
+CI 机默认不开 swap。内存一超直接 OOM kill，job 很快失败，比换页拖到超时好查（02 章 2.2）。机器上有开发工具时，可以考虑加 2–4 GB swap，让开发工具闲着的内存换出去，同时给 runner 单元加 `MemorySwapMax=0`，让 CI 自己不用 swap。bootstrap 不写这一项，要手动加 drop-in。这个组合参考项目没有实测过，用之前先在空闲时验证。加了 swap 以后，上面式子里的 T 要按内存加 swap 重算。
+
+### 10.4 BuildKit 与磁盘阈值
+
+这几个数要上线一段时间才量得出来：
+
+| 记号 | 是什么 | 怎么量 |
+|---|---|---|
+| W | 构建缓存工作集：BuildKit 缓存稳定下来的大小 | 上线一周后看 `docker system df` 的 Build Cache 行 |
+| G | Docker 以外每月增长 | `ci-health.log` 里「可用 + containerd」之和每月减少多少（08 章 8.2） |
+| F | 固定占用：系统与工具链、在用镜像、工作区，再加一个月的 G | 已用空间减去 Build Cache，再加 G |
+| 单 job 临时写盘 | node_modules、构建产物、新镜像 | step.sh 输出的 `disk=`，或者 job 前后各看一次 `df` |
+
+还没有数据时，W 按 20 GB、G 按每月 6 GiB 起步，F 按 25 GB 估（参考项目清理后约 19 GB，加一个月的增长）。这些是参考项目的值，当时机器上还有开发工具，CI 专用机通常小一些。一台跑 k 个实例时，工作区要按 k 份算（`du -sh <RUNNER_HOME>/_work` 看一份多大），镜像和 BuildKit 缓存是共用的。
+
+```text
+Min Free = 盘总量 × 20%，不低于 20 GB，不高于 40 GB
+Max Used = min(2 × W, 盘总量 − F − Min Free − 10 GB)
+Reserved = min(10 GB, Max Used ÷ 2)
+检查：Max Used ≥ W；Min Free ≥ k × 单 job 临时写盘 + G
+```
+
+- Max Used 小于 W 时，GC 会反复驱逐还在用的缓存，构建退回冷构建（02 章 2.6）。这时要么换大盘，要么先按 08 章 8.4 修 Dockerfile 的层序，把 W 降下来。
+- Max Used 取 W 的 2 倍，是给换 lockfile 前后的两套依赖层都留出位置。盘再大，也不用超过这个数。
+- 公式里减去的 10 GB 是余量，让稳态可用空间停在 Min Free 之上，免得一上线就贴着告警线。
+
+磁盘告警阈值：
+
+```text
+CI_DISK_WARN_MB = Min Free 换算成 MiB + 1024                    bootstrap 按 BUILDKIT_MIN_FREE 自动算
+CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认 10240，要改就显式传
+```
+
+按盘大小查（W = 20 GB，F = 25 GB，k = 1）：
+
+| 盘总量 | Reserved | Max Used | Min Free | CI_DISK_WARN_MB | 说明 |
+|---|---|---|---|---|---|
+| 40 GB | 不适用 | 不适用 | 不适用 | 不适用 | 跑 docker build 的 CI 不推荐：F 加 Min Free 已经超过盘总量 |
+| 75 GB | 10GB | 20GB | 20GB | 21504 | 参考项目第一台，也是 bootstrap 的默认值。这是下限：机器上留过开发工具时，一个多月后可用空间就会挤到 Min Free 附近，要靠每月巡检（08 章 8.6）清理 |
+| 150 GB | 10GB | 40GB | 30GB | 31744 | 参考项目在一台 150 GB 盘的候选机上用的就是这组值 |
+| 300 GB | 10GB | 40GB | 40GB | 41984 | 缓存上限由 W 决定，盘大了不用跟着调 |
+
+`CI_DISK_CRIT_MB` 在这几档都是默认的 10240。
+
+在已部署的机器上改 BuildKit 参数：先等机器空闲，`systemctl stop` 停掉 runner 服务，再带上新的 `BUILDKIT_*` 重跑 bootstrap。daemon.json 有变化时 bootstrap 会重启 docker，最后会重新启动 runner（04 章 4.1）。`CI_DISK_WARN_MB` 第一次算出来以后就落盘到 `/etc/ci-runner.env`，重跑时读回旧值，不会按新的 Min Free 重算。所以改 `BUILDKIT_MIN_FREE` 时，要么同时显式传新的 `CI_DISK_WARN_MB`，要么先把 env 文件里那一行删掉。
+
+`CI_FIXEDWORK_BASELINE` 不按规格算。它是每台机器自己跑 `preflight.sh --with-load` 得到的 p50，各测各的，不能抄别的机器，也不能拿来比两台机器的快慢（02 章 2.5）。
+
+### 10.5 推荐表
+
+下表按参考项目的 job 算：J = 6 GiB，C = 4，S = 0.5 GiB，Q = 0.6 GiB，`RUNNER_MEM_MAX` 取 6G。有一个人在机器上开发时，D 按 5 GiB 算（VS Code 远程 4 GiB，加上限 1G 的 Codex），开发用核按 2。内存按系统里看到的 MemTotal 算，都不开 swap。
+
+| 规格 | 有人在上面开发 | k_mem | k_cpu | 资源上的 k | 现在部署 | RUNNER_MEM_MAX | RUNNER_OOM_ADJ | 结论 |
+|---|---|---|---|---|---|---|---|---|
+| 2 核 / 4 GB（约 3.8 GiB） | 否 | 0 | 0 | 0 | 不适用 | 不适用 | 不适用 | 不推荐：放不下一个约 6 GiB 的 job |
+| 4 核 / 8 GB（约 7.6 GiB） | 否 | 1 | 1 | 1 | 1 | 6G | 800 | 可用，参考项目用的就是这一档。完整跑一遍 CI 时整机最低只剩约 1.3 GiB，没有余地再放别的 |
+| 4 核 / 8 GB | 是 | 0 | 0 | 0 | 不适用 | 6G | 200 | 不推荐：参考项目在这一档上开发了两天，出了 11 次全局 OOM（09 章 B17） |
+| 8 核 / 16 GB（约 15.2–15.6 GiB） | 否 | 2 | 2 | 2 | 1 | 6G | 800 | 资源上够跑 2 个。现有脚本和参考项目的 workflow 每台只支持 1 个，满足 10.6 的前提后才能跑 2 个 |
+| 8 核 / 16 GB | 是 | 1 | 1 | 1 | 1 | 6G | 600 | 要在 CI 机上开发时，这是最小的规格 |
+| 16 核 / 32 GB（约 31 GiB） | 否 | 4 | 4 | 4 | 1 | 6G | 800 | 资源富余。不满足 10.6 的前提时只能跑 1 个，多出来的资源只能让 job 里多线程的步骤快一点 |
+| 16 核 / 32 GB | 是 | 3 | 3 | 3 | 1 | 6G | 800 | 同上 |
+
+表下说明：
+
+- 「资源上的 k」大于 1 只说明资源够。「现在部署」是现有脚本能做到的数。
+- 开发工具里的命令行工具，8 GB 的机器上限取 1G，16 GB 及以上可以给到 2G（10.3）。
+- 盘按 10.4 的表另外查。
+- job 轻的项目（单 job 整机峰值不超过 2 GiB、用核不超过 2、不跑 docker build）按同样的公式重算：2 核 / 4 GB 能跑 1 个，4 核 / 8 GB 资源上够跑 2 个。
+
+#### 参考项目的选择
+
+参考项目定下的做法是两台 4 核 8 GB 的机器，每台一个实例。第一台在跑，第二台按同样的规格再买。考虑的是三点：
+
+1. 单核速度。核多帮不了单核受限的 job（02 章 2.7）。参考项目开到的一台 8 核 16 GB 候选机，把真实的单核算法测试跑了一遍，比现有 runner 慢 23%。不管买哪种规格，单核都要先和现有机器比过。
+2. 每台只能跑一个实例时，一台 8 核 16 GB 同时也只跑一个 job，排队不会比一台 4 核 8 GB 短。两台 4 核 8 GB 的核数和内存加起来和它一样，却能同时跑两个 job，排队更短。
+3. 一台出问题，另一台照样接 job。
+
+以后要换成一台大机器跑多个实例，按 10.6 的路线走。
+
+### 10.6 一台多实例的前提（扩容路线）
+
+现有脚本和参考项目的 workflow 都按每台机器一个实例写。一台机器上跑不了多个实例，原因有两个：
+
+- 参考项目的 workflow 给 services 容器和步骤里 `docker run` 起的容器发布了固定的宿主端口（127.0.0.1 上的 5433、6379、9000），e2e 在宿主上起的进程也用固定端口（3100、3101）。两个实例同时跑，后起的那个会撞端口（02 章 2.3）。
+- 清理钩子按一台机器一个 job 写。它删全部带 CI 标签的容器、对 `CI_APP_PORTS` 执行 `fuser -k`、执行不带过滤的 `docker volume prune`，这些都是整机范围的。为了不误伤别的 job，它发现本机有不止一个 job 在跑时就整段跳过（04 章 4.4）。所以多实例下它不会误删，但清理基本不跑。去掉这道守卫又不改清理范围，才会删掉另一个 job 的容器、杀掉它的进程。
+
+#### 前提
+
+同机跑 k 个实例之前，下面每一条都要满足：
+
+1. workflow 不占固定的宿主端口。做法有两种：job 跑在容器里，services 不发布端口，按服务名访问；或者发布到随机端口，比如 `ports: ['127.0.0.1::5432']`，再从 `${{ job.services.postgres.ports['5432'] }}` 读实际端口。随机端口的写法参考项目没有实测过。e2e 在宿主上起的进程也要按实例分开端口，或者在运行时挑空闲端口（05 章 ②、⑨）。
+2. 清理钩子只动自己这个 job 的东西。容器按实例或按 job 打标签，只删自己的；端口按实例分；卷按标签清，或者 workflow 挂 tmpfs 不产生卷（05 章 ⑫）。
+3. 每个实例有自己的 `RUNNER_HOME`、`RUNNER_NAME`、systemd 单元和 `MemoryMax`，脚本能按实例分别安装、检查和监控（见下表）。
+4. 按 10.2 算出的 k 不小于要跑的实例数。会把核用满的 job，先给每个实例限定核数。盘按 k 份工作区重算（10.4）。
+5. 测试里没有写死的短超时（比如 Jest 默认的 5000 ms），或者已经按 k 个实例并发时的耗时放宽。参考项目同机跑两个实例时的第 1 次失败就是这种（02 章 2.1）。每个 job 都按 02 章 2.7 乘上争核系数 M 核过超时余量。
+6. 改完后让 k 个完整的 CI run 同时跑，至少三轮，没有随机红叉、没有 OOM。
+
+脚本要改的地方如下。这里只列范围，没有实现，也没有验证过：
+
+| 文件 | 现状 | 多实例要改成 |
+|---|---|---|
+| `bootstrap.sh` | `RUNNER_NAME`、`RUNNER_HOME` 各只有一个；服务单元取第一个；钩子、`ci-cleanup.service`、`ci-health.sh` 都按一个实例渲染；`/etc/ci-runner.env` 只存一套参数 | 按实例循环注册、装服务、写 override 和 `.env`；参数按实例存 |
+| `ci-cleanup.sh` | 本机 job 数大于 1 就跳过；删全部带 CI 标签的容器；按端口 `fuser -k`；卷不带过滤 | 只删本实例或本 job 的容器；端口按实例分；卷按标签清 |
+| `ci-health.sh` | 只有一个服务名、一个 runner 名 | 逐个实例采 `mem_peak` 和服务状态；连续失败按本机所有实例的名字统计 |
+| `verify.sh` | 只查第一个服务单元，多于一个时打一行提示 | 逐个实例检查 |
+| workflow | 端口固定 | 见前提第 1、2 条 |
+
+#### 加机器还是同机多实例
+
+两条路各有代价：
+
+- 加机器：脚本和 workflow 都不用改，一台挂了其他台照常接 job。代价是每台要单独装、单独监控，构建缓存各存一份，新机器第一次构建是冷的。
+- 同机多实例：镜像和 BuildKit 缓存共用。代价是要先改 workflow、清理钩子和脚本；一台机器挂了，上面的实例一起停。
+
+#### 扩容路线
+
+分三个阶段。每个阶段写了做法和什么时候考虑下一步，条件到了再动，不用提前做。
+
+阶段一：每台机器一个实例。参考项目现在在这个阶段：第一台 4 核 8 GB 在跑，计划再加一台同规格的，每台一个实例。
+
+- 做法：要更多并发就加一台机器。新机器的单核分数要和现有机器比过（03 章 3.0、02 章 2.7），步骤见 08 章 8.7。
+- 什么时候考虑阶段二：机器多到每台单独装机、单独监控、构建缓存各存一份成了负担，或者想用一台大机器换下几台小机器。
+
+阶段二：改 workflow、清理钩子和脚本，仍然每台一个实例。
+
+- 做法：满足前提第 1、2、3 条。改完的 workflow 和钩子先在现有机器上跑一段时间，每台还是一个实例，行为和改之前应该一样。
+- 什么时候考虑阶段三：现有机器上跑了一段时间没有新问题，前提第 4、5 条也满足。
+
+阶段三：一台大机器跑 k 个实例。
+
+- 做法：k 按 10.2 算。大机器的单核同样要先和现有机器比（02 章 2.7）。它可以和小机器混用，标签相同，GitHub 会把 job 派给空闲的实例。
+- 上线条件：按前提第 6 条做完并发实验再接真实 job。上线后出现随机红叉或 OOM，就把 k 降回 1，查清原因再加。
+
+### 10.7 上线后看哪些数、什么时候复核
+
+上线后头两周，每天看一次下面这几项：
+
+| 看什么 | 怎么看 | 正常 | 不正常时 |
+|---|---|---|---|
+| 全局 OOM | `journalctl -k --since -1d \| grep 'Out of memory: Killed'` | 0 次 | J 或 D 估小了，或者 k 定大了，按 10.1 重新量 |
+| runner 撞上自己的上限 | runner 单元 cgroup 下 `memory.events` 里的 `max` 和 `oom_kill` | 都不涨 | `max` 在涨，说明进程树顶到了上限，在靠回收页缓存撑着；`oom_kill` 在涨，说明 job 被杀了，看 P 是不是变大了 |
+| 容器撞上自己的上限 | 内核日志里 `oom_memcg=` 指向 `docker-<id>.scope` 的记录 | 没有 | 容器自己的 `--memory` 设小了。这归 workflow 管，和机器规格无关 |
+| `mem_avail` | `ci-health.log`，每小时一个快照 | k 个 job 在跑时也不低于 10.2 的余量 max(1 GiB, T × 10%) | 快照只记整点那一刻，通常比真实的最低值高，所以快照里出现低值就要查 |
+| `mem_peak` | `ci-health.log`，runner 进程树自上次启动以来的峰值 | 含页缓存，接近 `RUNNER_MEM_MAX` 不一定有问题 | 以 `memory.events` 的 `oom_kill` 为准 |
+| `fixedwork` | `ci-health.log`，定长任务耗时 | 不超过基线的 1.4 倍 | 邻居在抢核（08 章 8.3）；k 大于 1 时也可能是自己的 job 占满了核，说明 k 定大了 |
+| `root_avail`、`containerd`、`volumes` | `ci-health.log`（08 章 8.2） | `containerd` 涨到 Max Used 加镜像后停住；`volumes` 接近 0 | 见 08 章 8.2 |
+| job 耗时 | 02 章 2.7 的 gh 查询 | 每个 job 都满足超时余量 | 先查 R 是不是变了 |
+
+出现下面任一情况，就按 10.1 重新量一遍，再套公式：
+
+- workflow 加了重的 job 或步骤（新的 docker build、e2e、更大的测试容器），或者 Node、TypeScript、测试框架升了大版本；
+- 测试框架或打包工具的 worker 数改了；
+- 机器上开始有人开发，或者不再有人开发；
+- 换盘、扩盘，或者按 08 章 8.4 修完 Dockerfile 后 W 变了；
+- 重启或迁移后，`lscpu` 显示的 CPU 型号变了。这时 preflight 基线和单核分数也要重测（08 章 8.3）；
+- 排队等待的 p90 超过了单个 run 的时长（08 章 8.5）。
+
+每月巡检（08 章 8.6）时顺便核对一次：`/etc/ci-runner.env` 里的参数，和按本章公式算出来的值是否还一致。
 
 ---
 
@@ -2145,26 +3158,34 @@ systemctl is-active ci-cleanup.timer                    # timer 起没起
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/preflight.sh` | 候选机自检，输出 GO / NO-GO。只读 |
+| `scripts/machine-check.sh` | 新机器一分钟测硬件和单核速度，和现有 runner 比，判合格 / 有保留 / 不合格。只读，只要 python3 |
+| `scripts/preflight.sh` | 候选机自检：硬件下限、端口、时间同步、网络、CPU 争抢，输出 GO / NO-GO。只读 |
 | `scripts/bootstrap.sh` | 装机、注册、加固，可以重复跑。`--harden-ssh` 才改 SSH，`--skip-runner` 跳过注册 |
 | `scripts/verify.sh` | 装完或重启后自检，输出 PASS / FAIL 表。会试跑一次清理钩子，有 job 在跑时这一项自动跳过 |
 | `scripts/ci-cleanup.sh` | 清理钩子，由 bootstrap 装到 runner 的 `hooks/` 目录 |
 | `scripts/ci-health.sh` | 每小时健康采点，由 bootstrap 装到 `/usr/local/bin/` |
-| `scripts/analysis/` | 调研期的测量工具：连通性采样、排队仿真、单步资源画像 |
+| `scripts/ssh-guard.sh` | SSH 加固的安全网：一条 SSH 会话都不剩时才回滚配置（04 章 4.6） |
+| `scripts/analysis/` | 调研期的测量工具：连通性采样、排队仿真、单步资源画像、整机内存采样 |
+
+现在的脚本一台机器只装一个 runner 实例。同机多实例的前提见 10 章 10.6。
 
 ## 附：脚本验证到什么程度
 
 | 场景 | 怎么验证的 | 结果 |
 |---|---|---|
-| `bootstrap.sh` 在已配置的机器上重跑 | 完整重跑（2026-09） | 通过，退出码 0，12 项关键状态逐字节相同 |
+| `bootstrap.sh` 在已配置的机器上重跑 | 第一台完整重跑（2026-09） | 通过，退出码 0，12 项关键状态逐字节相同 |
 | `bootstrap.sh` 从零安装工具链 | 干净的 `ubuntu:24.04` 容器 | 通过，docker、node、gh、psmisc 都能从零装上 |
-| `bootstrap.sh` 加固段（需要 systemd） | 容器里测不了 | 只在已有机器上验证过效果，第一次在新机器上装请盯着输出 |
-| `bootstrap.sh` 2026-10 新增的段落 | 参数落盘与读回、阈值推导、配置文件原地更新等逐段单独测试；线上按它的生成结果逐文件部署并逐字节比对 | 通过 |
-| 在全新机器上注册 runner | 需要真实 token 和真实仓库 | 未验证，现有验证走的都是「已注册，跳过」分支 |
-| `preflight.sh` | 本机实跑 | 13 PASS，2 WARN |
-| `verify.sh` | 本机实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
+| `bootstrap.sh --skip-runner` 从零安装 | 全新的 Ubuntu 24.04 云主机 | 2026-10-19 第一次跑出几处问题（09 章 A15–A17），已修；修复后 10-19 和 10-25 各跑通一次，退出码 0 |
+| 全新机器上的注册和 `verify.sh` | 需要真实 token 和真实仓库 | 修复后还没在全新机器上完整跑过，第一次注册时请盯着输出 |
+| `machine-check.sh` | 在现有 runner 和两台 Intel Skylake 候选机上实跑 | 两台候选机耗时是现有 runner 的 1.7–1.9 倍，判为不合格 |
+| `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
+| `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
+| `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 
-## 附：手册没覆盖、需要你自己做的两件事
+上表的实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
+
+## 附：手册没覆盖、需要你自己做的三件事
 
 1. 配云防火墙。只能在云厂商控制台配。Docker 自己加的 DNAT 规则会绕过宿主机的 ufw，能挡住它的只有这一层。
 2. 撤销注册用的 PAT。注册 runner 用的 registration token 是一次性的，但用来换取它的那个 PAT 不是，用完要撤销。
+3. 配心跳告警（06 章 6.4 ①）。bootstrap 不装它。机器宕机或断网时 ci-health 也跟着停了，只有外部的心跳服务能发现。有几台机器就建几个检查。

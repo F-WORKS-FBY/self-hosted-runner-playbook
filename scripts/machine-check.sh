@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# machine-check.sh —— 新开的云主机能不能当 CI runner：一分钟出结论。只读，不装任何东西，只要 python3。
+# machine-check.sh：新开的云主机能不能当 CI runner，一分钟出结论。只读，不装任何东西，只要 python3。
 #
 # 用法：
 #   bash machine-check.sh                       只测、打印分数（没有参考值时不判快慢）
@@ -7,7 +7,8 @@
 #   curl -fsSL <仓库 raw 地址>/scripts/machine-check.sh | REF=4.6 bash
 #
 # REF 怎么来：在你现有的、跑得好好的 runner 上用同一个脚本跑一次，取它打印的「单核分数」。
-# 它在跑 CI 时测出来的数偏大（偏保守），没关系。
+# 它在跑 CI 时测出来的数偏大，候选机的比值会跟着偏小，判得偏松。比值接近合格线的候选机，
+# 按 02 章 2.7 回放最慢的 job 再定。
 #
 # 可调阈值（默认值和 preflight.sh 一致）：MIN_CORES=4 MIN_MEM_MIB=7000 MIN_DISK_GB=40
 #   PASS_RATIO=1.2 WARN_RATIO=1.4（分数 ÷ REF）  SCALE_WARN=1.3（全核满载时单核掉速倍数）

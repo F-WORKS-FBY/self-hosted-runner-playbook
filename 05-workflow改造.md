@@ -1,6 +1,6 @@
 ## 05 workflow 改造：常驻 runner 上会坏掉的托管假设
 
-本章列出 workflow 里依赖托管 runner 特性的写法，以及在自建常驻 runner 上该怎么改。这是整本手册里最可迁移的部分：前面几章的内容换个云厂商就要调整，本章的内容对任何仓库都适用。
+本章列出 workflow 里依赖托管 runner 特性的写法，以及在自建常驻 runner 上该怎么改。本章和机器无关，对任何仓库都适用。
 
 托管 runner 给每个 job 分配一台全新的一次性 VM：
 
@@ -12,12 +12,15 @@
 
 几乎每个仓库的 workflow 里都积累了一批依赖这些性质的写法。它们在托管 runner 上不会出问题，所以也一直没有暴露出来。
 
-本章用到的两个说法：
+本章用到的几个说法：
 
-- N=1：只有一台自建 runner，所有 job 在这台机器上串行排队。
+- N：全仓库自建 runner 实例的总数，所有机器加起来算，也就是同时最多能跑几个 job。N=1 时所有 job 串行排队。有两台机器、每台一个实例时 N=2，job 能并行了，但同一个 run 的两个 job 仍可能先后落在同一台机器上。
+- k：一台机器上跑几个实例。现有脚本和占固定宿主端口的 workflow 都只支持每台 1 个，原因见 10 章 10.6。
 - 假绿：检查本该失败，结果却显示通过。
 
-下面 ①–⑪ 共十一条，每条按「怎么自查 → 失败是什么样 → 怎么改」组织；⑫ 是上线一个月后补充的。建议把它们当作 checklist，对照你的 workflow 逐条检查。章末有一组汇总命令，改完后用来确认。
+参考项目最初只有一台机器、一个实例（N=1），本章的实测大多是在这个条件下做的。
+
+下面 ①–⑬ 共十三条，每条按「怎么自查、失败是什么样、怎么改」组织。⑫ 是上线一个月后补的，⑬ 是准备加第二台机器时补的。建议把它们当作 checklist，对照你的 workflow 逐条检查。章末有一组汇总命令，改完后用来确认。
 
 ---
 
@@ -42,18 +45,19 @@ The container name "/minio" is already in use by container "7eb4689c...".
 
 第 2 个 run 就会失败，而且报错和代码改动无关。
 
-同一个 run 里的两个 job 用同一个写死的名字时更严重，冲突是必然的，与概率无关：
+同一个 run 里的两个 job 用同一个写死的名字时更严重：
 
 - 托管 runner 上，两个 job 在两台独立 VM 上，互不影响。
 - N=1 的自建机上，两个 job 在同一台机器上串行。第一个 job 不清理，第二个 job 一定冲突。
+- N≥2 时，两个 job 有时分到不同机器，有时落在同一台，冲突时有时无，更难查。
 
 怎么改：
 
 ```yaml
 env:
-  # 唯一到 run × attempt × job 三级：
-  #  · run_attempt 是真判据 —— re-run 时 run_id 不变
-  #  · github.job 不可省 —— 同一个 run 里的两个 job 只到 run 级仍会自撞
+  # 名字要唯一到 run、attempt、job 三级：
+  #   run_attempt 不能省，re-run 时 run_id 不变
+  #   github.job 不能省，同一个 run 里的两个 job 只唯一到 run 级仍会撞名
   SVC_NAME: myservice-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
   CI_LABEL: com.myorg.ci=1          # 与 bootstrap.sh 的 CI_LABEL 完全一致
 steps:
@@ -66,11 +70,11 @@ steps:
 
 要点：
 
-- **`--label` 的值必须和 bootstrap.sh 里的 `CI_LABEL` 完全一致。** 清理钩子第 1 步按这个 label 删除上一个 job 没删掉的容器。本模板原来写的是 `--label ci=1`，和任何 `CI_LABEL` 都对不上。
-- 删除容器用 `rm -fv`，不用 `rm -f`。镜像声明了 `VOLUME` 时（minio、postgres、redis、prometheus 都声明了），Docker 会建匿名卷，带 `-v` 才会连卷一起删。本模板原来写的是 `rm -f`，参考项目沿用了这个模板，原来每个起 minio 的 job 漏 1 个卷（10-16 已改，见 ⑫）。
+- `--label` 的值必须和 bootstrap.sh 里的 `CI_LABEL` 完全一致。清理钩子第 1 步按这个 label 删除上一个 job 没删掉的容器。bootstrap 的默认值是 `com.ci.selfhosted=1`，上面的 `com.myorg.ci=1` 是示例，两边写成同一个就行。
+- 删除容器用 `rm -fv`，不用 `rm -f`。镜像声明了 `VOLUME` 时（minio、postgres、redis、prometheus 都声明了），Docker 会建匿名卷，带 `-v` 才会连卷一起删。参考项目原来用 `rm -f`，每个起 minio 的 job 漏 1 个卷，见 ⑫。
 - `docker run --rm` 解决不了漏卷。实测 `run -d --rm` 之后再 `rm -f`（不带 -v），卷照样留下。`--rm` 只在容器自己退出或被 `docker stop` 时生效。
 - `rm -fv` 只在清理步骤真的跑了时有用。runner 进程被杀时 `if: always()` 也不执行，容器留给钩子删。更稳的是在镜像的 VOLUME 路径挂 tmpfs，一开始就不建卷，写法和注意事项见 ⑫。
-- 清理钩子并非只按 label 过滤。它的第 6 步是一条不带过滤的 `docker volume prune`，用来兜底回收匿名卷（本模板原来说「绝不裸 prune」，这个说法不对）。workflow 里写对了，就不必依赖它。service 容器的卷见 ⑫。
+- 清理钩子并非只按 label 过滤。它的第 6 步是一条不带过滤的 `docker volume prune`，用来兜底回收匿名卷。workflow 里写对了，就不必依赖它。service 容器的卷见 ⑫。
 
 ---
 
@@ -97,6 +101,13 @@ services:
 ```
 
 确认：localhost 可以连上，从公网连接返回 `Connection refused`。
+
+上面的 `5433` 是固定的宿主端口。每台机器只跑一个 runner 实例时没有问题，机器再多也一样，每台各有一套端口。一台机器跑多个实例时，两个 job 会抢同一个宿主端口，后起的 service 起不来。到那一步有两种改法：
+
+- 让 Docker 随机分配宿主端口：写成 `ports: ['127.0.0.1::5432']`，job 里用 `${{ job.services.postgres.ports['5432'] }}` 读出实际端口。runner 能不能正确处理这种写法，参考项目没有实测，先在测试分支上验证。
+- job 跑在 `container:` 里，用服务名直连（`postgres:5432`），不发布宿主端口。
+
+测试在宿主上起的进程（⑨ 里的 API）也一样，每个实例要用不同的端口。不占固定宿主端口是一台机器跑多个实例的前提之一，其余几条见 10 章 10.6。
 
 ---
 
@@ -138,7 +149,7 @@ grep -rhoE '\b(gh|jq|yq|aws|az|gcloud|make|cmake|gcc|zstd|unzip)\b' .github/work
 失败分两级，第二级更麻烦：
 
 - 命令后面没有 `||` 兜底：步骤直接失败（`bash -e`），至少能看到。
-- 命令后面有 `|| fallback`：静默降级。表现为路径门控退化成全跑、定时任务每次都跑、某个检出被跳过。**门禁看起来还在跑，实际已经失效。**
+- 命令后面有 `|| fallback`：静默降级。表现为路径门控退化成全跑、定时任务每次都跑、某个检出被跳过。门禁看起来还在跑，实际已经失效。
 
 怎么改：把缺的工具装上，并把工具清单写进你的 bootstrap，不要靠记忆。
 
@@ -160,7 +171,7 @@ grep -rhoE '\b(gh|jq|yq|aws|az|gcloud|make|cmake|gcc|zstd|unzip)\b' .github/work
 怎么改：先想清楚回退。去掉缓存后，回落到托管 runner 时每个 job 要多付一次冷装（约 52 秒）。想用条件表达式两头兼顾，做不到：
 
 ```yaml
-cache: ${{ vars.CI_RUNNER && '' || 'pnpm' }}     # ❌ 不成立
+cache: ${{ vars.CI_RUNNER && '' || 'pnpm' }}     # 错误写法，不成立
 # GitHub 表达式里 && / || 返回操作数的值，而空串是 falsy：
 # CI_RUNNER 已设 → (CI_RUNNER && '') = '' → '' 是 falsy → ('' || 'pnpm') = 'pnpm'
 # 永远产出 'pnpm'。写 'none' 之类会让 setup-node 直接报错。
@@ -187,12 +198,12 @@ job 被取消时，写在最后一步、又没带 `if: always()` 的清理步骤
 
 ### ⑦ `timeout-minutes` 的含义变了
 
-在 N=1 的自建 runner 上，`timeout-minutes` 决定了一个卡死的 job 最多能让全组 CI 停多久，所以要对照实测时长重新检查。
+在自建 runner 上，`timeout-minutes` 决定了一个卡死的 job 最多能占住一个实例多久。N=1 时，这就是全组 CI 最多停多久，所以要对照实测时长重新检查。
 
 | 环境 | `timeout-minutes` 的含义 | job 跑飞的后果 |
 |---|---|---|
 | 托管 runner | 这个 job 最多烧多少钱 | 只烧掉自己那台一次性 VM |
-| N=1 自建 runner | 全组 CI 停摆的上界 | 独占唯一的 runner，后面所有 PR 一起等 |
+| 自建 runner，共 N 个实例 | 一个实例最多被占住多久，N=1 时就是全组 CI 停摆的上界 | 少一个可用实例，排队变长；N=1 时后面所有 PR 一起等 |
 
 自查：
 
@@ -201,6 +212,8 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 ```
 
 > 参考项目：现值是实测时长的 8–150 倍（lint 15 min / 实测 22 s = 41×；build 30 min / 实测 12–70 s = 26–150×）。一次 ci run 最坏占用 15+15+30+30 = 90 分钟。按「实测 p95 × 4」重设后是 29 分钟。
+
+实测时长要记下是在哪台机器上量的。换到单核更慢的机器，同样的 `timeout-minutes` 余量会缩水，单核受限的 job（限了 1 个 CPU 的测试容器、单线程的类型检查）最先超时。加机器或换机器之前，按 02 章 2.7 核对：最长实测耗时 × R ≤ timeout-minutes × 2/3，R 是新机器和参考机的耗时比。
 
 注意：`timeout-minutes` 从 job 开始执行才计时，排队时间不算。机器宕机导致排队 24 小时这种情况它管不了，要靠哨兵（06 章 6.4）。
 
@@ -212,6 +225,7 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 
 - 托管 runner 上，多个 job 并行是免费的（各自一台 VM）。
 - N=1 上，它们串行排队，每多一个 job 就多付一次脚手架。
+- N≥2 时，同一个 run 的 job 又能分到几个实例上并行，合并的收益比 N=1 时更小。
 
 不要急着合并 job。先量两个数，即托管和自建机上各自的每 job 脚手架时间：
 
@@ -221,9 +235,9 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 
 > 参考项目：托管上脚手架约 52 秒/job（合并 4→1 省 156 秒）；自建机上只有约 16 秒/job（合并只省 48 秒），因为常驻机器上依赖早就在盘上了。收益缩水 3 倍，而代价（文档同步、required check 粒度、回退时降级）一点没少。
 
-判断方法：用真实事件时间戳做排队仿真（08 章 8.1），比较「合并 job」和其他提速手段的实际收益。
+判断方法：用真实事件时间戳做排队仿真（08 章 8.1），比较「合并 job」和其他提速手段的实际收益。现有的仿真脚本只模拟一个 runner，也就是 N=1 的情况。
 
-参考项目的结论：合并 job 与「修 Dockerfile 层序 + 去 cache」效果相当（最忙那天 11.7 vs 11.2 分钟），而后者不用改任何文档。**先做后者。**
+参考项目的结论：合并 job 与「修 Dockerfile 层序 + 去 cache」效果相当（最忙那天 11.7 vs 11.2 分钟），而后者不用改任何文档，所以先做后者。
 
 ---
 
@@ -238,24 +252,25 @@ grep -rn "timeout-minutes" .github/workflows/    # 对照你的实测时长
 ```text
 [api:err] Error: listen EADDRINUSE: address already in use 0.0.0.0:3100   ← 只在 stderr 留一行，不失败
  Test Files  1 failed | 8 passed (9)
-      Tests  1 failed | 220 passed (221)                                  ← 220 个测试跑在**孤儿**上
+      Tests  1 failed | 220 passed (221)                                  ← 220 个测试跑在孤儿进程上
 ```
 
 > 实测：用一个孤儿进程占住端口后跑 e2e，221 条里 220 条通过，唯一失败的那条还指向认证代码，而不是真实原因。换一个对状态不敏感的孤儿进程，结果就是全绿。
 
-**也就是说，整套 e2e 跑在上一次 run 的代码上，而 CI 是绿的。**
+也就是说，整套 e2e 跑在上一次 run 的代码上，CI 却是绿的。
 
 孤儿进程的来源：
 
 - `teardown` 只有一行 `proc.kill()`，而 job 被取消时它不执行。
-- runner 的 `KillMode=process` 也不杀子进程。
+- runner 自己的兜底没有接住。job 结束时，runner 会杀掉环境变量里带本 job `RUNNER_TRACKING_ID` 的进程，日志里显示为 `Cleaning up orphan processes`。有几种情况它认不出来：测试代码 spawn 子进程时传了一份新的 env，没继承这个变量；workflow 把这个变量设成了空串；runner 进程本身被杀了。参考项目当时的孤儿属于哪一种，没有核对过。
+- runner 服务的 `KillMode=process` 只决定停服务时杀不杀子进程，和 job 结束没有关系。
 
 怎么改：分三层，至少做前两层。
 
 第一层（代码注释中的 ①）：起进程之前，先确认端口没被占用。
 
 ```ts
-// ① 起之前先确认端口没被占 —— 用裸 TCP 连接，不依赖对方回什么
+// ① 起之前先确认端口没被占。用裸 TCP 连接，不依赖对方回什么
 async function assertPortFree(port: number) {
   const busy = await new Promise<boolean>((res) => {
     const s = connect({ port, host: '127.0.0.1' });
@@ -265,7 +280,7 @@ async function assertPortFree(port: number) {
     s.once('timeout', () => done(false));
     s.once('error',   () => done(false));
   });
-  if (busy) throw new Error(`端口 ${port} 已被占用——多半是上一次 run 的孤儿进程。先清掉再跑。`);
+  if (busy) throw new Error(`端口 ${port} 已被占用，多半是上一次 run 的孤儿进程，先清掉再跑。`);
 }
 ```
 
@@ -273,6 +288,7 @@ async function assertPortFree(port: number) {
 
 ```bash
 # ② runner 的 JOB_STARTED 钩子里清孤儿
+# 3100、3101 是参考项目 e2e 的端口，换成你的 CI_APP_PORTS（03 章 3.1）
 fuser -k 3100/tcp 3101/tcp 2>/dev/null || true
 ```
 
@@ -321,7 +337,7 @@ grep -rn 'image:' .github/workflows/ | grep -v '@sha256'  # 有几个镜像没�
 
 ```bash
 docker volume ls -q | wc -l                       # 在一台常驻 runner 上看；钩子没在跑的话会一直涨
-grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为空
+grep -rn 'docker rm -f ' .github/workflows/ <CI 用的脚本目录> | grep -v -- '-fv'   # 应为空
 ```
 
 机制：镜像声明了 `VOLUME`、启动时又没挂 `-v`/`--mount`/`--tmpfs`，Docker 就建一个匿名卷；删容器时不带 `-v`，卷就留下。卷有两处来源：
@@ -331,9 +347,9 @@ grep -rn 'docker rm -f ' .github/workflows/ tools/ | grep -v -- '-fv'   # 应为
 | `services:` 里的 postgres / redis | runner 自己，`docker rm --force`，不带 `-v` | 能，挂 tmpfs（见下） |
 | 步骤里 `docker run -d` 起的（minio、prometheus…） | workflow 的 `docker rm -f` | 能，挂 tmpfs，删除时用 `rm -fv`（见 ①） |
 
-参考项目里，每个用到数据库的 job 原来漏 3 个卷（postgres + redis + minio），约 70 MB，大头是 PGDATA；跑了监控冒烟的 build job 还会给 prometheus 漏 1 个（改了监控配置时跑；碰到 packages/、lockfile、根 package.json 等共享面，或手动触发时也全跑）。那台机器上卷数始终是 0，因为清理钩子的 `docker volume prune` 在每个 job 前后都在回收。这是钩子在兜底，workflow 本身并没有写对。换一台没装钩子的常驻 runner，卷数就会一直涨。
+参考项目里，每个用到数据库的 job 原来漏 3 个卷（postgres、redis、minio，约 70 MB，大头是 PGDATA），跑监控冒烟的 job 还会给 prometheus 漏 1 个。那台机器上卷数始终是 0，是因为清理钩子的 `docker volume prune` 在每个 job 前后都在回收，workflow 本身并没有写对。换一台没装钩子的常驻 runner，卷数就会一直涨。
 
-参考项目 2026-10-16 按下面的写法改完（metta-app #269）：postgres、redis、minio、prometheus 都挂 tmpfs，起这些容器的 job 都在起完后核对没挂卷。合并前在 runner 上记了约 15 分钟 `docker events`，覆盖 nightly 的两个 job 和 build job 的两个冒烟，这些容器照常建了又删，期间没有新建卷。
+参考项目 2026-10-16 按下面的写法改完：postgres、redis、minio、prometheus 都挂 tmpfs，起这些容器的 job 都在起完后核对没挂卷。合并前在 runner 上记了约 15 分钟 `docker events`，期间跑了几个起这些容器的 job，容器照常建了又删，没有新建卷。
 
 怎么改：给 service 容器挂 tmpfs，从源头上不产生卷。2026-10-16 在参考机上实测：postgres 正常启动，`docker inspect` 的 Mounts 为空，删容器后新增卷 0 个。
 
@@ -353,7 +369,7 @@ services:
 
 - postgres 18 的镜像声明的是 `/var/lib/postgresql`，不是常见的 `/var/lib/postgresql/data`。后者是 17 及以前的路径；18 起 PGDATA 在 `/var/lib/postgresql/<大版本>/docker`。
 - 路径写错不会报错，只是卷照样建、照样漏。
-- tmpfs 占内存（参考项目约 50–120 MB/job）。它记在容器的 cgroup 上，不在 runner 的 MemoryMax 里；但在没有 swap 的机器上它占的是真内存，所以 `size=` 必须写。
+- tmpfs 占内存（参考项目约 50–120 MB/job）。它记在容器的 cgroup 上，不在 runner 的 MemoryMax 里；但在没有 swap 的机器上它占的是真内存，所以 `size=` 必须写，量单 job 整机峰值 J 时也要把它算进去（10 章 10.1）。
 - 镜像以非 root 用户运行时，tmpfs 要加 `mode=1777`。prometheus 以 nobody 运行，不加的话报 `/prometheus/queries.active: permission denied`，起不来。postgres、redis 的入口脚本会先以 root 改属主，不用加。
 - 步骤里起的容器同样挂：`docker run -d ... --tmpfs /data:size=256m <minio 镜像> server /data`。参考机上实测 minio 在 tmpfs 上写 20 MB 对象、读回逐字节一致。
 
@@ -378,6 +394,34 @@ services:
 
 ---
 
+### ⑬ 容器写进工作区的文件，runner 删不掉（准备加第二台机器时补）
+
+常驻机器上工作区跨 job 复用，下一个 job 的 checkout 要先删掉上一次留下的文件。CI 容器往挂进去的工作区写文件时，文件属主是容器里进程的 uid。这个 uid 和 runner 用户对不上，runner 就删不掉这些文件。托管 runner 每个 job 都是新 VM，碰不到这个问题。
+
+自查：
+
+```bash
+# 在每台 runner 上跑。runner 和 /opt/actions-runner 按你的 RUNNER_USER、RUNNER_HOME 换
+id -u runner                                              # 各台机器应该相同
+find /opt/actions-runner/_work -not -user runner | head   # 应为空
+```
+
+失败是什么样：`actions/checkout` 清理工作区时报 `EACCES: permission denied`，job 在第一步就失败，和代码改动无关（09 章 A19）。
+
+文件归谁，看容器以哪个用户运行：
+
+- node 官方镜像默认以 root 运行，只是自带一个 uid 1000 的 `node` 用户，要用 `--user node` 才会切过去。很多镜像里的普通用户也是 uid 1000。
+- 以 root 运行的容器写下的文件属于 uid 0，runner 是哪个 uid 都删不掉。
+- job 用 `container:` 跑时，步骤在容器里以镜像的默认用户执行，常常是 root，写进工作区的文件也归 root。
+
+怎么改：
+
+- 所有 runner 机器上 runner 用户的 uid 保持一致，参考项目用 1000。bootstrap 按 `RUNNER_UID` 建用户；装机顺序，以及云镜像自带 uid 1000 用户时怎么处理，见 03 章 3.3。
+- 自己 `docker run` 又挂了工作区的容器，用 runner 的身份运行：`docker run --user "$(id -u):$(id -g)" -v "$GITHUB_WORKSPACE:/w" ...`。这样文件直接归 runner，不依赖镜像里有没有 uid 1000 的用户。
+- 必须以 root 运行的容器，在 `if: always()` 的清理步骤里把属主改回来：`docker run --rm -v "$GITHUB_WORKSPACE:/w" <同一个镜像> chown -R "$(id -u):$(id -g)" /w`。runner 进程被杀时这一步也不会执行，下一个 job 会在 checkout 失败，这时要登上机器用 root 删掉那些文件。
+
+---
+
 ### 改造完的自查
 
 改完后跑下面这组命令确认，每行末尾的注释是期望结果。
@@ -390,6 +434,8 @@ grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理�
 grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
 grep -rn -- '--tmpfs'        .github/workflows/                        # 每个声明了 VOLUME 的镜像都应有一条（⑫）
 grep -rn '容器没有挂卷'       .github/workflows/                        # 起了这些容器的 job 都应有这一步（⑫）
+grep -rnE '127\.0\.0\.1:[0-9]+:' .github/workflows/                    # 一台机器跑多个实例时应为空（②）
+find /opt/actions-runner/_work -not -user runner | head                # 在每台 runner 上跑，应为空（⑬）
 ```
 
 ---

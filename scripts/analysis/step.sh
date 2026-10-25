@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# step.sh <name> <command...> — runs inside ci.slice, samples cgroup memory at 100ms
+# step.sh <名字> <命令...>：把命令放进 ci.slice 下单独的 scope 里跑，每 100ms 采一次 cgroup 内存。
+# 内存只含这条命令拉起的进程，不含 docker 容器和 docker build 的 RUN 步骤（它们归 dockerd 管）。
+# CPU 核秒读的是整机 /proc/stat，量的时候机器上不要跑别的东西。要 root 运行；结果追加到 $CI_DATA_DIR/steps.psv。
 NAME="$1"; shift
 DATA="${CI_DATA_DIR:-./data}"; CG=/sys/fs/cgroup/ci.slice
 SCOPE="ci-$(echo "$NAME" | tr -c 'a-zA-Z0-9' '-')-$$"

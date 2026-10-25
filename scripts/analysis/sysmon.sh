@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# sysmon.sh [输出文件]：每 5 秒记一行整机 CPU、内存、磁盘，直到被 kill。
+# 第 11 列 mem_avail_mb 的全程最低值，用来算单 job 的整机峰值（10 章 10.1）。
 OUT="${1:-${CI_DATA_DIR:-./data}/sysmon.csv}"
 echo "ts,cpu_user,cpu_nice,cpu_sys,cpu_idle,cpu_iowait,cpu_irq,cpu_softirq,cpu_steal,mem_total_mb,mem_avail_mb,mem_used_mb,load1,root_avail_gb,procs_running" > "$OUT"
 prev=""

@@ -1,5 +1,7 @@
 """单 runner 排队仿真：用真实 run 创建时间戳 + 本机实测服务时长。
-语义按各 workflow 真实的 concurrency 设置：
+限制：只模拟一个 runner；下面四个 workflow 名和它们的 concurrency 规则是按参考项目写死的，
+事件里出现别的 workflow 名会在 CANCEL_RUNNING[wf] 处报 KeyError。用到别的仓库，先改 CANCEL_RUNNING 和 group()。
+参考项目各 workflow 的 concurrency 设置：
   ci.yml            group=ci-<ref>,        cancel-in-progress=true  -> 同分支新 run 取消【排队中 + 正在跑】的旧 run
   main-post-merge   group=main-post-merge, cancel-in-progress=false -> 新 run 顶掉【排队中】的旧 run，不动正在跑的
   pr-meta           group=pr-meta-<PR>,    cancel-in-progress=true  -> 同分支同上
