@@ -133,6 +133,11 @@ try:
     runs = get(f"/repos/{repo}/actions/runs?per_page=50&status=completed").get("workflow_runs", [])
     concl = []
     for r in runs:
+        # 被取消的 run 整个跳过（不计入，也不打断连续计数）。新推送顶掉旧 run 时，写了 if: always() 的汇总 job
+        # 照样会跑，因为前面的 job 被取消而判失败；按 job 统计会把它当成本机失败，PR 推得勤的时候一小时能凑满 3 次。
+        # job 超时时 run 的结论是 failure，不是 cancelled，不受影响。
+        if r.get("conclusion") == "cancelled":
+            continue
         js = get(f"/repos/{repo}/actions/runs/{r['id']}/jobs?per_page=100").get("jobs", [])
         mine = [j for j in js if j.get("runner_name") == name]
         if not mine:
