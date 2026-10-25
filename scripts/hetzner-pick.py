@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """hetzner-pick.py —— 在 Hetzner Cloud 上自动「开机 → 验机 → 不合格就删掉重开」，直到开到一台合格的。
 
-为什么要这样：共享 vCPU 的套餐，同一个机型每次开出来的 CPU 型号不一样，单核能差一倍
-（2026-10 连开到两台 Intel Skylake，单核耗时是 AMD EPYC-Rome 参考机的 1.7 倍左右）。
+只适用于 Hetzner Cloud。为什么要这样：Hetzner 的共享 vCPU（cpu_type=shared）套餐，同一个机型每次开出来的
+CPU 型号不一样，单核能差一倍（2026-10 连开到两台 Intel Skylake，单核耗时是 AMD EPYC-Rome 参考机的 1.7 倍左右）。
 CI 里单核受限的 job 会因此超时。验机用同目录的 machine-check.sh，判定规则见它的文件头和 02 章 2.7。
 
 准备：
@@ -13,10 +13,10 @@ CI 里单核受限的 job 会因此超时。验机用同目录的 machine-check.
 用法：
   export HCLOUD_TOKEN=<令牌>                      # 只放环境变量，别写进文件
   python3 hetzner-pick.py --list                  # 看有哪些 x86、≥4 核、≥8 GB 的机型，各机房的价格和能不能买
-  python3 hetzner-pick.py --type <机型> --keys "<我的钥匙名>,<还要装的钥匙名>" --ref 2.5
+  python3 hetzner-pick.py --type <机型> --keys "<我的钥匙名>,<还要装的钥匙名>" --ref <参考分数>
 
   --keys      建机时装进 root 的 SSH 钥匙（Hetzner 里的名字，逗号分隔）。必须包含运行脚本的人自己的那把。
-  --ref       参考机的单核分数（在现有 runner 上跑 machine-check.sh 得到）。
+  --ref       参考机的单核分数（在你现有的 runner 上跑 machine-check.sh 得到，别抄别人的数）。
   --locations 只在这些机房里挑，逗号分隔，默认是这个机型当下能买到的全部机房。
   --max-tries 最多开几台，默认 8。   --wait-min / --wait-max  两次之间随机等多少秒，默认 120 到 420。
   --identity  登录用的私钥文件，默认用 ssh 自己的默认钥匙。
@@ -24,6 +24,9 @@ CI 里单核受限的 job 会因此超时。验机用同目录的 machine-check.
 结果：合格就停，打印 IP 和验机摘要，服务器打上标签 ci-check=pass；不合格的当场删掉。
 每台至少按 Hetzner 的小时价计费（开了马上删，大约是一小时的钱），--list 里有价格。
 脚本只删它这次自己建的服务器（带标签 created-by=hetzner-pick）。中途按 Ctrl-C 也会删掉正在测的那台。
+
+别的厂商没有对应的脚本：用那家的 CLI 或 API 照同样的三条规则写（只删自己开并打了标签的机器；
+中断时先删正在测的那台；设次数上限），各厂商要核对的差别见 02 章 2.9。
 """
 import argparse
 import datetime

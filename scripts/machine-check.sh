@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# machine-check.sh：新开的云主机能不能当 CI runner，一分钟出结论。只读，不装任何东西，只要 python3。
+# machine-check.sh：新机器（云主机或裸金属）能不能当 CI runner，一分钟出结论。只读，不装任何东西，只要 python3。
 #
 # 用法：
 #   bash machine-check.sh                       只测、打印分数（没有参考值时不判快慢）
-#   REF=4.6 bash machine-check.sh               和参考机比：分数 ≤ REF×1.2 合格，≤ REF×1.4 有保留，再慢不合格
-#   curl -fsSL <仓库 raw 地址>/scripts/machine-check.sh | REF=4.6 bash
+#   REF=<参考分数> bash machine-check.sh        和参考机比：分数 ≤ REF×1.2 合格，≤ REF×1.4 有保留，再慢不合格
+#   curl -fsSL <仓库 raw 地址>/scripts/machine-check.sh | REF=<参考分数> bash
 #
 # REF 怎么来：在你现有的、跑得好好的 runner 上用同一个脚本跑一次，取它打印的「单核分数」。
 # 它在跑 CI 时测出来的数偏大，候选机的比值会跟着偏小，判得偏松。比值接近合格线的候选机，
 # 按 02 章 2.7 回放最慢的 job 再定。
 #
 # 可调阈值（默认值和 preflight.sh 一致）：MIN_CORES=4 MIN_MEM_MIB=7000 MIN_DISK_GB=40
+#   （这三个是参考项目的值，按 10 章算出你的再传。磁盘量的是根分区 df /，Docker 数据要另放一块盘时见 02 章 2.9）
 #   PASS_RATIO=1.2 WARN_RATIO=1.4（分数 ÷ REF）  SCALE_WARN=1.3（全核满载时单核掉速倍数）
 #   PAR=0 跳过全核满载那一项（在正跑着 CI 的机器上量 REF 时用，别和 CI 抢核）
 #
-# 为什么要测单核：共享 vCPU 的云主机，同一个套餐每次开出来的 CPU 型号可能不同，单核能差一倍。
+# 为什么要测单核：不同厂商、规格族、CPU 代际的单核差很多；共享 vCPU 的规格，同一个套餐每次开出来的
+# 型号还可能不同（参考项目在 Hetzner Cloud 上碰到过耗时差 1.7–1.9 倍的）。
 # CI 里被限成 1 个 CPU 的测试、单线程的类型检查，核再多也不会变快，单核慢多少耗时就涨多少，
 # 最后撞上 timeout-minutes。见 02 章 2.7。
 #
@@ -95,7 +97,7 @@ if [ "${PAR:-1}" != 0 ]; then
   scale=$(python3 -c "print('%.2f' % ($pmax / $t_loop))")
   say "  最慢的进程 ${pmax}s，是单独跑时的 ${scale} 倍"
   python3 -c "import sys; sys.exit(0 if $scale <= $SCALE_WARN else 1)" \
-    || WARNS+=("全核满载时单核掉速 ${scale} 倍（> $SCALE_WARN），可能有邻居在抢 CPU，隔一会儿再测一次")
+    || WARNS+=("全核满载时单核掉速 ${scale} 倍（> $SCALE_WARN），可能有邻居在抢 CPU，隔一会儿再测一次；一直这样，也可能是 vCPU 为超线程（02 章 2.9）")
 fi
 python3 -c "import sys; sys.exit(0 if $spread <= 1.3 else 1)" \
   || WARNS+=("同一项测试快慢差 ${spread} 倍，测的时候有波动，隔一会儿再测一次")
@@ -106,7 +108,7 @@ if [ -n "$REF" ]; then
   say "== 和参考机比：分数 $score ÷ 参考 $REF = ${ratio}（合格线 ≤ $PASS_RATIO，有保留 ≤ $WARN_RATIO）"
   if python3 -c "import sys; sys.exit(0 if $ratio <= $PASS_RATIO else 1)"; then verdict_speed="单核是参考机的 ${ratio} 倍耗时"
   elif python3 -c "import sys; sys.exit(0 if $ratio <= $WARN_RATIO else 1)"; then WARNS+=("单核比参考机慢（耗时 ${ratio} 倍），单核受限的 job 会明显变慢，核对一下超时余量（02 章 2.7）")
-  else FAILS+=("单核比参考机慢太多（耗时 ${ratio} 倍，上限 $WARN_RATIO），删掉重开一台")
+  else FAILS+=("单核比参考机慢太多（耗时 ${ratio} 倍，上限 $WARN_RATIO），换一台（按月计费或裸金属先看 02 章 2.9）")
   fi
 fi
 

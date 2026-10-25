@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # bootstrap.sh：把一台干净的 Ubuntu 机器装成 GitHub Actions 自建 CI runner。
 #
-# 适用范围：x86_64 的 Ubuntu（测过 24.04），一台机器一个 runner 实例。
+# 适用范围：x86_64 的 Ubuntu（测过 24.04），一台机器一个 runner 实例。写法不绑定云厂商，实测都在同一家厂商的云主机上。
 #   别的架构在开头就退出（Node 和 runner 下载的都是 x64 的包）。同机多实例要先改脚本，前提见 10 章 10.6。
+#   Debian 要先把第 2 步 Docker 源地址里的 linux/ubuntu 换成 linux/debian（两处），没有实测过；
+#   不用 apt 的发行版要自己改装包的几步。换厂商要核对的事见 02 章 2.9。
 # 幂等：重复跑不会破坏已有配置，只补齐缺的。已在一台配置完成的机器上重跑验证过。
 # 必须 root 运行。
 #
@@ -193,6 +195,7 @@ info "已装：ca-certificates curl gnupg jq git tar unzip zstd psmisc python3"
 step "2/8 Docker CE（官方源）"
 if ! command -v docker >/dev/null; then
   install -m 0755 -d /etc/apt/keyrings
+  # 源地址按 Ubuntu 写。Debian 把这里和下面 echo 里的 linux/ubuntu 都换成 linux/debian（未测）。
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   chmod a+r /etc/apt/keyrings/docker.asc
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
@@ -524,6 +527,8 @@ fi
 harden_ssh(){
   step "可选 SSH 加固"
   # 这是唯一可能把人锁在门外的动作。前置条件必须满足，否则拒绝执行。
+  # 只查 root 的公钥。用厂商默认用户登录的，那个用户的公钥要自己先确认（04 章 4.6）；
+  # 后续项：同时检查 SUDO_USER 的 authorized_keys。
   local keys; keys=$(grep -cve '^\s*$' -e '^\s*#' /root/.ssh/authorized_keys 2>/dev/null || echo 0)
   if [ "$keys" -lt 1 ]; then
     echo "  失败：/root/.ssh/authorized_keys 里没有可用公钥，拒绝关闭口令登录（那会把你锁在门外）" >&2
@@ -531,7 +536,7 @@ harden_ssh(){
   fi
   info "root 已配 $keys 个公钥"
   # 文件名必须以 00- 开头：sshd_config.d 是首次出现者胜，
-  # 必须排在 cloud-init 写的 50-cloud-init.conf（里面是 PasswordAuthentication yes）之前。
+  # 必须排在 cloud-init 写的 50-cloud-init.conf 之前（有的厂商在里面写 PasswordAuthentication yes）。
   cat > /etc/ssh/sshd_config.d/00-hardening.conf <<'EOF'
 PasswordAuthentication no
 PermitRootLogin prohibit-password
@@ -547,7 +552,7 @@ EOF
   cat <<'EOF'
 
   注意：现在另开一个终端验证能登进来，再关掉当前会话：
-       ssh -o PasswordAuthentication=no root@<本机IP>
+       ssh -o PasswordAuthentication=no <登录用户>@<本机IP>    # root 或厂商的默认用户
      进不去就在当前这条还活着的会话里回滚：
        rm -f /etc/ssh/sshd_config.d/00-hardening.conf && systemctl reload ssh
 EOF
@@ -586,7 +591,8 @@ EOF
 fi
 cat <<EOF
 
-还没做、需要你在云控制台做的：
-  · 云防火墙：入方向只放行 SSH 端口（默认 22，建议限来源 IP）。这一层在虚拟机外面，是唯一挡得住
-    「docker 自建 DNAT 绕过宿主 ufw」的地方，也是覆盖 CI 里宿主进程监听端口的正确层次。
+还没做、需要你自己做的：
+  · 入方向防火墙：只放行 SSH 端口（默认 22，建议限来源 IP），IPv4 和 IPv6 都要覆盖。云上配在厂商的
+    云防火墙或安全组里，它在虚拟机外面，docker 自建的 DNAT 绕不过它，CI 在宿主上监听的端口也一并挡住。
+    裸金属或者厂商没有云防火墙时，按本仓库 04 章 4.7「没有云防火墙时」做。
 EOF

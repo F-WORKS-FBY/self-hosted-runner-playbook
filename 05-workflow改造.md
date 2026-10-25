@@ -90,7 +90,7 @@ grep -rn "ports:" .github/workflows/ | grep -v "127.0.0.1"
 
 失败是什么样：CI 不会失败，所以也不会提醒你。它只是把你的数据库开放到了公网上。
 
-> 实测：`ports: ['5433:5432']` 加明文 `POSTGRES_PASSWORD`，check-host.net 的四个境外节点全部成功建立 TCP 连接，并收到 Postgres 的认证响应。当时宿主的 `ufw` 是 inactive，但这不影响结论：Docker 的 DNAT 本来就绕过 ufw。
+> 实测：`ports: ['5433:5432']` 加明文 `POSTGRES_PASSWORD`，check-host.net 的四个外部节点全部成功建立 TCP 连接，并收到 Postgres 的认证响应。当时宿主的 `ufw` 是 inactive，但这不影响结论：Docker 的 DNAT 本来就绕过 ufw。
 
 怎么改：
 
@@ -292,7 +292,7 @@ async function assertPortFree(port: number) {
 fuser -k 3100/tcp 3101/tcp 2>/dev/null || true
 ```
 
-第三层：用云防火墙挡住这些宿主端口。它们不是容器，`-p 127.0.0.1` 管不到。
+第三层：用入方向防火墙挡住这些宿主端口（04 章 4.7）。它们不是容器，`-p 127.0.0.1` 管不到。
 
 ---
 
@@ -304,7 +304,7 @@ fuser -k 3100/tcp 3101/tcp 2>/dev/null || true
 
 怎么改：
 
-- 优先靠云防火墙（04 章 4.7）。宿主进程不走 DOCKER 链，所以主机防火墙和云防火墙对它都有效。
+- 优先靠入方向防火墙（04 章 4.7）。宿主进程不走 Docker 的链，所以云防火墙（安全组）和主机防火墙（ufw、nftables）对它都有效。
 - 也可以改应用代码的绑定地址，但要先确认两点：不会破坏容器形态（容器内必须绑 `0.0.0.0` 才能被发布端口访问到）；不和仓库已有的绑定地址约定冲突。
 
 ---

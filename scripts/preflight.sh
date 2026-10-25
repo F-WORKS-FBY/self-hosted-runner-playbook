@@ -15,6 +15,10 @@
 #
 # 判据来源见本仓库 02-选机与验收.md。阈值都可以按你的项目改，测法别改，
 # 尤其是 steal 那一项：它在很多云上结构性地测不到。
+#
+# 第 6 项（steal 能不能用）先看是不是裸金属，再核对 CPUID 0x40000000 的 hypervisor 签名，
+# 是 KVMKVMKVM 才去读 0x40000001 的 bit5（KVM_FEATURE_STEAL_TIME）。别的虚拟化（Xen、Hyper-V 等）
+# 只报「判断不了」，争抢一律按 --with-load 的定长任务测。
 set -uo pipefail
 
 # CI 会占用的宿主端口：services: 映射到宿主的端口，加上 bootstrap 的 CI_APP_PORTS。
@@ -23,8 +27,8 @@ CI_HOST_PORTS="${CI_HOST_PORTS:-}"
 # 下面三个硬件下限是参考项目的值（单 job 约用 4 核，跑 8 GB 那一档的机器）。
 # 你的项目按 10-按机器规格定参数.md 算出要多少，再用环境变量传进来。
 MIN_CORES="${MIN_CORES:-4}"          # 单 job 用核，向上取整（10 章 10.2）
-MIN_MEM_MIB="${MIN_MEM_MIB:-7000}"   # 8 GB 的机器系统里一般只看到 7.5 GiB 左右，这里留了余地（10 章 10.2）
-MIN_DISK_GIB="${MIN_DISK_GIB:-40}"   # 根分区可用空间；跑 docker build 的 CI，盘按 10 章 10.4 定
+MIN_MEM_MIB="${MIN_MEM_MIB:-7000}"   # 标 8 GB 的机器系统里一般只看到 7.5 GiB 左右（各厂商略有差别），这里留了余地（10 章 10.2）
+MIN_DISK_GIB="${MIN_DISK_GIB:-40}"   # 根分区（df /）可用空间；跑 docker build 的 CI，盘按 10 章 10.4 定。Docker 数据另放一块盘时见 02 章 2.9
 # 包管理器的源不是 npm 时，把要测的地址加在这里，空格分隔。
 # 例："https://pypi.org/simple/ https://files.pythonhosted.org/ https://proxy.golang.org/"
 CI_EXTRA_ENDPOINTS="${CI_EXTRA_ENDPOINTS:-}"
@@ -135,16 +139,26 @@ else warn "缺 curl 或 python3，跳过"; fi
 
 hdr "6. CPU 争抢能不能观测（决定用什么方法测争抢）"
 STEAL_OK=0
-if [ -r /dev/cpu/0/cpuid ] || modprobe cpuid 2>/dev/null; then
-  EAX=$(python3 - <<'PY' 2>/dev/null
+VIRT=$(systemd-detect-virt --vm 2>/dev/null || true)
+if [ "$VIRT" = "none" ]; then
+  ok "裸金属（systemd-detect-virt --vm = none），没有同宿主的邻居抢核，这一项不适用"
+elif [ -r /dev/cpu/0/cpuid ] || modprobe cpuid 2>/dev/null; then
+  # 先看 0x40000000 的 hypervisor 签名：0x40000001 的 bit5 只在 KVM 下表示 KVM_FEATURE_STEAL_TIME，
+  # Xen、Hyper-V 下这个叶子是别的含义，直接读会得出错误结论
+  read -r SIG EAX < <(python3 - <<'PY' 2>/dev/null
 import os,struct
 try:
     fd=os.open('/dev/cpu/0/cpuid',os.O_RDONLY)
-    print(hex(struct.unpack('<IIII',os.pread(fd,16,0x40000001))[0]))
-except Exception: print('')
+    _, b, c, d = struct.unpack('<IIII', os.pread(fd, 16, 0x40000000))
+    sig = struct.pack('<III', b, c, d).rstrip(b'\0').decode('ascii', 'replace').replace(' ', '_') or '?'
+    print(sig, hex(struct.unpack('<IIII', os.pread(fd, 16, 0x40000001))[0]))
+except Exception: print('? ')
 PY
 )
-  if [ -n "$EAX" ] && [ "$EAX" != "0x0" ]; then
+  if [ "${SIG:-?}" != "KVMKVMKVM" ]; then
+    warn "虚拟化是 ${VIRT:-未知}（hypervisor 签名 ${SIG:-?}），不是 KVM，判断不了 steal 能不能用"
+    note "争抢改用定长任务的墙钟时间衡量（--with-load 会给出基线）。"
+  elif [ -n "$EAX" ] && [ "$EAX" != "0x0" ]; then
     if python3 -c "import sys;sys.exit(0 if (int('$EAX',16)>>5)&1 else 1)" 2>/dev/null; then
       STEAL_OK=1; ok "宿主暴露了 KVM_FEATURE_STEAL_TIME（CPUID 0x40000001 eax=$EAX，bit5=1），/proc/stat 的 steal 列可用"
     else

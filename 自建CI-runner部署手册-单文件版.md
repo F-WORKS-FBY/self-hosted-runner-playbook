@@ -3,8 +3,8 @@
 > 这份文件由仓库里的分章文件自动拼成，用 `bash scripts/make-single.sh` 重新生成。
 > 要改内容请改分章文件，不要改这一份，否则两个版本会对不上。
 >
-> 手册讲一套通用做法：怎么选机器、按规格怎么定参数、怎么装、怎么改 workflow、怎么接线、怎么验证、怎么运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。
-> 里面的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在一台 4 核、约 7.6 GiB 内存的机器上。没有特别说明时，数字指这一台。
+> 手册讲一套通用做法：怎么选机器、按规格怎么定参数、怎么装、怎么改 workflow、怎么接线、怎么验证、怎么运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。做法不绑定厂商，云主机和裸金属都适用。换厂商时要核对的事（CPU 型号是否固定、登录方式、metadata 地址、防火墙在哪配、计费粒度等）见 02 章 2.9。
+> 里面的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在 Hetzner Cloud 一台 4 核、约 7.6 GiB 内存的共享 vCPU 云主机上。准备加第二台时又在同一家试过几台候选机（02 章 2.7）。没有特别说明时，数字指第一台。
 > 写着「参考项目」的地方是举例，不是要求。你的机器该跑几个实例、参数怎么取，按 10 章的公式算。
 
 ---
@@ -22,7 +22,7 @@ REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一�
 #    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
 #    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
 GH_REPO=owner/repo \
-RUNNER_NAME=ci-$(hostname -s) \
+RUNNER_NAME=<每台不同，比如 ci-1> \
 RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
 CI_LABEL=com.myorg.ci=1 \
 CI_APP_PORTS="<CI 在宿主上监听的端口，空格分隔，没有就留空>" \
@@ -98,7 +98,7 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 每 run 计费分钟 = Σ(每个 job 的 ceil(秒数/60))     # 注意是每 job 各自取整
 ```
 
-> 参考项目：按现配置外推为 2280 计费分钟/月，免费额度 2000，超出 280 分钟。按 Linux 2 核 $0.006/分钟计，费用为 $1.68/月。而一台机器月租 €7–14。只算钱的话，自建是亏的。
+> 参考项目：按现配置外推为 2280 计费分钟/月，免费额度 2000，超出 280 分钟。按 Linux 2 核 $0.006/分钟计，费用为 $1.68/月。参考项目用的厂商（Hetzner Cloud）上，这一档的机器月租 €7–14，换了厂商按它的报价重算。只算钱的话，自建是亏的。
 
 ### 1.2 为什么仍然值得做
 
@@ -124,14 +124,14 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 
 关于共享机器：如果 CI 和业务共用一个 dockerd，一次 ENOSPC（磁盘写满）除了让 CI 变红，业务也会一起写不进去。要自建就用专机。
 
-开发工具同理。参考项目在 8 GB 的 CI 机上开着 VS Code Remote 和 AI 助手开发了两天，出了 11 次全局 OOM，被杀的大多是 CI 的进程。8 GB 这一档的机器只跑 CI。更大的机器要兼开发，按 04 章 4.8 配置，内存够不够按 10 章算。
+开发工具同理。机器能不能兼开发，要把开发工具的内存算进 10 章 10.2 的公式，算下来每台还能跑至少 1 个 job 才行，配置按 04 章 4.8。参考项目单个 job 整机峰值约 6 GiB，在一台 8 GB 的 CI 机上开着 VS Code Remote 和 AI 助手开发了两天，出了 11 次全局 OOM，被杀的大多是 CI 的进程。
 
 ### 1.4 决策清单
 
 下面五项全部为「是」，才继续往下做：
 
 1. 仓库是私有的，或你能接受 fork PR 的代码执行风险。
-2. 有专用的机器（不跑业务、不跑别人的数据，8 GB 这一档的机器上也不做日常开发）。要几台、每台多大，见 10 章。
+2. 有专用的机器：不跑业务、不跑别人的数据；按 10 章算下来内存不够兼开发的，也不做日常开发。要几台、每台多大，见 10 章。
 3. 已经做完免费优化，额度仍然吃紧。
 4. 有人负责它的运维（清理、监控、升级）。
 5. 接受「runner 实例有限时 job 会排队」。先用 08 章 8.1 的方法算一遍你的峰值，再决定要几台机器、每台跑几个实例（10 章）。
@@ -153,7 +153,7 @@ REF=<现有 runner 的单核分数> bash scripts/machine-check.sh
 
 两个脚本里的硬件下限（4 核、7000 MiB 内存、40 GiB 可用盘）是按参考项目定的默认值。你的项目按 10 章算出要多少，用 `MIN_CORES`、`MIN_MEM_MIB`、`MIN_DISK_GIB`（machine-check 里叫 `MIN_DISK_GB`）传进去。其中 40 GiB 只是脚本的最低门槛，不代表够用。跑 docker build 的 CI，盘按 10 章 10.4 算，参考项目要约 75 GB 的盘。
 
-下面逐项解释查什么、为什么这样查。阈值可以按你的项目调整，测法不能改。
+下面逐项解释查什么、为什么这样查。阈值可以按你的项目调整，测法不能改。换了云厂商、或者用裸金属时，先对一遍 2.9。
 
 ### 2.1 CPU 与内存：按单 job 实测峰值来定
 
@@ -260,6 +260,10 @@ auth.docker.io                 上面那个的鉴权
 
 很多云的宿主不向 guest 暴露 `KVM_FEATURE_STEAL_TIME`（CPUID `0x40000001` 的 bit5）。这时 `/proc/stat` 的 steal 列结构上恒为 0：内核根本拿不到这项数据，这个 0 不是测出来的。任何基于 `%st` 的监控在这种机器上都是永久的假绿。假绿指检查本该报警或失败，却显示正常；这里就是指标一直正常，实际什么也没测到。
 
+这一位只在 hypervisor 签名（CPUID `0x40000000` 返回的字符串）是 `KVMKVMKVM` 时才是这个含义。别的虚拟化（Xen、Hyper-V 等）的同一位另有含义，裸金属上读到的是无关的数据。preflight 会先看是不是裸金属、再核对这个签名，不是 KVM 的只报「判断不了」，这时争抢按下面的定长任务测。裸金属没有邻居抢核，定长任务的基线照样要测，ci-health 要用它。
+
+先跑 `systemd-detect-virt --vm`。输出 none 是裸金属；输出别的值，再用下面的命令看签名。
+
 检查方法如下：
 
 ```bash
@@ -267,11 +271,14 @@ auth.docker.io                 上面那个的鉴权
 python3 -c "
 import os,struct
 fd=os.open('/dev/cpu/0/cpuid',os.O_RDONLY)   # 需要先 modprobe cpuid
+_,b,c,d=struct.unpack('<IIII',os.pread(fd,16,0x40000000))
 eax=struct.unpack('<IIII',os.pread(fd,16,0x40000001))[0]
-print(hex(eax), 'STEAL_TIME bit5 =', (eax>>5)&1)"
+print('签名', struct.pack('<III',b,c,d), hex(eax), 'STEAL_TIME bit5 =', (eax>>5)&1)"
 ```
 
-参考项目测得 `eax=0x0100005b`，bit5 = 0，steal 不可观测。第一轮测试曾把「steal 全程 0.00%」当作「无争抢」的证据。由于 steal 列恒为 0，那 1855 个样本得出 0.00% 是必然的，什么也证明不了。
+签名是 `b'KVMKVMKVM\x00\x00\x00'` 时，bit5 才有意义。
+
+参考项目（Hetzner Cloud）测得 `eax=0x0100005b`，bit5 = 0，steal 不可观测。第一轮测试曾把「steal 全程 0.00%」当作「无争抢」的证据。由于 steal 列恒为 0，那 1855 个样本得出 0.00% 是必然的，什么也证明不了。
 
 替代方法是测定长任务的墙钟时间。同样的活干 N 遍，如果被邻居抢核，就会变慢。参考项目在一台机器上连跑 30 遍的结果：
 
@@ -324,13 +331,15 @@ BuildKit 自己有 GC 兜底，缓存不会无限增长，盘一般不会被缓�
 
 GC 的三个参数（Reserved、Max Used、Min Free）按盘的大小取，公式和各档的值见 10 章 10.4。参考项目 75 GB 的盘用 10 / 20 / 20 GB。
 
+上面的公式和脚本里的磁盘检查，都按 Docker 数据（`/var/lib/containerd`、`/var/lib/docker`）和根分区在同一个文件系统上来写。分开放的，见 2.9 的「磁盘」一行。
+
 ### 2.7 单核速度和超时余量
 
-核数和内存达标，不代表这台机器够快。共享 vCPU 的云主机，同一个套餐每次开出来的 CPU 型号可能不同，单核速度能差一倍。
+核数和内存达标，不代表这台机器够快。不同厂商、不同规格族、不同代际的 CPU，单核速度差得很多。共享 vCPU 的规格，同一个套餐每次开出来的 CPU 型号还可能不同；型号相同，也可能因为宿主负载或频率不同而慢一截。所以每台新机器都要实测，换厂商要核对的事见 2.9。
 
 最先受影响的是单核受限的 job：被限成 1 个 CPU 的测试容器、单线程的类型检查和 lint，还有测试里写死的超时（2.1 里的 `Test timed out in 5000ms`）。这类 job 不会因为核多而变快，单核慢多少，耗时就涨多少，最后撞上 `timeout-minutes`。preflight 查不出这个问题。
 
-> 参考项目：找第二台机器时，先开到两台 Intel Skylake 的机器，`machine-check.sh` 的单核分数是 4.2–4.7。现有 runner（AMD EPYC-Rome）在跑 CI 时测的分数约 2.5，比值 1.7–1.9，两台都判为不合格。这个 REF 是忙时量的，偏大，实际差距只会更大。后来开到一台同为 EPYC-Rome 的 8 核机器，把真实的单核算法测试在上面跑了一遍，仍比现有 runner 慢 23%。最后用上的那台也是 EPYC-Rome（4 核），分数 2.91，比值 1.16，回放算法测试慢 13–18%。
+> 参考项目（Hetzner Cloud 的共享 vCPU 规格，CPU 型号由分到的宿主机决定）：找第二台机器时，同一个套餐先开到两台 Intel Skylake 的机器，`machine-check.sh` 的单核分数是 4.2–4.7。现有 runner（AMD EPYC-Rome）在跑 CI 时测的分数约 2.5，比值 1.7–1.9，两台都判为不合格。这个 REF 是忙时量的，偏大，实际差距只会更大。后来开到一台同为 EPYC-Rome 的 8 核机器，把真实的单核算法测试在上面跑了一遍，仍比现有 runner 慢 23%。最后用上的那台也是 EPYC-Rome（4 核），分数 2.91，比值 1.16，回放算法测试慢 13–18%。
 
 做法分四步。
 
@@ -341,9 +350,7 @@ GC 的三个参数（Reserved、Max Used、Min Free）按盘的大小取，公�
    REF=<上面的单核分数> bash scripts/machine-check.sh    # 在候选机上
    ```
 
-2. 测候选机。拿到机器先跑。候选机分数 ÷ REF 不超过 1.2 判合格，不超过 1.4 判有保留，再大判不合格。不合格的直接删掉重开；按小时计费的云上，这样做几乎没有成本。脚本还会打印 CPU 型号、有没有 SHA 指令扩展，以及全核同时满载时单核掉速多少。掉速超过 1.3 倍，可能有邻居在抢 CPU，隔一会儿再测。
-
-   在 Hetzner 上可以把这一步交给 `scripts/hetzner-pick.py`：它用 API 开机，用运行者自己的 SSH 钥匙登进去跑 `machine-check.sh`，合格就停，不合格就删掉，随机等几分钟、优先换个机房再开，用法见 README 的「脚本」一节。别的云要自己写同样的循环，要点有三个：只删自己开的机器（打标签再按标签核对），中断时先删掉正在测的那台，设次数上限。
+2. 测候选机。拿到机器先跑。候选机分数 ÷ REF 不超过 1.2 判合格，不超过 1.4 判有保留，再大判不合格。脚本还会打印 CPU 型号、有没有 SHA 指令扩展，以及全核同时满载时单核掉速多少。掉速超过 1.3 倍，可能有邻居在抢 CPU，隔一会儿再测；一直这样，也可能是这个规格的 vCPU 是超线程，两个 vCPU 共用一个物理核（2.9）。
 
    两台机器要用同一个 Python 大版本，否则分数没法比。同一个发行版版本自带的 python3 是一样的。不要拿 preflight 的 sha256 基线比两台机器（2.5）。
 
@@ -352,6 +359,12 @@ GC 的三个参数（Reserved、Max Used、Min Free）按盘的大小取，公�
    ```bash
    for i in 1 2 3; do node -e "let t=Date.now(),s=0;for(let i=0;i<5e8;i++)s+=i%7;console.log((Date.now()-t)/1000)"; done
    ```
+
+   不合格怎么办看计费方式。按小时或按秒计费的云上，直接删掉重开，最多花一两个小时的钱。按月计费的云和裸金属，开错一台就是一个月的钱，下单前先按 2.9 查清这个规格的 CPU 型号是否固定。能选固定 CPU 代际或独享 vCPU 的规格就选，拿到后照样用 machine-check 确认。
+
+   按小时计费时，这一步可以自动化：用厂商的 API 或 CLI 写一个循环，依次是开机、等 cloud-init 跑完、跑 machine-check、不合格就删。要守三条：只删自己开的机器（建机时打标签，删之前按标签核对）；中断时先删掉正在测的那台；设次数上限。
+
+   > 参考项目（Hetzner Cloud）：用的是 `scripts/hetzner-pick.py`，只适用于 Hetzner Cloud。它用 API 开机，用运行者自己的 SSH 钥匙登进去跑 `machine-check.sh`，合格就停；不合格就删掉，随机等几分钟、优先换个机房再开。用法见 README 的「脚本」一节。
 
 3. 核对超时余量。记 R = 候选机耗时 ÷ 参考机耗时，先用第 2 步的分数比，有了第 4 步的回放结果就换成回放的比值。对每个跑在自建机上的 job 核对：
 
@@ -392,18 +405,37 @@ GC 的三个参数（Reserved、Max Used、Min Free）按盘的大小取，公�
 
 各种规格的机器该跑几个实例、参数怎么取，见 10 章 10.5 的推荐表。
 
+### 2.9 换云厂商时要核对的事
+
+前面各节的测法不挑厂商，云主机和裸金属都适用。换厂商、或者第一次用裸金属时，按下表对一遍：建机前查厂商文档，拿到机器后在机器上查。厂商的做法会变，以它当前的文档为准。
+
+| 核对什么 | 各家差在哪 | 怎么查 |
+|---|---|---|
+| CPU 型号和 vCPU | 共享 vCPU 的规格可能每次分到不同型号的宿主机，有的规格族固定 CPU 代际。有的厂商一个 vCPU 是一个超线程 | 看厂商文档里这个规格是否标明 CPU 型号或代际、vCPU 怎么算。拿到机器看 `lscpu`，每台都跑 machine-check（2.7） |
+| 性能会不会变 | 突发性能规格积分用完会限速，machine-check 只跑一分钟测不出来。维护、迁移、关机再开可能换宿主机 | 避开突发性能规格。上线后看 ci-health 的定长任务（08 章 8.3）；`lscpu` 型号变了按 10 章 10.7 重测 |
+| 架构和发行版 | 有更便宜的 ARM 规格；镜像不只有 Ubuntu | `uname -m`。脚本只支持 x86_64，按 Ubuntu 写，别的发行版见 03 章开头 |
+| 登录 | 有的建机时选公钥、直接以 root 登录；有的只建一个默认用户，常占着 uid 1000。root 能不能用口令登录，看镜像里的 `PermitRootLogin`。SSH 断了要靠控制台、串口或 IPMI 这类带外入口 | 建机时填 SSH 公钥。`sshd -T` 看实际生效的值。见 03 章 3.0、3.3，04 章 4.6 |
+| metadata 服务 | 地址不同，裸金属多数没有。实例绑了云身份时会发临时凭据 | IPv4 地址传给 `METADATA_IP`；IPv6 的地址不要传给它，按 04 章 4.5 用 ip6tables 手工加。runner 机器不绑云身份 |
+| 入方向防火墙 | 云防火墙、安全组等，叫法和位置不同。有的新机器默认不挂规则，裸金属多数没有这一层 | 看实际生效的规则，从别的机器探端口（09 章 A10）。没有时按 04 章 4.7「没有云防火墙时」做 |
+| 网络 | 公网 IPv4 可能单独收费或者没有。写这份手册时 GitHub 只有 IPv4 地址，只有 IPv6 的机器连不上，除非厂商提供 NAT64/DNS64。共享出口 IP 时 Docker Hub 配额和别人共用。有的地区访问 GitHub、Docker Hub 不稳定 | `ip -4 addr`；preflight 第 4、5 项（2.4）。配额不够见 09 章 A7，连不稳就换地区或配代理 |
+| 磁盘 | 本地 NVMe 和网络盘快慢差很多，默认系统盘可能只有几十 GB | `lsblk -d -o NAME,SIZE,ROTA`。快慢靠 2.7 第 4 步回放，容量按 10 章 10.4 算。另挂数据盘见表下 |
+| 内存和 swap | MemTotal 比标称少多少各家不同，厂商代理也占内存。云镜像多数不带 swap，安装盘装的常带 swap 文件或分区 | MemTotal 代进 10 章 10.1 的公式；`swapon --show`（10 章 10.3） |
+| 计费粒度 | 按小时或按秒计费，开错一台最多花一两个小时的钱。按月计费和裸金属开错就是一个月的钱，可能还有安装费和最短租期 | 按月计费的，下单前确认 CPU 型号固定（本表第一行）。按小时计费的可以自动开、测、删，见 2.7 第 2 步 |
+
+另挂数据盘放 Docker 时，preflight、machine-check、verify、ci-health 的磁盘检查量的仍是根分区，要改成 Docker 数据（`/var/lib/containerd`、`/var/lib/docker`）所在的路径，10 章 10.4 的盘总量也按那块盘算。不想改脚本，就在建机时把系统盘选够大，不另挂盘。
+
 ---
 
 ## 03 装机与注册
 
 本章用 `scripts/bootstrap.sh` 完成装机和 runner 注册，后面各节逐项说明脚本每一步为什么这样做。新机器建议分两次跑：第一次不注册，确认机器够快之后再注册，见 3.0。
 
-脚本的适用范围是 x86_64 的 Ubuntu（测过 24.04），一台机器一个 runner 实例。在别的架构上它一开始就退出。现在要提高并发就加机器（08 章 8.7）；一台机器跑多个实例要先满足 10 章 10.6 的前提。
+脚本的适用范围是 x86_64 的 Ubuntu（测过 24.04，真机测试都在参考项目所用的 Hetzner Cloud 上），一台机器一个 runner 实例。在别的架构上它一开始就退出。Debian 没有实测过：bootstrap 里 Docker 的 apt 源写死了 `linux/ubuntu`（第 2 步，两处），Debian 上换成 `linux/debian`。不用 apt 的发行版要自己改装包那几步。换厂商要核对的事见 02 章 2.9。现在要提高并发就加机器（08 章 8.7）；一台机器跑多个实例要先满足 10 章 10.6 的前提。
 
 ```bash
 read -rsp 'PAT: ' GH_TOKEN; echo; export GH_TOKEN
 GH_REPO=owner/repo \
-RUNNER_NAME=ci-$(hostname -s) \
+RUNNER_NAME=<每台不同，比如 ci-1> \
 RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
 CI_LABEL=com.myorg.ci=1 \
 CI_APP_PORTS="3100 3101" \
@@ -414,7 +446,7 @@ unset GH_TOKEN
 
 第一行用 `read -s` 输入一次性 PAT，这样它不会留在 shell 历史里（3.4）。注册完去 GitHub 撤销这个 PAT。标签、端口和 `CI_LABEL` 是参考项目的取值，要换成你自己的，各项怎么定见 3.1。没写出来的参数用默认值。`PNPM_VERSION` 可选，留空就交给 workflow 里的 action 处理。
 
-`bootstrap.sh` 是幂等的：重复运行不会破坏已有配置，只补齐缺少的部分。参数会落盘到 `/etc/ci-runner.env`，重跑时没显式传的从那里读回。已在一台配置完成的机器上重跑验证过：12 项关键状态逐字节相同，只有注释文本被标准化。2026-10-19 在全新的 Ubuntu 24.04 上从零安装时跑出过几处问题（09 章 A15–A17），修复后当天和 10-25 两次在全新机器上用 `--skip-runner` 跑通，退出码 0。修复之后，注册加 verify 的完整流程还没有在全新机器上跑过。之后新加的等 apt 锁、检查架构和 uid、注册前查同名这几处只在沙箱里单独测过，还没在真机上整体跑过。
+`bootstrap.sh` 是幂等的：重复运行不会破坏已有配置，只补齐缺少的部分。参数会落盘到 `/etc/ci-runner.env`，重跑时没显式传的从那里读回。已在一台配置完成的机器上重跑验证过：12 项关键状态逐字节相同，只有注释文本被标准化。2026-10-19 在全新的 Ubuntu 24.04 上从零安装时跑出过几处问题（09 章 A15–A17），修复后当天和 10-25 两次在全新机器上用 `--skip-runner` 跑通，退出码 0。10-25 第二台 runner 也是在全新机器上用修复后的脚本注册的，之后 `verify.sh` 33 PASS、0 FAIL。之后新加的等 apt 锁、检查架构和 uid、注册前查同名这几处只在沙箱里单独测过，还没在真机上整体跑过。
 
 在已经接 job 的机器上重跑之前，先等它空闲，用 `systemctl stop` 停掉 runner 服务再跑，脚本最后会重新启动它。原因是脚本只在开头查一次有没有 job，跑的几分钟里接到的 job 会被最后那次重启打断；改了 BuildKit 参数还会重启 docker。具体步骤见 08 章 8.7。
 
@@ -422,9 +454,9 @@ unset GH_TOKEN
 
 拿到一台新机器，按下面的顺序做。
 
-1. 用密钥登录。Ubuntu 24.04 的 sshd 默认 `PermitRootLogin prohibit-password`，root 只能用公钥登录。云厂商发来的 root 口令是对的，登录时也提示可以输口令，照样会被拒（09 章 A21）。建机器时就填上 SSH 公钥。忘了填的，用云控制台的网页终端登进去，把公钥写进 `/root/.ssh/authorized_keys`。
-2. 测单核速度。`scripts/machine-check.sh` 只依赖 python3，一分钟左右打印硬件信息和单核分数。先在现有的 runner 上跑一次，拿到它的分数，最好挑它空闲的时候跑；它正在跑 CI 时加 `PAR=0`，跳过全核满载那一项。再在新机器上用 `REF=<现有 runner 的分数>` 跑，脚本会判合格、有保留或不合格。不合格就删掉重开，按小时计费的云上这样做几乎没有成本。第一台没有参考机，只记下分数，以后加机器时拿它当 REF。怎么判读、超时余量怎么核对，见 02 章 2.7。端口、网络、争抢这些检查用 `preflight.sh`（02 章）。
-3. 等 apt 锁。新机器刚开机时，cloud-init 和自动升级常占着 dpkg 锁，这时 apt-get 会直接失败。bootstrap 会先等 cloud-init 跑完，之后每次 apt-get 遇到锁最多等 10 分钟（`APT_LOCK_WAIT` 可调，设成 0 表示不等）。在它之前要手工装东西的，先跑 `cloud-init status --wait`，apt-get 加 `-o DPkg::Lock::Timeout=600`。注意这个选项只管 install，`apt-get update` 遇到锁仍然直接失败，要自己重试。
+1. 确认登录方式，用密钥登录。各厂商注入 SSH 公钥、开放 root 登录的做法不同。有的建机时选公钥，直接以 root 登录。有的只建一个默认用户（比如 AWS 的 Ubuntu 镜像是 `ubuntu`），root 不能直接 SSH，要登录后 `sudo -i`。Ubuntu、Debian 的 sshd 默认 `PermitRootLogin prohibit-password`。镜像保留这个默认值时，root 用口令登录会被拒，厂商发了 root 口令、登录时也提示输口令也一样（09 章 A21）。有的厂商会把它改成 yes。实际生效的值看 `sshd -T | grep permitrootlogin`。不管哪种，建机时都填上 SSH 公钥。忘了填的，用厂商的带外入口登进去补公钥：云上多是控制台的网页终端或串口控制台，裸金属是 IPMI 或救援系统。脚本都要以 root 跑，用默认用户登录的先 `sudo -i`。默认用户常占着 uid 1000，处理办法见 3.3。
+2. 测单核速度。`scripts/machine-check.sh` 只依赖 python3，一分钟左右打印硬件信息和单核分数。先在现有的 runner 上跑一次，拿到它的分数，最好挑它空闲的时候跑；它正在跑 CI 时加 `PAR=0`，跳过全核满载那一项。再在新机器上用 `REF=<现有 runner 的分数>` 跑，脚本会判合格、有保留或不合格。不合格就换一台：按小时计费的云上删掉重开即可；按月计费或裸金属，先看 02 章 2.9。第一台没有参考机，只记下分数，以后加机器时拿它当 REF。怎么判读、超时余量怎么核对，见 02 章 2.7。端口、网络、争抢这些检查用 `preflight.sh`（02 章）。
+3. 等 apt 锁。新机器刚开机时，cloud-init 和自动升级常占着 dpkg 锁，这时 apt-get 会直接失败。bootstrap 会先等 cloud-init 跑完（机器上没有 cloud-init 就不等），之后每次 apt-get 遇到锁最多等 10 分钟（`APT_LOCK_WAIT` 可调，设成 0 表示不等）。在它之前要手工装东西的，先跑 `cloud-init status --wait`，apt-get 加 `-o DPkg::Lock::Timeout=600`。注意这个选项只管 install，`apt-get update` 遇到锁仍然直接失败，要自己重试。
 4. 先建 runner 用户，固定 uid。bootstrap 第一次运行时按 `RUNNER_UID`（默认 1000）建 runner 用户，所以要在建开发用户等其他普通用户之前跑它。原因和处理办法见 3.3。
 5. 分两次跑 bootstrap。第一次带上全部参数、不给 token，加 `--skip-runner`：装工具链、做加固、建 runner 用户，不注册。然后以 runner 用户把最慢的那个 job 回放一遍，和现有机器的耗时比（02 章 2.7）。通过了，再输入 PAT 重跑一次完成注册。第二次的参数从 `/etc/ci-runner.env` 读回，不用再传。
 
@@ -458,7 +490,7 @@ unset GH_TOKEN
 | `CI_LABEL` | 与 workflow 里 `docker run --label` 的值逐字一致 | `com.myorg.ci=1` |
 | `CI_FIXEDWORK_BASELINE` | 这台机器上 `preflight.sh --with-load` 给出的 p50。每台各测各的，不能抄别的机器，也不能拿来比两台机器的快慢（02 章 2.5） | `0.51`（第一台） |
 | `BUILDKIT_RESERVED` / `BUILDKIT_MAX_USED` / `BUILDKIT_MIN_FREE` | 按盘大小定，不用出厂默认值，公式见 10 章 10.4。已部署的机器上改了 `BUILDKIT_MIN_FREE`，磁盘告警阈值不会跟着重算，做法也见 10.4 | 75 GB 盘：`10GB` / `20GB` / `20GB`；150 GB 盘：`10GB` / `40GB` / `30GB` |
-| `METADATA_IP` | 云 metadata 服务的地址，bootstrap 拦住 CI 访问它。多数云用默认值，阿里云、腾讯云等不同，见 04 章 4.5。旧版脚本没有把它落盘，这样的机器第一次用新版重跑时要显式传一次 | `169.254.169.254`（默认） |
+| `METADATA_IP` | 云 metadata 服务的地址，bootstrap 拦住 CI 访问它。多数云用默认值，阿里云、腾讯云等不同，见 04 章 4.5。裸金属一般没有 metadata 服务，留默认值即可。旧版脚本没有把它落盘，这样的机器第一次用新版重跑时要显式传一次 | `169.254.169.254`（默认） |
 
 注意：`CI_LABEL` 必须和 workflow 里 `docker run --label` 的值逐字一致。清理钩子（`scripts/ci-cleanup.sh`，见 04 章 4.4）靠这个标签认领容器。
 
@@ -514,7 +546,7 @@ runner 用户必须加入 `docker` 组，而 `docker` 组等价于免密的宿�
 
 - bootstrap 新建 runner 用户时用 `RUNNER_UID` 指定 uid，默认 1000。这个 uid 已经被别的用户占了，脚本报错退出，不会让 `useradd` 悄悄换一个。
 - 所以拿到新机器先跑 bootstrap（3.0），再建开发用户等其他普通用户。
-- 有的云镜像自带一个 uid 1000 的默认用户，比如 AWS 上的 `ubuntu`。这种机器要么先把它删掉或改到别的 uid，要么所有 runner 机器统一用另一个 uid，并确认容器写文件时用的也是它。
+- 有的云镜像自带一个 uid 1000 的默认用户，比如 AWS 上的 `ubuntu`，而且它常常是唯一能 SSH 登录的账号。这种机器有两种做法：所有 runner 机器统一用另一个 uid（`RUNNER_UID=`），并按 05 章 ⑬ 让容器以 runner 的 uid 写文件；或者先给 root 或另一个账号配好公钥、确认能登录，再用那个账号把默认用户改到别的 uid。默认用户还登录着的时候改不了它的 uid。preflight 第 1 项会提示 uid 1000 被谁占着。
 - runner 用户已经存在时，bootstrap 不改它的 uid，只在和 `RUNNER_UID` 不一致时打印一行提示。已部署的机器重跑不受影响。
 
 ### 3.4 注册：用一次性 token，不留常驻凭据
@@ -830,7 +862,7 @@ runner 进程被杀时，两个钩子都不执行。
 
 本节用两条 iptables 规则，阻止 CI 读取云 metadata 服务。
 
-云 metadata 服务对 CI job 和容器都是可达的，里面常有初始 root 口令、公钥、网络配置。多数云的地址是 `169.254.169.254`，包括 AWS、GCP、Azure、Hetzner、DigitalOcean、华为云。也有例外：阿里云是 `100.100.100.200`，腾讯云是 `169.254.0.23`。用之前查一下你那家云的文档。bootstrap 用 `METADATA_IP` 参数指定地址，默认 `169.254.169.254`。传过一次就会落盘到 `/etc/ci-runner.env`，重跑时不用再传。旧版 bootstrap 不落盘这一项，这样的机器第一次用新版重跑时要显式传一次。
+云 metadata 服务对 CI job 和容器都是可达的。里面常有 SSH 公钥、网络配置和 cloud-init 的配置数据，有的厂商还放了初始 root 口令；实例绑了云身份时，还会发这个身份的临时凭据（见本节末尾）。多数云的地址是 `169.254.169.254`，包括 AWS、GCP、Azure、Hetzner、DigitalOcean、华为云。也有例外：阿里云是 `100.100.100.200`，腾讯云是 `169.254.0.23`。用之前查一下你那家云的文档。裸金属一般没有 metadata 服务，规则加了也无害。bootstrap 用 `METADATA_IP` 参数指定地址，默认 `169.254.169.254`。传过一次就会落盘到 `/etc/ci-runner.env`，重跑时不用再传。旧版 bootstrap 不落盘这一项，这样的机器第一次用新版重跑时要显式传一次。
 
 两条规则一条管容器，一条管宿主进程：
 
@@ -844,11 +876,16 @@ netfilter-persistent save
 
 两条都要。`DOCKER-USER` 只管容器流量，而 CI job 的 shell 是宿主进程，`DOCKER-USER` 管不到它。
 
+有的厂商给 metadata 加了自己的保护，比如要先取 token、限制跳数。这类保护挡不住宿主上的 CI 进程，两条规则照样要加。
+
 root 仍然可以读 metadata（cloud-init 要用）。这两条只管 IPv4。你那家云如果还开了 IPv6 的 metadata 地址，要用 `ip6tables` 照样加一遍。
 
-> 参考项目的情况：metadata 的 `vendor_data` 里确实有 cloud-init 写入的 root 口令，在容器内能取出来。但与 `/etc/shadow` 的 hash 逐位比对后不匹配：口令在 cloud-init 之后已被改过，泄露的是陈旧凭据。所以这条规则属于纵深防御，要防的并不是一个正在造成损失的漏洞。
->
-> 判断严重程度时，要做这一步比对。没比对就定级，容易把陈旧凭据当成正在发生的泄露，定得过重。
+metadata 里有什么因厂商而异，按厂商文档以 root 在本机读一遍再判断。有两种情况要分清：
+
+- 实例绑定了云账号的角色或服务账号：metadata 会发这个身份的临时凭据，CI job 拿到就能用它调云 API，这就是正在发生的泄露。runner 机器不要绑任何云身份。有的厂商默认会给新机器挂一个，建机时看清楚。
+- 里面有口令：先和 `/etc/shadow` 里的 hash 比对再定级。口令在建机后改过的，泄露的是陈旧凭据。没比对就定级，容易把陈旧凭据当成正在发生的泄露，定得过重。
+
+> 参考项目（Hetzner Cloud）的情况：metadata 的 `vendor_data` 里确实有 cloud-init 写入的 root 口令，在容器内能取出来。但与 `/etc/shadow` 的 hash 逐位比对后不匹配：口令在 cloud-init 之后已被改过，泄露的是陈旧凭据。实例也没有绑云身份。所以在参考项目里，这条规则属于纵深防御。
 
 ### 4.6 SSH：唯一可能把你锁在门外的动作
 
@@ -862,7 +899,7 @@ SSH 加固是本章唯一可能把你锁在门外的操作。`bootstrap.sh` 默�
 
 ```bash
 journalctl -u ssh --since "-30d" --no-pager | grep -oE "Accepted (publickey|password)" | sort | uniq -c
-stat -c '%y' /root/.ssh/authorized_keys      # 公钥是什么时候装的
+stat -c '%n %y' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null   # 公钥是什么时候装的
 ```
 
 把两者按时间线对一下：
@@ -871,6 +908,8 @@ stat -c '%y' /root/.ssh/authorized_keys      # 公钥是什么时候装的
 - 公钥装上之后仍有口令登录：说明有人还在用口令，不能关，先让他们配公钥。
 
 > 参考项目：8 次口令登录全在 `09-06 14:18–14:54`，而 `authorized_keys` 写于 `14:54:52`（他登进来就是为了装公钥）。此后 11 次登录全是 publickey，零口令。结论：可以关。
+
+还要确认 SSH 断了以后有别的路进机器，也就是厂商的带外入口：云上多是控制台网页终端或串口控制台，裸金属是 IPMI 或救援系统。有的带外入口（VNC 式的网页控制台、串口控制台、IPMI）登录的是本地终端，要用口令，只配了公钥、没设口令的账号进不去。需要时先用 `passwd` 给 root 设一个本地口令，SSH 关掉口令认证后，它只在本地终端有用。走 SSH 的网页终端在 sshd 配错时也进不去，不算带外入口。动手前先确认这条路走得通。
 
 #### 写配置
 
@@ -881,7 +920,7 @@ PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
 ```
 
-注意：文件名要以 `00-` 开头。`sshd_config.d` 里同一项以首次出现的为准，这个文件要排在其他文件之前，比如 cloud-init 写的 `50-cloud-init.conf`（里面是 `PasswordAuthentication yes`）。前提是主配置 `/etc/ssh/sshd_config` 的 `Include` 行在最前面，Ubuntu 和 Debian 的默认配置是这样。
+注意：文件名要以 `00-` 开头。`sshd_config.d` 里同一项以首次出现的为准，这个文件要排在其他文件之前，比如 cloud-init 写的 `50-cloud-init.conf`。这个文件有没有、里面写什么看厂商，参考项目的机器上是 `PasswordAuthentication yes`，以 `sshd -T` 的输出为准。前提是主配置 `/etc/ssh/sshd_config` 的 `Include` 行在最前面，Ubuntu 和 Debian 的默认配置是这样。
 
 #### 生效与验证
 
@@ -895,8 +934,10 @@ KbdInteractiveAuthentication no
 第 4 步的验证命令：
 
 ```bash
-ssh -o PasswordAuthentication=no -p <SSH 端口> root@<IP>   # 强制不用口令，能进说明公钥这条路通
+ssh -o PasswordAuthentication=no -p <SSH 端口> <登录用户>@<IP>   # 强制不用口令，能进说明公钥这条路通
 ```
+
+登录用户是 root，或者厂商建的默认用户（03 章 3.0）。`--harden-ssh` 只检查 root 的 `authorized_keys`。用默认用户登录的，先确认那个用户的 `~/.ssh/authorized_keys` 里有你的公钥；root 没有公钥时脚本会拒绝执行，按上面「写配置」手工做。
 
 进不去的话，在当前还活着的会话里回滚：
 
@@ -911,7 +952,7 @@ rm -f /etc/ssh/sshd_config.d/00-hardening.conf && systemctl reload ssh
 - 你正常连着时，它不会动配置；
 - 你被踢下线又进不来时，它会自动回滚。
 
-它数的是 sshd 实际监听端口上的已建立连接。端口从 `sshd -T` 和 sshd 正在监听的端口读，SSH 不在 22 端口也能用。在云控制台的网页终端里操作时，它数不到 SSH 会话，3 分钟内就会回滚，所以加固要在 SSH 会话里做。
+它数的是 sshd 实际监听端口上的已建立连接。端口从 `sshd -T` 和 sshd 正在监听的端口读，SSH 不在 22 端口也能用。在控制台网页终端、串口控制台或 IPMI 这类带外入口里操作时，它数不到 SSH 会话，3 分钟内就会回滚，所以加固要在 SSH 会话里做。
 
 安全网要在加固之前装好。`bootstrap.sh --harden-ssh` 写完配置马上 reload，中间不停顿。
 
@@ -927,21 +968,21 @@ systemctl stop ssh-guard.timer
 
 `systemd-run` 建的是临时 timer，机器重启后就没了，不用另外清理。回滚之后脚本会自己停掉 `ssh-guard.timer`。自己写 timer unit 的话，`OnUnitActiveSec=` 要和 `OnActiveSec=` 一起写。只写前者时，对应的服务一次都没跑过，timer 没有起算点，可能一次都不触发。
 
-### 4.7 云防火墙：挡得住 Docker 端口的那一层
+### 4.7 入方向防火墙：挡得住 Docker 端口的那一层
 
-云防火墙要去云厂商控制台配置，脚本做不了。
+入方向的防火墙要配在机器外面。各厂商叫法不同，有的叫云防火墙，有的叫安全组、网络安全组或 VPC 防火墙规则，下文统称云防火墙。它在控制台或厂商的 API、CLI 里配，bootstrap 管不到。有的厂商新机器默认不挂任何防火墙，所有端口对公网开着，建好机器先看一眼实际生效的规则。
 
-不能只靠宿主 ufw 的原因：Docker 会自己往 iptables 写 DNAT 规则，从结构上绕过 ufw。对容器端口来说，「在防火墙封了 3000」多半不生效。云防火墙在虚拟机外面，Docker 改不了它。
+不能只靠宿主 ufw 的原因：Docker 会自己往 iptables 写 DNAT 规则，从结构上绕过 ufw。对容器端口来说，「在防火墙封了 3000」多半不生效。云防火墙在机器外面，Docker 改不了它。
 
 它挡的是容器端口绑回环也盖不住的部分，也就是 CI 里在宿主上监听的进程，比如 e2e 直接 `spawn` 起来的应用服务器。这类进程不是容器，没有 `-p` 可以绑。
 
-配置：入方向只放行 SSH 端口（默认 22，建议限来源 IP），出方向全放。
+配置：入方向只放行 SSH 端口（默认 22，建议限来源 IP），出方向全放。IPv4 和 IPv6 都要覆盖，有的厂商两者分开配。
 
-对 CI 的影响为零。runner 是出站长轮询去 GitHub 领活，不需要任何入站端口。但要注意：以后想在这台机上跑任何对外服务，得回控制台加规则。
+对 CI 的影响为零。runner 是出站长轮询去 GitHub 领活，不需要任何入站端口。但要注意：以后想在这台机上跑任何对外服务，得回去加规则。
 
 #### 没有云防火墙时
 
-有的厂商不提供云防火墙。这时分两部分处理：
+裸金属，或者厂商不提供云防火墙时，分两部分处理：
 
 - 宿主进程监听的端口，用 ufw 或 nftables 挡。宿主进程不走 Docker 的链，主机防火墙对它有效。先放行 SSH 端口再启用防火墙，否则可能断线，之后也登不进来。
 - 容器端口，靠 05 章 ② 的 `127.0.0.1` 绑定。再在 `DOCKER-USER` 链里丢掉从公网网卡进来、目标是容器的新连接，作为第二道防线：
@@ -951,11 +992,13 @@ iptables -I DOCKER-USER -i eth0 -m conntrack --ctstate NEW -j DROP   # eth0 换�
 netfilter-persistent save
 ```
 
+公网网卡名各厂商不同（eth0、ens3、enp1s0 等），用 `ip route show default` 看 `dev` 后面的名字。有的云在机器外面做公网地址转换，机器里只看到内网地址，公网流量也从这块网卡进来，规则照样有效。这条规则只管 IPv4，在 daemon.json 里给 Docker 开了 IPv6 的，用 `ip6tables` 照样加一条。
+
 这条规则和 4.5 的规则一起持久化。参考项目没有在没有云防火墙的机器上实测过，加完之后从别的机器测一下端口，不要在本机探自己的公网 IP（09 章 A10）。
 
 ### 4.8 机器上还要开发时
 
-最好不要在 CI 机上开发，8 GB 及以下的机器尤其不要。参考项目在一台 4 核、约 7.6 GiB、没有 swap 的 CI 机上开着 VS Code Remote、Claude Code、Codex 开发了两天，出了 11 次全局 OOM，被杀的大多是 CI 的进程（09 章 B17）。原因有两层。一是内存账里没算开发工具，一个 VS Code 远程服务端就占约 4 GB。二是优先级排反了：runner 是 800，开发会话是 0，内核每次先挑的都是 CI。开发搬到别的机器之后，没有再出现。
+最好不要在 CI 机上开发。能不能兼开发要按下面第 1 步算，取决于你的 job 和开发工具各占多少内存，没有一个通用的内存档。参考项目在一台 4 核、约 7.6 GiB、没有 swap 的 CI 机上开着 VS Code Remote、Claude Code、Codex 开发了两天，出了 11 次全局 OOM，被杀的大多是 CI 的进程（09 章 B17）。原因有两层。一是内存账里没算开发工具，一个 VS Code 远程服务端就占约 4 GB。二是优先级排反了：runner 是 800，开发会话是 0，内核每次先挑的都是 CI。开发搬到别的机器之后，没有再出现。
 
 一定要在 CI 机上开发时，下面几步都要做。
 
@@ -976,7 +1019,7 @@ netfilter-persistent save
 
    sshd 的监听进程启动时会把自己调到 −1000，不会被杀。它为每个登录派生出的会话会恢复成 unit 上的 1000，会话里起的 VS Code 服务端、Claude Code、Codex 都继承这个值。`user@.service` 管的是 systemd 用户实例里起的进程，第 5 步的 `systemd-run --user` 就在这里。
 
-   这个设置对所有 SSH 登录都生效，包括 root 的运维会话。内存紧张时，你登进来排查用的 shell 也会先被杀，这时可以用云控制台的网页终端。用 `systemctl` 启动的服务不受影响，它们由 systemd 直接拉起，不继承会话的值。
+   这个设置对所有 SSH 登录都生效，包括 root 的运维会话。内存紧张时，你登进来排查用的 shell 也会先被杀，这时用厂商的带外入口（控制台网页终端、串口控制台，裸金属用 IPMI）。用 `systemctl` 启动的服务不受影响，它们由 systemd 直接拉起，不继承会话的值。
 
    确认：
 
@@ -1000,7 +1043,7 @@ netfilter-persistent save
    systemd-run --user --scope --quiet --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% -- codex
    ```
 
-   上限不要超过全量 CI 期间整机可用内存的最低值减 0.3 GiB。参考项目 7.6 GiB 的机器上最低可用约 1.3 GiB，所以取 1G；16 GiB 的机器上可以给到 2G。`CPUQuota=200%` 对应 10 章 10.2 里开发工具用核按 2 算。这条命令要在开发用户自己登录的 SSH 会话里执行。用 `su` 切过去的会话通常没有用户实例的环境变量，`systemd-run --user` 会报连不上 bus。
+   上限不要超过全量 CI 期间整机可用内存的最低值减 0.3 GiB。参考项目 7.6 GiB 的机器上最低可用约 1.3 GiB，所以取 1G；按它的 job 推算，16 GiB 的机器上可以给到 2G。你的机器用自己量到的最低值来算。`CPUQuota=200%` 对应 10 章 10.2 里开发工具用核按 2 算。这条命令要在开发用户自己登录的 SSH 会话里执行。用 `su` 切过去的会话通常没有用户实例的环境变量，`systemd-run --user` 会报连不上 bus。
 
 6. 开发工具的磁盘占用也要算进去。VS Code 远程服务端每次客户端升级会多留一份，要定期删，见 08 章 8.6 的每月巡检。
 
@@ -1098,7 +1141,7 @@ grep -rn "ports:" .github/workflows/ | grep -v "127.0.0.1"
 
 失败是什么样：CI 不会失败，所以也不会提醒你。它只是把你的数据库开放到了公网上。
 
-> 实测：`ports: ['5433:5432']` 加明文 `POSTGRES_PASSWORD`，check-host.net 的四个境外节点全部成功建立 TCP 连接，并收到 Postgres 的认证响应。当时宿主的 `ufw` 是 inactive，但这不影响结论：Docker 的 DNAT 本来就绕过 ufw。
+> 实测：`ports: ['5433:5432']` 加明文 `POSTGRES_PASSWORD`，check-host.net 的四个外部节点全部成功建立 TCP 连接，并收到 Postgres 的认证响应。当时宿主的 `ufw` 是 inactive，但这不影响结论：Docker 的 DNAT 本来就绕过 ufw。
 
 怎么改：
 
@@ -1300,7 +1343,7 @@ async function assertPortFree(port: number) {
 fuser -k 3100/tcp 3101/tcp 2>/dev/null || true
 ```
 
-第三层：用云防火墙挡住这些宿主端口。它们不是容器，`-p 127.0.0.1` 管不到。
+第三层：用入方向防火墙挡住这些宿主端口（04 章 4.7）。它们不是容器，`-p 127.0.0.1` 管不到。
 
 ---
 
@@ -1312,7 +1355,7 @@ fuser -k 3100/tcp 3101/tcp 2>/dev/null || true
 
 怎么改：
 
-- 优先靠云防火墙（04 章 4.7）。宿主进程不走 DOCKER 链，所以主机防火墙和云防火墙对它都有效。
+- 优先靠入方向防火墙（04 章 4.7）。宿主进程不走 Docker 的链，所以云防火墙（安全组）和主机防火墙（ufw、nftables）对它都有效。
 - 也可以改应用代码的绑定地址，但要先确认两点：不会破坏容器形态（容器内必须绑 `0.0.0.0` 才能被发布端口访问到）；不和仓库已有的绑定地址约定冲突。
 
 ---
@@ -1576,6 +1619,8 @@ ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -
 - 网络断开
 - runner 进程退出
 
+装好后先手工执行一次 `ExecStart` 里的命令，确认心跳服务收到了。有的地区的机房访问某些心跳服务不稳定，连不上就换一家或者配代理（02 章 2.9）。
+
 有多台机器时，每台在心跳服务上单独建一个检查，用各自的 UUID，检查名带上主机名或 `RUNNER_NAME`，告警时能看出是哪一台。几台共用一个检查的话，只要还有一台在报，别的机器挂了也发现不了。撤掉一台机器时，要同时删掉它的检查，不然它会一直告警，步骤见 08 章 8.7。
 
 心跳只看 runner 服务是不是 active。服务 active 只说明进程还在，这台机器能不能领到 job、跑得对不对，心跳看不出来。这些要看 verify.sh 的 GitHub 侧检查（07 章）、ci-health 的产出告警（服务 active 但本机的 job 连续失败），以及每台机器最近有没有领到过 job（08 章 8.7）。
@@ -1837,7 +1882,7 @@ curl -s -H "Accept: application/json" "https://check-host.net/check-tcp?host=<�
 
 参考项目的实测结果：
 
-- 修复前：四个境外节点全部成功连上，并收到 Postgres 认证响应。
+- 修复前：四个外部节点全部成功连上，并收到 Postgres 认证响应。
 - 修复后：全部 `Connection refused`。
 
 #### 孤儿进程假绿
@@ -1881,7 +1926,8 @@ done 2>/dev/null | sort -rn | head -15
 ```bash
 # 重启前：记基线
 systemctl is-enabled docker containerd <runner-unit>
-iptables -S | grep -c 169.254.169.254      # metadata 地址，和你的 METADATA_IP 一致
+M=$(sed -n 's/^METADATA_IP=//p' /etc/ci-runner.env)    # 本机落盘的 metadata 地址
+sudo iptables -S | grep -cF -- "${M:-169.254.169.254}"  # metadata 规则条数，正常是 2，重启后应不变
 systemctl list-timers --no-pager | grep ci-
 
 # 等机器空闲（下面这条没有输出）再停 runner，免得重启时正好在跑 job
@@ -1894,6 +1940,8 @@ bash scripts/verify.sh
 ```
 
 有多台机器时一次只重启一台。等它回来、`verify.sh` 通过、GitHub 上显示 online，再重启下一台，这样任何时候都有机器在接 job（08 章 8.7）。
+
+`reboot` 是机器内部的重启，一般不换宿主机。在控制台关机再开，或者厂商做了迁移，有的云会换到别的宿主机。这之后看一眼 `lscpu` 的型号，变了按 10 章 10.7 重测。
 
 注意：如果你的终端或 CI 助手就跑在这台机器上，重启会把它一起断掉，所以重启放在最后一步。
 
@@ -2045,6 +2093,7 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
 
 - 量 `/var/lib/containerd`，不要量 `/var/lib/docker`。Docker 29 默认用 containerd 快照器，实测 containerd 占 2.6 G，docker 目录只有 115 M。量错目录会低估约 10 倍，监控就成了假绿（指标显示正常，实际没量到真实占用）。
 - 匿名卷在 `/var/lib/docker/volumes`，要单独量。
+- 可用空间（`root_avail`）量的是根分区，也就是 `df /`。Docker 数据放在另一块盘上时，告警看的就不是 Docker 所在的那块盘，按 02 章 2.9 表下的说明改。
 - 磁盘阈值从 Min Free 推算。原版写死的两个阈值都有问题：
   - WARN < 40 GB：在设计稳态下每小时都会触发，一个月响了 309 次，没有送达任何人。
   - CRIT < 20000 MB：只比 Min Free（20480 MiB）低 480 MiB。
@@ -2060,10 +2109,10 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
 
 CPU 争抢要常态化采点监控，上线前查一次不够。
 
-1. 先确认 steal 指标能不能用（见 02 章 2.5）。
+1. 先确认 steal 指标能不能用（见 02 章 2.5）。preflight 第 6 项会先核对虚拟化类型，只在 KVM 上判断 steal 能不能用，别的虚拟化和裸金属按「不能用」处理。
 2. 不能用的话，就采集定长任务的墙钟时间，超过基线 1.4 倍时报警。`ci-health.sh` 已经按这个方式实现。
 
-注意：共享 vCPU 的邻居会变。今天不拥挤，只能说明此刻不拥挤。
+注意：共享 vCPU 的邻居会变。今天不拥挤，只能说明此刻不拥挤。按 CPU 积分限速的突发性能规格，积分用完后也表现为定长任务变慢，这类规格选型时就该避开（02 章 2.9）。
 
 基线只在同一台机器上有意义，不能拿来比较两台机器。`ci-health.sh` 和 `preflight.sh` 用的 sha256 定长任务，速度主要看 CPU 有没有 SHA 指令扩展。参考项目的 Intel Skylake 候选机没有这条扩展，现有的 AMD EPYC 有，sha256 显示 Intel 那台慢约 5 倍，实际单核只慢约 2 倍。反过来也会错：另一台同为 EPYC 的候选机，sha256 和现有 runner 只差约 4%，Python 循环却慢 15–25%。所以每台用自己的 preflight 结果当基线；换机、换规格，或者 `lscpu` 显示的 CPU 型号变了，都要重测。要比较两台机器的单核速度，用 02 章 2.7 的方法。
 
@@ -2161,7 +2210,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 1. 重启机器。
    - 原因：needrestart 已经豁免了 runner（4.2 节），安全更新装上了，但 runner 还在用旧库；内核更新更是必须重启才生效。参考机上线 5 周没重启过，期间来过 3 个新内核（自动只保留最新一个）和一次 libc6，全都没生效。
    - 做法：先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job。`live-restore` 与 `Restart=always` 会让一切自己恢复。有多台机器时一次只重启一台，这台回来、`verify.sh` 通过、GitHub 上显示 online 之后再动下一台（8.7）。
-   - 确认：恢复后跑 `verify.sh`。
+   - 确认：恢复后跑 `verify.sh`，再看一眼 `lscpu` 的 CPU 型号。有的云上关机再开或者被厂商迁移后会换宿主机，型号变了按 10 章 10.7 重测。
    - 旧内核不用手动删。Ubuntu 会把重启前在用的那个内核保留作回退，`apt autoremove` 这时不会删它，等下次装新内核时才会标记为可删除。参考机 2026-10-16 重启后就是这样。
 2. 退役旧镜像。workflow 换了 pin 之后，旧版本不会被自动删除（钩子只删悬空的和打了 CI 标签的）：
    ```bash
@@ -2188,7 +2237,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 
 #### 加一台机器
 
-1. 选机。规格按 10 章定。拿到机器后按 03 章 3.0 用 `machine-check.sh` 测单核速度，拿现有 runner 的分数当 `REF`，不合格就删掉重开。
+1. 选机。规格按 10 章定。拿到机器后按 03 章 3.0 用 `machine-check.sh` 测单核速度，拿现有 runner 的分数当 `REF`，不合格就换一台（按月计费的先看 02 章 2.9）。
 2. 第一次跑 bootstrap 加 `--skip-runner`，带上这台自己的 `RUNNER_NAME` 和其余参数，只装机、不注册。
 3. 以 runner 用户回放最慢的 job，按 02 章 2.7 核对超时余量。
 4. 确认老机器上的脚本是当前版本。早期版本的 ci-health 按整个 run 统计连续失败，几台共用标签时会互相报警；早期的 verify.sh 只按名字查 GitHub 侧状态，本机注册被同名顶掉时查不出来。老机器先按下面「更新已部署的机器」更新。
@@ -2262,7 +2311,7 @@ sed "s#__RUNNER_SVC__#<runner 服务>#" scripts/ci-health.sh > /usr/local/bin/ci
 - B. 判断方法上的错误：换个环境还会以别的形式出现，比 A 更值得读。
 - C. 有争议、未采纳的建议，以及不采纳的数据依据。
 
-文中的日期和数字都来自参考项目。
+文中的日期和数字都来自参考项目。参考项目的机器开在 Hetzner Cloud 上，和厂商有关的几条（A8、A19、A20、A21）注明了换厂商时怎么看，各厂商的差别汇总在 02 章 2.9。
 
 ---
 
@@ -2353,7 +2402,7 @@ Docker 29 的镜像数据在 `/var/lib/containerd`，只量 `/var/lib/docker` �
 
 #### A8. `sshd_config.d` 是「首次出现者胜」
 
-`sshd_config.d` 里同一个配置项以最先出现的为准，所以加固文件名必须排在 cloud-init 写的 `50-cloud-init.conf` 之前。后者里面是 `PasswordAuthentication yes`。
+`sshd_config.d` 里同一个配置项以最先出现的为准，所以加固文件名必须排在 cloud-init 写的 `50-cloud-init.conf` 之前。参考项目的机器上，后者里面是 `PasswordAuthentication yes`。这个文件有没有、里面写什么看厂商，以 `sshd -T` 的输出为准。
 
 做法：加固文件用 `00-` 前缀。
 
@@ -2522,23 +2571,23 @@ bootstrap 注册时带 `--replace`，方便在同一台机器上重新注册。�
 
 常驻机器上工作区跨 job 复用，下一个 job 的 checkout 要先清掉上一次留下的文件。CI 容器往挂进去的工作区写文件时，文件属主是容器里进程的 uid。很多镜像里的普通用户是 uid 1000，比如 node 官方镜像自带的 `node` 用户（这个镜像默认以 root 运行，要在 workflow 里用 `--user` 切过去）。runner 也是 1000 时，这些文件归它，下一次 checkout 删得掉。runner 是别的 uid 时，清理会报 `EACCES`，job 在 checkout 这一步就失败。
 
-参考项目第一台的 runner 恰好是 1000，因为它是机器上第一个普通用户。如果先建了开发用户，runner 就会拿到 1001。
+参考项目第一台的 runner 恰好是 1000，因为它是机器上第一个普通用户（参考项目所用厂商的镜像只有 root，没有自带普通用户）。如果先建了开发用户，runner 就会拿到 1001。
 
-做法：装机时先建 runner 用户，uid 固定为 1000（bootstrap 的 `RUNNER_UID`，默认 1000，被占用时报错退出），再建其他普通用户，多台机器保持一致（03 章 3.3）。有的云镜像自带 uid 1000 的用户，比如 AWS Ubuntu 镜像里的 `ubuntu`，要先处理掉它。
+做法：装机时先建 runner 用户，uid 固定为 1000（bootstrap 的 `RUNNER_UID`，默认 1000，被占用时报错退出），再建其他普通用户，多台机器保持一致（03 章 3.3）。有的云镜像自带 uid 1000 的用户，比如 AWS Ubuntu 镜像里的 `ubuntu`。它常常是唯一能 SSH 登录的账号，不能直接删，处理办法见 03 章 3.3。
 
-#### A20. 共享 vCPU 的云上，同一个套餐开出来的 CPU 型号不一样
+#### A20. 同一个套餐开出来的 CPU 型号可能不一样（参考项目：Hetzner Cloud 共享 vCPU）
 
-共享 vCPU 机型的 CPU 型号由分到的宿主机决定，下单时选不了。参考项目找第二台机器时，同一个套餐先后开到两台 Intel Skylake，`machine-check.sh` 的单核分数是 4.2–4.7（分数是耗时，越大越慢），现有 runner（AMD EPYC-Rome）在跑 CI 时测的约 2.5，比值 1.7–1.9。后来开到一台同为 EPYC-Rome 的 8 核机器，型号和现有 runner 一样，真实的单核算法测试仍慢 23%。
+参考项目用的 Hetzner Cloud 共享 vCPU 机型，CPU 型号由分到的宿主机决定，下单时选不了。别的厂商有的规格族固定 CPU 代际，有的能指定最低 CPU 平台，看厂商文档；不管哪种，拿到机器都要实测。参考项目找第二台机器时，同一个套餐先后开到两台 Intel Skylake，`machine-check.sh` 的单核分数是 4.2–4.7（分数是耗时，越大越慢），现有 runner（AMD EPYC-Rome）在跑 CI 时测的约 2.5，比值 1.7–1.9。后来开到一台同为 EPYC-Rome 的 8 核机器，型号和现有 runner 一样，真实的单核算法测试仍慢 23%。
 
 单核慢主要影响被限制在单核上跑的 job（比如测试容器只给 1 个 CPU）、单线程的类型检查和 lint，以及带固定超时的测试。核数多也补不回来。
 
-做法：拿到机器先用 `machine-check.sh` 和现有 runner 比（03 章 3.0），不合格就删掉重开。合格的也要回放最慢的 job、核对超时余量，再注册（02 章 2.7）。
+做法：拿到机器先用 `machine-check.sh` 和现有 runner 比（03 章 3.0），不合格就换一台，按月计费时怎么办见 02 章 2.7 和 2.9。合格的也要回放最慢的 job、核对超时余量，再注册（02 章 2.7）。
 
 #### A21. 新机器 root 用口令 SSH 登不上，口令是对的
 
-Ubuntu 24.04 的 sshd 默认是 `PermitRootLogin prohibit-password`，root 只能用公钥登录。云厂商发来的 root 口令是对的，登录时也提示可以输口令，root 用口令登录照样被拒。cloud-init 写的 `PasswordAuthentication yes` 只打开了口令认证，root 能不能用口令登录由 `PermitRootLogin` 单独决定。参考项目在 Hetzner 上遇到过。
+Ubuntu、Debian 的 sshd 默认是 `PermitRootLogin prohibit-password`（OpenSSH 7.0 起的上游默认值）。镜像保留这个默认值时，root 只能用公钥登录。有的厂商建机时如果没选公钥，会生成一个 root 口令发给你，登录时也提示可以输口令，这时 root 用口令登录照样被拒。也有厂商会把 `PermitRootLogin` 改成 yes，root 用口令能登上去。实际生效的值看 `sshd -T | grep permitrootlogin`。cloud-init 写进去的 `PasswordAuthentication yes`（有的厂商会写）只打开了口令认证，root 能不能用口令登录由 `PermitRootLogin` 单独决定。参考项目在 Hetzner Cloud 上遇到过。另一些厂商根本不给 root 口令，只建一个默认用户、注入你的公钥。
 
-做法：建机器时就填上 SSH 公钥。忘了填的，用云控制台的网页终端以口令登录，把公钥写进 `/root/.ssh/authorized_keys`（03 章 3.0）。
+做法：建机器时就填上 SSH 公钥。忘了填的，用厂商的带外入口（控制台网页终端、串口控制台，裸金属用 IPMI 或救援系统）登录，把公钥写进要登录的那个用户的 `~/.ssh/authorized_keys`（03 章 3.0）。
 
 ---
 
@@ -2827,7 +2876,7 @@ verify.sh 查 GitHub 侧状态时，原来用的是 `curl -H "Authorization: Bea
 
 - 把 4 个 job 合并成 1 个：三个独立方案都这么建议，论证也对（只有一个 runner 时，job 只排队不并行）。但仿真显示，它带来的排队改善与「修 Dockerfile 层序 + 去 cache」等效（11.7 vs 11.2 分钟），而后者不动一行文档，也不破坏回退时的并行。在提速之上再合并，只多省 2.2–2.6 分钟，不值 10 处文档改动。
 - `docker image prune` 是清理主力：实测回收 0 MB。Docker 29 重打同名 tag 不留悬空镜像。原文接着说「主力是 `buildx prune`」，这半句也错了，见 B13：workflow 挂 tmpfs 之前，持续负载下一直在回收的是 `volume prune`；缓存上限靠 GC。
-- metadata 泄露 root 口令 = 阻塞项：机制属实，但把口令与 `/etc/shadow` 的 hash 逐位比对后不匹配，是陈旧凭据，因此降级为「高」。判定「凭据泄露」之前，先验证那个凭据还有效。
+- metadata 泄露 root 口令 = 阻塞项：机制属实，但把口令与 `/etc/shadow` 的 hash 逐位比对后不匹配，是陈旧凭据，因此降级为「高」。判定「凭据泄露」之前，先验证那个凭据还有效。这个降级只对参考项目所用厂商的 metadata 成立。metadata 里有什么因厂商而异，实例绑了云账号的角色或服务账号时，metadata 发的是能直接调云 API 的临时凭据，不能这样降级（04 章 4.5）。
 - 零下载的 `docker build` 也扣 Docker Hub 配额：试着复现，没能复现（6 次操作计数一格未动）。记录在案，但不采纳。
 
 ---
@@ -2836,7 +2885,7 @@ verify.sh 查 GitHub 侧状态时，原来用的是 `curl -H "Authorization: Bea
 
 本章回答两个问题：一台机器跑几个 runner 实例；装机时和规格有关的几个参数（`RUNNER_MEM_MAX`、`RUNNER_OOM_ADJ`、BuildKit 的三个值、磁盘告警阈值）按这台机器的核数、内存和盘怎么取。
 
-做法是先在机器上量几个数，再套公式。文中的推荐值按参考项目的 job 算，你的 job 不一样，结果也会不一样，量法和公式是通用的。
+做法是先在机器上量几个数，再套公式。文中的推荐值按参考项目的 job 算，你的 job 不一样，结果也会不一样，量法和公式是通用的，不挑云厂商，裸金属也一样。
 
 本章用两个记号：
 
@@ -2851,8 +2900,8 @@ verify.sh 查 GitHub 侧状态时，原来用的是 `curl -H "Authorization: Bea
 
 | 记号 | 是什么 | 怎么量 | 参考项目 |
 |---|---|---|---|
-| T | 总内存，系统里看到的 MemTotal，比厂商标的数小一点 | `grep MemTotal /proc/meminfo` | 约 7.6 GiB（标 8 GB） |
-| S | 系统自己占的内存：没有 job、没有开发会话时，T 减去可用内存 | 空闲时执行 `free -m`，T 减去 available 那一列 | 约 0.5 GiB（估算） |
+| T | 总内存，系统里看到的 MemTotal，比厂商标的数小一点。差多少各厂商不同（有的标 GB，有的标 GiB，内核还会预留一部分），一律用自己机器的 MemTotal | `grep MemTotal /proc/meminfo` | 约 7.6 GiB（标 8 GB） |
+| S | 系统自己占的内存：没有 job、没有开发会话时，T 减去可用内存。镜像里预装的厂商监控、安全代理也算在这里 | 空闲时执行 `free -m`，T 减去 available 那一列 | 约 0.5 GiB（估算） |
 | J | 一个 job 的整机峰值：最重的 job 让整机可用内存少了多少，含它起的容器、tmpfs 和 docker build | sysmon.sh，见下文 | 取 6 GiB |
 | C | 一个 job 用几个核：最重的 job 运行时平均忙几个核，向上取整 | step.sh 或 sysmon.sh，见下文 | 约 3.7 核，取 4 |
 | P | runner 进程树的峰值，不含容器，用来定 `RUNNER_MEM_MAX` | step.sh，或者读 memory.stat，见下文 | 约 3.7 GB |
@@ -2978,7 +3027,7 @@ k = min(k_mem, k_cpu)
 
 有 swap 时，T 按内存加 swap 算。单个 CI 进程最多涨到它所在实例的 `RUNNER_MEM_MAX`，所以 k 大于 1 时这个式子照样成立。
 
-`RUNNER_MEM_MAX=6G` 时各档的取值：
+`RUNNER_MEM_MAX=6G` 时各档的取值。表里「系统里看到的内存」是按参考项目所用厂商（Hetzner Cloud）的机器给的 MemTotal，别的厂商同一档可能差几百 MiB，用你自己机器的值代进式子：
 
 | 机器 | 系统里看到的内存 | 式子给的上限 | 有开发工具时取 | 只跑 CI 时取 |
 |---|---|---|---|---|
@@ -2992,9 +3041,11 @@ k = min(k_mem, k_cpu)
 
 #### 开发工具的上限和 swap
 
-开发工具里吃内存的命令行工具，按 04 章 4.8 用 `systemd-run` 套上限。上限不超过全量 CI 期间整机最低可用内存减 0.3 GiB：参考项目 8 GB 的机器上最低可用约 1.3 GiB，所以取 1G；16 GB 的机器可以给到 2G。
+开发工具里吃内存的命令行工具，按 04 章 4.8 用 `systemd-run` 套上限。上限不超过全量 CI 期间整机最低可用内存减 0.3 GiB。参考项目 8 GB 的机器上最低可用约 1.3 GiB，所以取 1G；按参考项目的 job 推算，16 GB 的机器可以给到 2G。你的机器用自己量到的最低可用内存来定。
 
-CI 机默认不开 swap。内存一超直接 OOM kill，job 很快失败，比换页拖到超时好查（02 章 2.2）。机器上有开发工具时，可以考虑加 2–4 GB swap，让开发工具闲着的内存换出去，同时给 runner 单元加 `MemorySwapMax=0`，让 CI 自己不用 swap。bootstrap 不写这一项，要手动加 drop-in。这个组合参考项目没有实测过，用之前先在空闲时验证。加了 swap 以后，上面式子里的 T 要按内存加 swap 重算。
+CI 机建议不开 swap。内存一超直接 OOM kill，job 很快失败，比换页拖到超时好查（02 章 2.2）。有没有 swap 要先看一眼：云镜像多数默认不带；用发行版安装盘装的系统（裸金属常见）通常默认带 swap 分区或 swap 文件。用 `swapon --show` 查，不想要就 `swapoff -a`，再注释掉 /etc/fstab 里对应的那一行。
+
+机器上有开发工具时，可以考虑加 2–4 GB swap，让开发工具闲着的内存换出去，同时给 runner 单元加 `MemorySwapMax=0`，让 CI 自己不用 swap。bootstrap 不写这一项，要手动加 drop-in。这个组合参考项目没有实测过，用之前先在空闲时验证。不管是自己加的还是系统默认带的，有 swap 时上面式子里的 T 都按内存加 swap 算。
 
 ### 10.4 BuildKit 与磁盘阈值
 
@@ -3027,7 +3078,7 @@ CI_DISK_WARN_MB = Min Free 换算成 MiB + 1024                    bootstrap 按
 CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认 10240，要改就显式传
 ```
 
-按盘大小查（W = 20 GB，F = 25 GB，k = 1）：
+按盘大小查（W = 20 GB，F = 25 GB，k = 1）。表里的盘总量指 Docker 数据所在的那块盘。有的厂商默认系统盘只有几十 GB 甚至更小，建机时改大，或者另挂数据盘放 Docker。脚本按 Docker 数据在根分区上写，分开放的见 02 章 2.9 表下的说明。
 
 | 盘总量 | Reserved | Max Used | Min Free | CI_DISK_WARN_MB | 说明 |
 |---|---|---|---|---|---|
@@ -3059,7 +3110,9 @@ CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认
 表下说明：
 
 - 「资源上的 k」大于 1 只说明资源够。「现在部署」是现有脚本能做到的数。
-- 开发工具里的命令行工具，8 GB 的机器上限取 1G，16 GB 及以上可以给到 2G（10.3）。
+- 表里只列了 CPU 和内存 1:2 的规格，括号里的 GiB 也是按 Hetzner Cloud 的机器给的 MemTotal。别的配比（比如 1:4）和别的厂商，按 10.2 用自己机器的数重算。
+- 「核」指系统里看到的 vCPU 数（`nproc`）。有的厂商一个 vCPU 是一个超线程，同样标 4 核，物理核可能只有一半，C 要在这台机器上重量（02 章 2.9）。
+- 开发工具里的命令行工具，按参考项目的 job，8 GB 的机器上限取 1G，16 GB 及以上可以给到 2G。你的机器按 10.3 用自己量到的最低可用内存定。
 - 盘按 10.4 的表另外查。
 - job 轻的项目（单 job 整机峰值不超过 2 GiB、用核不超过 2、不跑 docker build）按同样的公式重算：2 核 / 4 GB 能跑 1 个，4 核 / 8 GB 资源上够跑 2 个。
 
@@ -3138,7 +3191,7 @@ CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认
 | 容器撞上自己的上限 | 内核日志里 `oom_memcg=` 指向 `docker-<id>.scope` 的记录 | 没有 | 容器自己的 `--memory` 设小了。这归 workflow 管，和机器规格无关 |
 | `mem_avail` | `ci-health.log`，每小时一个快照 | k 个 job 在跑时也不低于 10.2 的余量 max(1 GiB, T × 10%) | 快照只记整点那一刻，通常比真实的最低值高，所以快照里出现低值就要查 |
 | `mem_peak` | `ci-health.log`，runner 进程树自上次启动以来的峰值 | 含页缓存，接近 `RUNNER_MEM_MAX` 不一定有问题 | 以 `memory.events` 的 `oom_kill` 为准 |
-| `fixedwork` | `ci-health.log`，定长任务耗时 | 不超过基线的 1.4 倍 | 邻居在抢核（08 章 8.3）；k 大于 1 时也可能是自己的 job 占满了核，说明 k 定大了 |
+| `fixedwork` | `ci-health.log`，定长任务耗时 | 不超过基线的 1.4 倍 | 邻居在抢核，或者突发性能规格的 CPU 积分用完了（08 章 8.3）；k 大于 1 时也可能是自己的 job 占满了核，说明 k 定大了 |
 | `root_avail`、`containerd`、`volumes` | `ci-health.log`（08 章 8.2） | `containerd` 涨到 Max Used 加镜像后停住；`volumes` 接近 0 | 见 08 章 8.2 |
 | job 耗时 | 02 章 2.7 的 gh 查询 | 每个 job 都满足超时余量 | 先查 R 是不是变了 |
 
@@ -3148,7 +3201,7 @@ CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认
 - 测试框架或打包工具的 worker 数改了；
 - 机器上开始有人开发，或者不再有人开发；
 - 换盘、扩盘，或者按 08 章 8.4 修完 Dockerfile 后 W 变了；
-- 重启或迁移后，`lscpu` 显示的 CPU 型号变了。这时 preflight 基线和单核分数也要重测（08 章 8.3）；
+- 重启或迁移后，`lscpu` 显示的 CPU 型号变了（有的云上关机再开或厂商迁移会换宿主机）。这时 preflight 基线和单核分数也要重测（08 章 8.3）；
 - 排队等待的 p90 超过了单个 run 的时长（08 章 8.5）。
 
 每月巡检（08 章 8.6）时顺便核对一次：`/etc/ci-runner.env` 里的参数，和按本章公式算出来的值是否还一致。
@@ -3160,6 +3213,7 @@ CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认
 | 脚本 | 作用 |
 |---|---|
 | `scripts/machine-check.sh` | 新机器一分钟测硬件和单核速度，和现有 runner 比，判合格 / 有保留 / 不合格。只读，只要 python3 |
+| `scripts/hetzner-pick.py` | 只适用于 Hetzner Cloud：自动开机、跑 machine-check，不合格就删掉，随机等几分钟再开，直到开到合格的。只删自己开的机器。别的厂商照 02 章 2.7 第 2 步的三条规则自己写 |
 | `scripts/preflight.sh` | 候选机自检：硬件下限、端口、时间同步、网络、CPU 争抢，输出 GO / NO-GO。只读 |
 | `scripts/bootstrap.sh` | 装机、注册、加固，可以重复跑。`--harden-ssh` 才改 SSH，`--skip-runner` 跳过注册 |
 | `scripts/verify.sh` | 装完或重启后自检，输出 PASS / FAIL 表。会试跑一次清理钩子，有 job 在跑时这一项自动跳过 |
@@ -3177,16 +3231,17 @@ CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认
 | `bootstrap.sh` 在已配置的机器上重跑 | 第一台完整重跑（2026-09） | 通过，退出码 0，12 项关键状态逐字节相同 |
 | `bootstrap.sh` 从零安装工具链 | 干净的 `ubuntu:24.04` 容器 | 通过，docker、node、gh、psmisc 都能从零装上 |
 | `bootstrap.sh --skip-runner` 从零安装 | 全新的 Ubuntu 24.04 云主机 | 2026-10-19 第一次跑出几处问题（09 章 A15–A17），已修；修复后 10-19 和 10-25 各跑通一次，退出码 0 |
-| 全新机器上的注册和 `verify.sh` | 需要真实 token 和真实仓库 | 修复后还没在全新机器上完整跑过，第一次注册时请盯着输出 |
-| `machine-check.sh` | 在现有 runner 和两台 Intel Skylake 候选机上实跑 | 两台候选机耗时是现有 runner 的 1.7–1.9 倍，判为不合格 |
+| 全新机器上的注册和 `verify.sh` | 第二台 runner（全新 Ubuntu 24.04，2026-10-25） | 注册后立刻接到排队的 job；`verify.sh` 33 PASS，0 FAIL |
+| `machine-check.sh` | 在现有 runner 和三台候选机上实跑 | 两台 Intel Skylake 是现有 runner 的 1.7–1.9 倍，判不合格；一台 AMD EPYC-Rome 1.16 倍，判合格 |
+| `hetzner-pick.py` | 模拟的 Hetzner API 加一台真机（真实 SSH 和验机） | 合格停止、不合格删除、机房开不出来时换机房、随机等待、Ctrl-C / SIGTERM / SIGHUP 时清理，都按预期 |
 | `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
 | `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 
-上表的实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
+上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 
 ## 附：手册没覆盖、需要你自己做的三件事
 
-1. 配云防火墙。只能在云厂商控制台配。Docker 自己加的 DNAT 规则会绕过宿主机的 ufw，能挡住它的只有这一层。
-2. 撤销注册用的 PAT。注册 runner 用的 registration token 是一次性的，但用来换取它的那个 PAT 不是，用完要撤销。
+1. 配入方向的防火墙（04 章 4.7）。云上用厂商的云防火墙或安全组，在控制台或厂商的 API 里配，bootstrap 管不到。Docker 会自己写 DNAT 规则，绕过宿主机的 ufw，所以只开 ufw 不够。厂商没有云防火墙、或者用的是裸金属时，按 04 章 4.7「没有云防火墙时」做。
+2. 撤销注册用的 PAT（03 章 3.4）。注册 runner 用的 registration token 是一次性的，但用来换取它的那个 PAT 不是，用完要撤销。
 3. 配心跳告警（06 章 6.4 ①）。bootstrap 不装它。机器宕机或断网时 ci-health 也跟着停了，只有外部的心跳服务能发现。有几台机器就建几个检查。

@@ -13,11 +13,11 @@
 
 # 自建 GitHub Actions CI runner 部署手册
 
-这份手册的用途：换服务器或加服务器时不必重新调研一遍。用脚本验机、装机、自检，按 05 章改一遍 workflow，再对一遍验收表就能到位。
+这份手册的用途：换服务器、换厂商或加服务器时不必重新调研一遍。用脚本验机、装机、自检，按 05 章改一遍 workflow，再对一遍验收表就能到位。
 
-它是一套通用做法，覆盖选机、按机器规格定参数、装机、改 workflow、接线、验证和运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。
+它是一套通用做法，覆盖选机、按机器规格定参数、装机、改 workflow、接线、验证和运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。做法不绑定厂商，云主机和裸金属都适用。换厂商时要核对的事（CPU 型号是否固定、登录方式、metadata 地址、防火墙在哪配、计费粒度等）见 [02 章 2.9](02-选机与验收.md)。
 
-- 文中的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在一台 4 核、约 7.6 GiB 内存的 Hetzner 机器上。准备加第二台时又试过几台候选机（02 章 2.7）。没有特别说明时，数字指第一台。
+- 文中的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在 Hetzner Cloud 一台 4 核、约 7.6 GiB 内存的共享 vCPU 云主机上。准备加第二台时又在同一家试过几台候选机（02 章 2.7）。没有特别说明时，数字指第一台。
 - 引用实测值的地方都标了「参考项目」。这些数字是例子，不是要求。你的机器该跑几个实例、参数怎么取，按 10 章的公式算。
 
 ---
@@ -37,7 +37,7 @@ REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一�
 #    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
 #    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
 GH_REPO=owner/repo \
-RUNNER_NAME=ci-$(hostname -s) \
+RUNNER_NAME=<每台不同，比如 ci-1> \
 RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
 CI_LABEL=com.myorg.ci=1 \
 CI_APP_PORTS="<CI 在宿主上监听的端口，空格分隔，没有就留空>" \
@@ -84,7 +84,7 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 ## 手册里没有、但你必须自己做的三件事
 
 > [!WARNING]
-> 1. 配云防火墙（04 章 4.7）。这一步只能在云厂商控制台里配。Docker 会自己写 DNAT 规则，绕过宿主机的 ufw。能挡住这类流量的只有云防火墙这一层。
+> 1. 配入方向的防火墙（04 章 4.7）。云上用厂商的云防火墙或安全组，在控制台或厂商的 API 里配，bootstrap 管不到。Docker 会自己写 DNAT 规则，绕过宿主机的 ufw，所以只开 ufw 不够。厂商没有云防火墙、或者用的是裸金属时，按 04 章 4.7「没有云防火墙时」做。
 > 2. 撤销注册用的 PAT（03 章 3.4）。registration token 是一次性的，但用来换取它的 PAT 不是，用完要撤销。
 > 3. 配心跳告警（06 章 6.4 ①）。bootstrap 不装它。机器宕机或断网时 ci-health 也跟着停了，只有外部的心跳服务能发现。有几台机器就建几个检查。
 
@@ -127,9 +127,9 @@ flowchart LR
 | 章 | 内容 | 什么时候读 |
 |---|---|---|
 | [01 决策](01-决策.md) | 自建到底值不值；什么时候不该做 | 立项前 |
-| [02 选机与验收](02-选机与验收.md) | 怎么判一台机器够不够；四条连通性阈值；steal 可能测不了；单核速度和超时余量 | 买机器前 |
+| [02 选机与验收](02-选机与验收.md) | 怎么判一台机器够不够；四条连通性阈值；steal 可能测不了；单核速度和超时余量；换云厂商时要核对的事 | 买机器前、换厂商前 |
 | [03 装机与注册](03-装机与注册.md) | 装机前的准备；工具链、runner 用户和 uid、注册；为什么不要 `--ephemeral` | 装机时 |
-| [04 加固](04-加固.md) | Docker / systemd / OOM 优先级 / 清理 / metadata / SSH / 云防火墙；机器上还要开发时怎么配 | 装机时 |
+| [04 加固](04-加固.md) | Docker / systemd / OOM 优先级 / 清理 / metadata / SSH / 入方向防火墙；机器上还要开发时怎么配 | 装机时 |
 | [05 workflow 改造](05-workflow改造.md) | 十三条会坏掉的托管假设，每条给自查命令与改法 | 必读，且要逐条过 |
 | [06 接线与回退](06-接线与回退.md) | 开关的正确形状与失败形态；哨兵怎么配才付得起 | 接线时 |
 | [07 验证](07-验证.md) | 机器侧自检 + 必须用真实 PR 验的四件事 + 重启演练 + 加机器的验收清单 | 接线后、加机器后 |
@@ -151,7 +151,7 @@ flowchart LR
 | 脚本 | 用途 | 幂等 |
 |---|---|---|
 | `scripts/machine-check.sh` | 新机器一分钟测硬件和单核速度，和现有 runner 比，判合格 / 有保留 / 不合格。只要 python3 | 只读 |
-| `scripts/hetzner-pick.py` | 在 Hetzner Cloud 上自动开机、跑 machine-check，不合格就删掉，随机等几分钟再开，直到开到合格的 | 只删自己开的机器 |
+| `scripts/hetzner-pick.py` | 只适用于 Hetzner Cloud：自动开机、跑 machine-check，不合格就删掉，随机等几分钟再开，直到开到合格的 | 只删自己开的机器 |
 | `scripts/preflight.sh` | 候选机自检：硬件下限、端口、时间同步、网络、CPU 争抢，输出 GO/NO-GO | 只读 |
 | `scripts/bootstrap.sh` | 装机 + 注册 + 加固 | 是 |
 | `scripts/verify.sh` | 装完或重启后自检，输出 PASS/FAIL 表 | 基本只读，见下 |
@@ -178,7 +178,7 @@ flowchart LR
   python3 scripts/hetzner-pick.py --type <机型> --keys "<自己的钥匙名>,<还要装的钥匙名>" --ref <参考分数>
   ```
 
-  合格就停，服务器打上标签 `ci-check=pass`；不合格的当场删掉，随机等 2–7 分钟、优先换个机房再开，默认最多 8 台。只删本次自己开的、带 `created-by=hetzner-pick` 标签的服务器，Ctrl-C、关掉终端也会先删掉正在测的那台。
+  合格就停，服务器打上标签 `ci-check=pass`；不合格的当场删掉，随机等 2–7 分钟、优先换个机房再开，默认最多 8 台。只删本次自己开的、带 `created-by=hetzner-pick` 标签的服务器，Ctrl-C、关掉终端也会先删掉正在测的那台。它只适用于 Hetzner Cloud，别的厂商用它的 CLI 或 API 照同样的三条规则写，见 02 章 2.7 第 2 步和 2.9。
 - `bootstrap.sh`：加 `--harden-ssh` 才会改 SSH 配置；加 `--skip-runner` 跳过 runner 注册，新机器建议先这样跑一次（03 章 3.0）。参数会存到 `/etc/ci-runner.env`，在已部署的机器上重跑时不用再传。有 job 在运行时它会拒绝执行，但只在开头查一次，所以在接 job 的机器上重跑前先停 runner 服务（08 章 8.7）。
 - `verify.sh`：基本只读。它会试跑一次清理钩子，有 job 在跑时自动跳过这次试跑。
 - 现在的脚本一台机器只装一个 runner 实例：bootstrap 和 verify 只认第一个 `actions.runner.*` 单元，清理钩子按整台机器清。同机多实例的前提见 10 章 10.6。
@@ -197,7 +197,7 @@ flowchart LR
 | `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS / 0 FAIL |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 
-上表的实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
+上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 
 <details>
 <summary><b>各项细节</b></summary>
@@ -219,7 +219,7 @@ flowchart LR
 </details>
 
 > [!CAUTION]
-> 2026-10-25 这一轮修订加的东西（等 apt 锁、检查架构、`RUNNER_UID`、注册前查同名、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数）只做过函数级测试，还没在机器上整体跑过。用它装下一台机器时请盯着输出。换云厂商或换发行版版本时也一样。
+> 2026-10-25 这一轮修订加的东西（等 apt 锁、检查架构、`RUNNER_UID`、注册前查同名、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数）只做过函数级测试，还没在机器上整体跑过。用它装下一台机器时请盯着输出。换云厂商或换发行版版本时也一样，换厂商前先对一遍 02 章 2.9。
 
 ---
 
@@ -233,4 +233,4 @@ flowchart LR
 - 手册里引用结论的地方都直接给了数字和测法，一般不需要回溯原始台账。
 
 > [!NOTE]
-> 标「参考项目」的地方都是举例：一个小团队的 pnpm monorepo。没有特别说明时，数字来自它的第一台 runner（4 核、约 7.6 GiB 内存、75 GB 盘）。你的数字会不同，但测法是通用的。
+> 标「参考项目」的地方都是举例：一个小团队的 pnpm monorepo。没有特别说明时，数字来自它的第一台 runner（Hetzner Cloud 共享 vCPU，4 核、约 7.6 GiB 内存、75 GB 盘）。你的数字会不同，但测法是通用的。

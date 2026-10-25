@@ -29,8 +29,8 @@ cat <<'HEAD'
 > 这份文件由仓库里的分章文件自动拼成，用 `bash scripts/make-single.sh` 重新生成。
 > 要改内容请改分章文件，不要改这一份，否则两个版本会对不上。
 >
-> 手册讲一套通用做法：怎么选机器、按规格怎么定参数、怎么装、怎么改 workflow、怎么接线、怎么验证、怎么运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。
-> 里面的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在一台 4 核、约 7.6 GiB 内存的机器上。没有特别说明时，数字指这一台。
+> 手册讲一套通用做法：怎么选机器、按规格怎么定参数、怎么装、怎么改 workflow、怎么接线、怎么验证、怎么运维。脚本面向 x86_64 的 Ubuntu（测过 24.04）。做法不绑定厂商，云主机和裸金属都适用。换厂商时要核对的事（CPU 型号是否固定、登录方式、metadata 地址、防火墙在哪配、计费粒度等）见 02 章 2.9。
+> 里面的实测数字来自参考项目：一个 pnpm monorepo 的 CI，跑在 Hetzner Cloud 一台 4 核、约 7.6 GiB 内存的共享 vCPU 云主机上。准备加第二台时又在同一家试过几台候选机（02 章 2.7）。没有特别说明时，数字指第一台。
 > 写着「参考项目」的地方是举例，不是要求。你的机器该跑几个实例、参数怎么取，按 10 章的公式算。
 
 ---
@@ -48,7 +48,7 @@ REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一�
 #    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
 #    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
 GH_REPO=owner/repo \
-RUNNER_NAME=ci-$(hostname -s) \
+RUNNER_NAME=<每台不同，比如 ci-1> \
 RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
 CI_LABEL=com.myorg.ci=1 \
 CI_APP_PORTS="<CI 在宿主上监听的端口，空格分隔，没有就留空>" \
@@ -116,6 +116,7 @@ cat <<'TAIL'
 | 脚本 | 作用 |
 |---|---|
 | `scripts/machine-check.sh` | 新机器一分钟测硬件和单核速度，和现有 runner 比，判合格 / 有保留 / 不合格。只读，只要 python3 |
+| `scripts/hetzner-pick.py` | 只适用于 Hetzner Cloud：自动开机、跑 machine-check，不合格就删掉，随机等几分钟再开，直到开到合格的。只删自己开的机器。别的厂商照 02 章 2.7 第 2 步的三条规则自己写 |
 | `scripts/preflight.sh` | 候选机自检：硬件下限、端口、时间同步、网络、CPU 争抢，输出 GO / NO-GO。只读 |
 | `scripts/bootstrap.sh` | 装机、注册、加固，可以重复跑。`--harden-ssh` 才改 SSH，`--skip-runner` 跳过注册 |
 | `scripts/verify.sh` | 装完或重启后自检，输出 PASS / FAIL 表。会试跑一次清理钩子，有 job 在跑时这一项自动跳过 |
@@ -133,18 +134,19 @@ cat <<'TAIL'
 | `bootstrap.sh` 在已配置的机器上重跑 | 第一台完整重跑（2026-09） | 通过，退出码 0，12 项关键状态逐字节相同 |
 | `bootstrap.sh` 从零安装工具链 | 干净的 `ubuntu:24.04` 容器 | 通过，docker、node、gh、psmisc 都能从零装上 |
 | `bootstrap.sh --skip-runner` 从零安装 | 全新的 Ubuntu 24.04 云主机 | 2026-10-19 第一次跑出几处问题（09 章 A15–A17），已修；修复后 10-19 和 10-25 各跑通一次，退出码 0 |
-| 全新机器上的注册和 `verify.sh` | 需要真实 token 和真实仓库 | 修复后还没在全新机器上完整跑过，第一次注册时请盯着输出 |
-| `machine-check.sh` | 在现有 runner 和两台 Intel Skylake 候选机上实跑 | 两台候选机耗时是现有 runner 的 1.7–1.9 倍，判为不合格 |
+| 全新机器上的注册和 `verify.sh` | 第二台 runner（全新 Ubuntu 24.04，2026-10-25） | 注册后立刻接到排队的 job；`verify.sh` 33 PASS，0 FAIL |
+| `machine-check.sh` | 在现有 runner 和三台候选机上实跑 | 两台 Intel Skylake 是现有 runner 的 1.7–1.9 倍，判不合格；一台 AMD EPYC-Rome 1.16 倍，判合格 |
+| `hetzner-pick.py` | 模拟的 Hetzner API 加一台真机（真实 SSH 和验机） | 合格停止、不合格删除、机房开不出来时换机房、随机等待、Ctrl-C / SIGTERM / SIGHUP 时清理，都按预期 |
 | `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
 | `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 
-上表的实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
+上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 
 ## 附：手册没覆盖、需要你自己做的三件事
 
-1. 配云防火墙。只能在云厂商控制台配。Docker 自己加的 DNAT 规则会绕过宿主机的 ufw，能挡住它的只有这一层。
-2. 撤销注册用的 PAT。注册 runner 用的 registration token 是一次性的，但用来换取它的那个 PAT 不是，用完要撤销。
+1. 配入方向的防火墙（04 章 4.7）。云上用厂商的云防火墙或安全组，在控制台或厂商的 API 里配，bootstrap 管不到。Docker 会自己写 DNAT 规则，绕过宿主机的 ufw，所以只开 ufw 不够。厂商没有云防火墙、或者用的是裸金属时，按 04 章 4.7「没有云防火墙时」做。
+2. 撤销注册用的 PAT（03 章 3.4）。注册 runner 用的 registration token 是一次性的，但用来换取它的那个 PAT 不是，用完要撤销。
 3. 配心跳告警（06 章 6.4 ①）。bootstrap 不装它。机器宕机或断网时 ci-health 也跟着停了，只有外部的心跳服务能发现。有几台机器就建几个检查。
 TAIL
 } > "$OUT"
