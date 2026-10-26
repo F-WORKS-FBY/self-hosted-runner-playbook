@@ -36,6 +36,8 @@ REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一�
 #    RUNNER_NAME 每台机器不同；标签所有机器相同
 #    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
 #    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
+#    CI 里有工具在 /tmp 下建临时目录、或者每次运行建一个唯一 tag 的镜像时，
+#    再加 CI_TMP_GLOBS、CI_PER_RUN_IMAGE_LABEL，job 被取消后钩子才清得掉（03 章 3.1）
 GH_REPO=owner/repo \
 RUNNER_NAME=<每台不同，比如 ci-1> \
 RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
@@ -194,8 +196,9 @@ flowchart LR
 | `machine-check.sh` | 在现有 runner 和三台候选机上实跑 | 两台 Intel Skylake 是现有 runner 的 1.7–1.9 倍，判不合格；一台 AMD EPYC-Rome 1.16 倍，判合格 |
 | `hetzner-pick.py` | 模拟的 Hetzner API 加一台真机（真实 SSH 和验机） | 合格停止、不合格删除、机房开不出来时换机房、随机等待、Ctrl-C / SIGTERM / SIGHUP 时清理，都按预期 |
 | `preflight.sh` | 第一台实跑 | 13 PASS / 2 WARN |
-| `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS / 0 FAIL |
+| `verify.sh` | 第一台实跑（2026-10-16 重启后；2026-10-26 部署新版后） | 34 PASS / 0 FAIL；37 PASS / 0 FAIL（当时有 job，2 项 SKIP） |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
+| `ci-cleanup.sh` 第 8 步（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里 24 项用例；第一台空闲时用真实镜像和 `/tmp` 目录实跑 | 通过：只删同时带两种标签的镜像和匹配的 runner 目录，对照对象、编译缓存、别的用户的同名目录都在 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 
@@ -215,6 +218,8 @@ flowchart LR
 - 第二台的注册：注册时有 28 个 job 在排队，runner 启动后马上接活。用的是本轮修订之前的 `bootstrap.sh`，启动顺序已经是修过的（加固、钩子、拦截就位后只启动一次）。
 - `preflight.sh`：各项与已知实测值吻合。两个 WARN 是 swap=0 和 steal 测不到。
 - `verify.sh`：实跑时抓出了脚本自身的两个 bug。
+- `ci-cleanup.sh` 第 8 步的容器用例：正常模式和 `*`、`.x`、`a/b`、`?*`、`[a-z]*` 混在一起时只删匹配的条目；符号链接只删链接本身；占位符没替换、参数留空时什么都不删；退出码都是 0。bootstrap 对两个新参数的字符校验另测了 8 项。
+- `ci-health.sh` 的新告警文案：用不含推送地址的临时配置试跑，三部分占用都列出来了，没有往群里推送。
 
 </details>
 

@@ -22,13 +22,19 @@
 #  ③ 磁盘阈值要跟 BuildKit GC 对齐。缓存会长到 GC 的 Max Used（bootstrap 默认 20 GiB）才停，
 #     参考机上这时可用空间稳定在约 23 GiB，这是设计稳态，不该告警。原来写死的 WARN<40G 于是从第 5 周起
 #     每小时都响（一个月 309 次，没有送达任何人）；CRIT<20000 MiB 又只比 GC 的 Min Free（20 GiB）低 480 MiB。
-#     现在 WARN = Min Free + 1 GiB：可用空间被 Docker 以外的增长挤到 Min Free 附近时，GC 开始为保底而驱逐缓存。
+#     现在 WARN = Min Free + 1 GiB：可用空间被别的东西挤到 Min Free 附近时，GC 开始为保底而驱逐缓存。
 #     CRIT = 10 GiB。按盘大小怎么取见 10 章 10.4。
 #  ④ 失败连续计数只看落在本机上的 job，按 runner 名匹配。原来统计全仓库的 run，GitHub 托管的 PR 标题检查
 #     之类的失败也算进来，2026-10-08 那次 CRIT 就是这么误报的。准备加第二台机器时又改了一次：几台共用一套标签，
 #     同一个 run 的 job 分在几台上，按 run 的结论算会互相背锅。读不到本机 runner 名时报错，不再退回统计全仓库。
 #  ⑤ 告警要送到人。只写本机 journal 等于没告警。配了 CI_ALERT_WEBHOOK 就推送（目前只实现了飞书自定义机器人），
 #     按告警集合的变化推送（新出现、全部恢复），持续存在的每 24 小时提醒一次。
+#
+# 2026-10-26 补的一条：
+#
+#  ⑥ 磁盘告警只报数，不替人下结论。原来的文案写的是「是 Docker 以外的东西在吃盘」，参考项目那次 CRIT
+#     查下来，可用空间少掉的部分七成在 containerd 里：被取消的 job 留下的镜像，BuildKit GC 管不到（09 章 B20）。
+#     现在告警带上 containerd、/tmp 和其余部分各占多少，采样行也多记一个 tmp=。
 set -uo pipefail
 LOG="${CI_HEALTH_LOG:-/var/log/ci-health.log}"
 SVC="__RUNNER_SVC__"                      # 由 bootstrap.sh 替换；--skip-runner 装的机器上是 none
@@ -86,6 +92,9 @@ PY
 )
 avail=$(df --output=avail -BM / 2>/dev/null | tail -1 | tr -dc 0-9)
 ctr=$(du -sBM /var/lib/containerd 2>/dev/null | cut -f1 | tr -dc 0-9)
+# /tmp 单独量：job 被取消时，程序自己建在 /tmp 下的临时目录不会被删（09 章 A22）
+tmpm=$(du -sxBM /tmp 2>/dev/null | cut -f1 | tr -dc 0-9)
+used=$(df --output=used -BM / 2>/dev/null | tail -1 | tr -dc 0-9)
 vol=$(du -sBM /var/lib/docker/volumes 2>/dev/null | cut -f1 | tr -dc 0-9)
 run="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && run=$(systemctl is-active "$SVC" 2>/dev/null)
 # 内存只记录不告警：runner cgroup 自上次启动以来的峰值（含页缓存，比进程实际占用高），以及整机可用内存
@@ -162,7 +171,7 @@ PY
   fi
 fi
 
-echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail}" >> "$LOG"
+echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M" >> "$LOG"
 
 # ── 告警 ────────────────────────────────────────────────────────────────
 # 每条告警一个稳定的 key，用于推送去重（数值每小时都在变，key 不变）。
@@ -171,10 +180,17 @@ warn(){ ALERTS+=("$1|$2"); echo "$(date -Is) $2" >> "$LOG"; logger -t ci-health 
 
 awk -v t="${t:-0}" -v b="$BASELINE_S" 'BEGIN{ if (b+0 > 0 && t+0 > b*1.4) exit 1 }' \
   || warn contention "WARN vCPU 争抢：定长任务 ${t}s（本机基线 ${BASELINE_S}s）"
+# 文案里给出各部分的占用，让人知道先看哪里。containerd 涨了不一定是 BuildKit 缓存（它有 GC 上限），
+# 更可能是 GC 管不到的镜像；/tmp 涨了多半是被取消的 job 留下的临时目录。排查顺序见 08 章 8.2。
+# 只减和根分区在同一个设备上的部分：/tmp 是 tmpfs、containerd 在单独的盘上时，它们不占根分区。
+rootdev=$(stat -c %d / 2>/dev/null); rest=${used:-0}; ctr_s="containerd ${ctr:-?}MB"; tmp_s="/tmp ${tmpm:-?}MB"
+if [ -n "$rootdev" ] && [ "$(stat -c %d /var/lib/containerd 2>/dev/null)" = "$rootdev" ]; then rest=$((rest - ${ctr:-0})); else ctr_s+="（不在根分区）"; fi
+if [ -n "$rootdev" ] && [ "$(stat -c %d /tmp 2>/dev/null)" = "$rootdev" ]; then rest=$((rest - ${tmpm:-0})); else tmp_s+="（不在根分区）"; fi
+disk_parts="${ctr_s}，${tmp_s}，根分区其余 ${rest}MB。先看 docker images 里有没有每次运行留下的镜像、du -sh /tmp/* 里有没有被取消的 job 留下的目录（08 章 8.2）"
 if [ "${avail:-999999}" -lt "$CRIT_MB" ]; then
-  warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB，已远低于 BuildKit GC 的 Min Free，GC 腾不出空间了，是 Docker 以外的东西在吃盘"
+  warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB，已远低于 BuildKit GC 的 Min Free，GC 腾不出空间了。${disk_parts}"
 elif [ "${avail:-999999}" -lt "$WARN_MB" ]; then
-  warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB，已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存；看看 Docker 以外是什么在涨"
+  warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB，已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存。${disk_parts}"
 fi
 [ -n "$CFG_ERR" ] && warn config "WARN 配置无效（应为 MiB 整数）：${CFG_ERR# }，已改用默认阈值"
 [ "$run" != "n/a" ] && [ "$run" != "active" ] && warn runner "CRIT runner 服务不是 active（当前 $run）"

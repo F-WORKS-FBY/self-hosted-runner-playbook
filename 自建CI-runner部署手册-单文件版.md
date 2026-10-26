@@ -488,6 +488,8 @@ unset GH_TOKEN
 | `RUNNER_OOM_ADJ` | runner 被内核 OOM 挑中的优先级。机器只跑 CI 用默认值。还开着开发工具、要它们先被杀时，取满足 (1000 − 本值) / 1000 × 总内存 > `RUNNER_MEM_MAX` 的值。原理见 04 章 4.3，各内存档的取值见 10 章 10.3 | `800`（只跑 CI）；约 7.6 GiB 的机器兼开发时 `200` |
 | `CI_APP_PORTS` | CI 在宿主上监听的端口，不填容器端口 | `3100 3101`（e2e 拉起的 API） |
 | `CI_LABEL` | 与 workflow 里 `docker run --label` 的值逐字一致 | `com.myorg.ci=1` |
+| `CI_PER_RUN_IMAGE_LABEL` | 每次运行用唯一 tag 建、之后不再用的镜像带的标签键。镜像同时带着 CI 标签时，钩子每次都删，不等 6 小时（05 章 ⑫）。没有这类镜像就留空 | 留空；有这类镜像时如 `com.myorg.run` |
+| `CI_TMP_GLOBS` | 工具自己建在 `/tmp` 下的临时目录名，空格分隔的模式，钩子删属于 runner 用户的（05 章 ③）。不能含 `/`，不能以 `*` 或 `.` 开头。工具改用 `$RUNNER_TEMP` 后就不用配 | 留空；有这类目录时如 `myproj-scratch-*` |
 | `CI_FIXEDWORK_BASELINE` | 这台机器上 `preflight.sh --with-load` 给出的 p50。每台各测各的，不能抄别的机器，也不能拿来比两台机器的快慢（02 章 2.5） | `0.51`（第一台） |
 | `BUILDKIT_RESERVED` / `BUILDKIT_MAX_USED` / `BUILDKIT_MIN_FREE` | 按盘大小定，不用出厂默认值，公式见 10 章 10.4。已部署的机器上改了 `BUILDKIT_MIN_FREE`，磁盘告警阈值不会跟着重算，做法也见 10.4 | 75 GB 盘：`10GB` / `20GB` / `20GB`；150 GB 盘：`10GB` / `40GB` / `30GB` |
 | `METADATA_IP` | 云 metadata 服务的地址，bootstrap 拦住 CI 访问它。多数云用默认值，阿里云、腾讯云等不同，见 04 章 4.5。裸金属一般没有 metadata 服务，留默认值即可。旧版脚本没有把它落盘，这样的机器第一次用新版重跑时要显式传一次 | `169.254.169.254`（默认） |
@@ -835,6 +837,8 @@ runner 进程被杀时，两个钩子都不执行。
 | `docker image prune`（悬空）+ 按 CI 标签的 `-a`（只删 6 小时前建的） | 同一个 tag 拉到新版本后留下的旧版本 | 保留 |
 | `docker buildx prune --filter until=24h` | 删掉的多是下次还要用的缓存，见下 | 已删 |
 | `fuser -k <app_ports>/tcp` | 上一次 run 的宿主孤儿进程 | 保留 |
+| 按 `CI_PER_RUN_IMAGE_LABEL` 删镜像（不看创建时间） | 每次运行各建一份的镜像，job 被取消时程序自己删不掉 | 2026-10-26 新增，按项目配置 |
+| 删 `/tmp` 下匹配 `CI_TMP_GLOBS`、属于 runner 的条目 | 工具自己建在 `/tmp` 下的临时目录，job 被取消时留下 | 2026-10-26 新增，按项目配置 |
 
 各条说明：
 
@@ -843,6 +847,7 @@ runner 进程被杀时，两个钩子都不执行。
 - `docker image prune`：用 digest 钉住的旧 pin 不算悬空，清不掉，要人工退役（08 章 8.6）。按 CI 标签的那条，要 workflow 的 `docker build` 打了标签才匹配得到，否则匹配 0 个。
 - `docker buildx prune --filter until=24h`：已从脚本删除。它一次回收过 5896 MB，但那是攒了几天的量，不是持续效果（09 章 B13）。它删的是 24 小时没被用到的缓存，实际常常是整层几 GB 的依赖层（换了 lockfile，或者安静了一晚上），删完下一次构建就是冷的。这些空间在需要时 GC 本来就会回收。缓存上限靠 4.1 节 daemon.json 里的 GC 策略控制。
 - `fuser -k <app_ports>/tcp`：清掉上一次 run 留在宿主上的孤儿进程，见 05 章 ⑨。这种情况属于「假绿」：测试实际跑在上一次 run 留下的孤儿进程上，本该失败的检查却显示通过。
+- 最后两条接的是程序自己没删掉的东西。job 被取消时钩子照常执行，但步骤里程序的 finally、`trap` 不执行（05 章 ⑥、09 章 A22），它建的镜像和 `/tmp` 目录就留了下来。两个参数默认为空，等于不清；按项目填，取值见 03 章 3.1。删镜像那条只删同时带 CI 标签的，机器上还有别人用 docker 时的前提见 05 章 ⑫ 末尾。删 `/tmp` 那条只动 `/tmp` 下一层、属于当前用户（runner）的条目，同机开发用户的同名目录不受影响。根治还是让工具把临时目录放进 `$RUNNER_TEMP`（05 章 ③）。
 
 #### 钩子不能撞上正在跑的 job
 
@@ -1184,6 +1189,20 @@ grep -rn '/tmp/' .github/workflows/
 - run: mycmd | tee "$RUNNER_TEMP/out.log" && grep -q "expected" "$RUNNER_TEMP/out.log"
 ```
 
+上面的 grep 只能查到 workflow 里写死的路径。还有一类更隐蔽：工具代码自己建临时目录，用的是语言默认的 `os.tmpdir()`、`mkdtemp`、`mktemp`、`tempfile`，落点都是 `/tmp`。这类目录平时由程序结束时自己删，job 被取消时删不掉（见 ⑥），在常驻机器上会一直留着。Ubuntu 24.04 默认的 tmpfiles 规则只删 `/tmp` 里 30 天没动过的东西。参考项目有个测试工具，每次在 `/tmp` 下打一份约 1 GB 的源码包，一周被取消 9 次，就攒下 9 份。
+
+自查（目录换成你的工具和脚本所在的位置）：
+
+```bash
+grep -rnE 'tmpdir\(\)|mkdtemp|mktemp|tempfile|TemporaryDirectory' tools/ scripts/
+```
+
+怎么改：临时目录的上一级换成 `$RUNNER_TEMP`，没有这个变量时（本地运行）再用系统默认，比如 Node 里写成 `mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), 'x-'))`。runner 在每个 job 结束时清空这个目录，被取消的 job 也一样（Worker 日志里是 `Cleaning runner temp folder`），下一个 job 开始前还会再清一次。
+
+不要图省事在步骤上设 `TMPDIR=$RUNNER_TEMP`。那样工具链放在 `/tmp` 里的编译缓存也会每个 job 被清一次，构建会变慢。
+
+工具一时改不了的，用清理钩子兜底：bootstrap 传 `CI_TMP_GLOBS="<目录名模式>"`，钩子每次在 job 前后删掉 `/tmp` 下一层、属于 runner 用户、名字匹配的条目（04 章 4.4）。
+
 ---
 
 ### ④ 依赖预装工具
@@ -1244,6 +1263,28 @@ job 被取消时，写在最后一步、又没带 `if: always()` 的清理步骤
 - 在 runner 侧挂 `JOB_STARTED` 钩子兜底。
 
 说明：runner 侧的 `JOB_COMPLETED` 钩子在 job 被取消时其实会执行。它跑不到的情况有两种：job 在初始化阶段就被取消；runner 服务被停掉。详见 04 章 4.4。
+
+#### 程序里的清理也一样不执行
+
+写在程序里的清理更容易漏：try/finally、`trap ... EXIT`、程序自己装的 SIGTERM 处理，在 job 被取消时同样不执行。原因在 runner 取消步骤的方式，下面是 Worker 日志原文（runner 2.338.0）：
+
+```
+Sending SIGINT to process 624280.
+Process did not honor SIGINT signal within 7.5 seconds.
+Sending SIGTERM to process 624280.
+Process did not honor SIGTERM signal within 2.5 seconds.
+Kill entire process tree since both cancel and terminate signal has been ignored by the target process.
+```
+
+624280 是 runner 为这一步起的 bash（`bash -e <步骤脚本>`）。信号只发给这个 bash，bash 不会把信号转给它正在等的子进程，真正干活的程序收不到。10 秒后整棵进程树被 SIGKILL，程序里的清理代码没有机会运行。就算信号送到了，10 秒也常常不够：要先停容器，再删几 GB 的文件。
+
+所以 job 里产生的东西，要交给不依赖程序自己退出的机制去清：
+
+- 临时文件放进 `$RUNNER_TEMP`（③），job 被取消后 runner 也会清。
+- 容器和 `docker build` 出来的镜像打 CI 标签（⑫ 末尾），由清理钩子在下一个 job 开始前删。
+- 每次运行用唯一 tag 建的镜像，另打一个专用标签，并配上 `CI_PER_RUN_IMAGE_LABEL`（同在 ⑫ 末尾）。
+
+参考项目踩过这个坑：一个测试工具在 finally 里删它建的镜像和 `/tmp` 目录，一周被取消 9 次，留下 9 份，每份约 3 GB 镜像加 1 GB 目录，根分区一度只剩 5.5 GB（09 章 A22）。
 
 ---
 
@@ -1441,6 +1482,10 @@ services:
 
 另外，`docker build` 也要打上 `--label "$CI_LABEL"`，清理钩子才能删掉过期的 CI 镜像；不打标签时，钩子里那条清理匹配到 0 个镜像。标签漏打也不报错，参考项目让每个 build 带 `--iidfile "$RUNNER_TEMP/ci-images/<名字>"`（先 `mkdir -p "$RUNNER_TEMP/ci-images"`），再加一步遍历这些文件核对标签。
 
+每次运行都用唯一 tag 建的镜像（tag 里带 run ID 或随机串，用完就删的那种），还要再打一个专用标签，比如 `--label com.myproj.run=<本次的名字>`，并在 bootstrap 里传 `CI_PER_RUN_IMAGE_LABEL=com.myproj.run`（只写键）。钩子对 CI 标签的镜像只删 6 小时前建的，而这类镜像以后不会再用，没必要等。job 正常结束时程序自己会删；被取消时删不了（⑥），只能靠钩子。不配这个参数，每取消一次就要多占 6 个小时以上的空间，参考项目一个这样的镜像独占约 3 GB。
+
+钩子只删同时带 CI 标签和这个专用标签的镜像。机器上还有别人用 docker、又会在本地跑同一个工具时，让工具只在 CI 里（`GITHUB_ACTIONS=true`）打 CI 标签，本地建的镜像就不会被钩子删掉。
+
 参考项目还在 job 末尾的 `if: always()` 清理里加了一条 `docker image prune -f --filter "label=$CI_LABEL"`（不带 `-a`，只删悬空的，带 tag 的当前版本留着），防的是固定 tag 重建后旧版本变成悬空镜像。这是经典镜像存储的行为；Docker 29 + containerd 快照器上带 `-t` 重建，旧版本直接被删、不留悬空镜像（02 章 2.6 实测，10-16 复测相同），所以在这类机器上这一条只是保险。
 
 ---
@@ -1481,12 +1526,14 @@ find /opt/actions-runner/_work -not -user runner | head   # 应为空
 grep -rn -- '--name '        .github/workflows/ | grep -v 'run_id'      # 应为空
 grep -rn 'ports:'            .github/workflows/ | grep -v '127.0.0.1'  # 应为空
 grep -rn '/tmp/'             .github/workflows/                        # 应为空或已确认无害
+grep -rnE 'tmpdir\(\)|mkdtemp|mktemp' tools/ scripts/                 # CI 里跑的临时目录应改用 $RUNNER_TEMP（③）
 grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理步骤应该有
 grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
 grep -rn -- '--tmpfs'        .github/workflows/                        # 每个声明了 VOLUME 的镜像都应有一条（⑫）
 grep -rn '容器没有挂卷'       .github/workflows/                        # 起了这些容器的 job 都应有这一步（⑫）
 grep -rnE '127\.0\.0\.1:[0-9]+:' .github/workflows/                    # 一台机器跑多个实例时应为空（②）
 find /opt/actions-runner/_work -not -user runner | head                # 在每台 runner 上跑，应为空（⑬）
+find /tmp -maxdepth 1 -user runner -mtime +1 | head                    # 在每台 runner 上跑，应为空或只有工具缓存（③⑥）
 ```
 
 ---
@@ -1735,15 +1782,15 @@ SKIP 有两种。一种是上面说的机器在忙，跳过了会打断 job 的�
 | runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust` 等于 `RUNNER_OOM_ADJ`（没写按 800）且大于 0、`After=docker`；runner 用户的 uid 等于 `RUNNER_UID`（默认 1000） | 前几项见 04 章 4.3。uid 不一致只提示（SKIP），原因见 03 章 3.3 |
 | Docker | `live-restore=true`；BuildKit GC 有 Max Used 与 Min Free 两项 | 见表下说明 |
 | 清理与监控 | 共 11 项，见表下说明 | 见表下说明 |
-| 部署参数与系统更新 | `/etc/ci-runner.env` 存在；里面的 CI 标签和钩子一致；里面的 `RUNNER_NAME` 和本机注册名一致；needrestart 豁免 runner；有没有待重启的更新 | 见表下说明 |
+| 部署参数与系统更新 | `/etc/ci-runner.env` 存在；里面的 CI 标签和钩子一致（配了 `CI_PER_RUN_IMAGE_LABEL`、`CI_TMP_GLOBS` 的，这两项也要一致）；里面的 `RUNNER_NAME` 和本机注册名一致；needrestart 豁免 runner；有没有待重启的更新 | 见表下说明 |
 | 网络加固 | DOCKER-USER + OUTPUT 两条 metadata 规则；已持久化；实拨容器验证 | 少一条就有一条路通 |
 | SSH | 口令登录是否关闭 | 开着时只提示（SKIP），关不关见 04 章 4.6 |
-| 干净度 | 无残留容器（有 job 时 SKIP）；匿名卷没有累积；根分区可用空间 | 清理没生效，或者 Docker 以外的东西在吃盘 |
+| 干净度 | 无残留容器（有 job 时 SKIP）；匿名卷没有累积；根分区可用空间；runner 用户在 `/tmp` 下的占用 | 清理没生效，或者有清理管不到的东西在吃盘 |
 | GitHub 侧 | 按本机 `.runner` 里的注册 ID 找到自己那一条，状态为 online | 查不到：没注册，或者网络问题。同名那条的 ID 不是本机的：本机的注册被另一台用同名 `--replace` 顶掉了（09 章 A18） |
 
 Docker 组：如果 BuildKit GC 只有 Reserved，说明你用了 `defaultKeepStorage`，Min Free 保护就丢了（09 章 A1）。
 
-干净度组：根分区那一项和 ci-health 用同一套阈值，都从 `/etc/ci-runner.env` 读。低于 `CI_DISK_CRIT_MB`（默认 10 GiB）是 FAIL；低于 `CI_DISK_WARN_MB`（BuildKit 的 Min Free 加 1 GiB）只提示。这样盘大小不同的机器不会误报，两个值怎么取见 10 章 10.4。匿名卷的上限默认 6 个，是按参考项目定的：三个服务容器，workflow 没给它们挂 tmpfs 时，每个 job 会短暂留下约 3 个匿名卷。别的项目取每个 job 的服务容器数乘 2，跑 verify 时用 `CI_MAX_VOLUMES=<上限> bash scripts/verify.sh` 传入。
+干净度组：根分区那一项和 ci-health 用同一套阈值，都从 `/etc/ci-runner.env` 读。低于 `CI_DISK_CRIT_MB`（默认 10 GiB）是 FAIL；低于 `CI_DISK_WARN_MB`（BuildKit 的 Min Free 加 1 GiB）只提示。这样盘大小不同的机器不会误报，两个值怎么取见 10 章 10.4。匿名卷的上限默认 6 个，是按参考项目定的：三个服务容器，workflow 没给它们挂 tmpfs 时，每个 job 会短暂留下约 3 个匿名卷。别的项目取每个 job 的服务容器数乘 2，跑 verify 时用 `CI_MAX_VOLUMES=<上限> bash scripts/verify.sh` 传入。runner 用户在 `/tmp` 下的文件合计超过 2048 MiB 时只提示（SKIP），多半是被取消的 job 留下的临时目录（05 章 ③⑥）。`/tmp` 里也有工具自己的编译缓存，缓存本来就大的项目用 `CI_MAX_TMP_MB=<上限>` 调高。
 
 `verify.sh` 只检查本机第一个 `actions.runner.*` 服务。一台机器装了多个实例时，脚本会打一行提示，其余实例查不到，前提见 10 章 10.6。
 
@@ -2046,8 +2093,8 @@ r = simulate(events, svc)
 |---|---|---|
 | BuildKit build cache | `daemon.json` 的 GC 策略 | 长到上限后由 GC 驱逐 |
 | 匿名卷（services 容器的数据） | 只有 `docker volume prune` | workflow 没挂 tmpfs 时无上界，约 70 MB/job |
-| 镜像 | 悬空的由钩子清；换掉的旧 pin 要人工退役 | 慢慢累积，参考项目一个月约 2 GB |
-| Docker 以外 | 无 | 参考项目一个月涨了约 6 GiB |
+| 镜像 | 悬空的由钩子清；换掉的旧 pin 要人工退役；每次运行各建一份的，配了 `CI_PER_RUN_IMAGE_LABEL` 由钩子清 | 慢慢累积，参考项目一个月约 2 GB；每次运行各建一份的镜像，每取消一次留一份，参考项目约 3 GB 一份 |
+| Docker 以外 | 无；`/tmp` 下的临时目录配了 `CI_TMP_GLOBS` 由钩子清 | 参考项目一个月涨了约 6 GiB；被取消的 job 留在 `/tmp` 的目录，参考项目约 1 GB 一份 |
 
 表格补充说明：
 
@@ -2055,8 +2102,15 @@ r = simulate(events, svc)
 - `docker volume prune` 由清理钩子在每个 job 前后各执行一次。service 容器留下的匿名卷只有它会清，BuildKit 的 GC 不管卷；workflow 给这些容器挂上 tmpfs 后就不再产生（05 章 ⑫）。
 - 换掉的旧 pin 不会被自动清理，退役步骤见 8.6。
 - Docker 以外的增长包括 IDE 远程服务端、旧检出、包管理器缓存等。约 6 GiB 这个数，是 `ci-health` 采样里「可用 + containerd」之和的减少量。
+- 被取消的 job 留下的东西：程序在 finally 里删的镜像和 `/tmp` 目录，job 被取消时都删不掉（05 章 ⑥）。这类增长跟着取消次数走，PR 推得越勤越快，不是匀速的。
 
-所以「不清理就会盘满」这个判断通常不对。要盯的是匿名卷和 Docker 以外的增长。
+所以「不清理就会盘满」这个判断通常不对。要盯的是匿名卷、被取消的 job 留下的东西和 Docker 以外的增长。
+
+containerd 涨了，不一定是 BuildKit 缓存。缓存有 GC 上限，镜像不归 GC 管。参考项目第一台 2026-10-26 报 CRIT（根分区只剩 5.5 GB），之前 3 小时里可用空间少了 12.8 GB：containerd 涨了 8.9 GB，全是被取消的 job 留下的镜像；其余 3.9 GB 是 `/tmp` 里的目录（09 章 A22、B20）。ci-health 的磁盘告警会列出 containerd、`/tmp` 和其余部分各占多少，按下面的顺序查：
+
+1. `docker images`：有没有一串名字只差一段随机串的镜像。有的话按 05 章 ⑫ 末尾配 `CI_PER_RUN_IMAGE_LABEL`。
+2. `du -sh /tmp/* | sort -h | tail`：有没有同一个前缀的一串大目录。有的话按 05 章 ③ 处理。
+3. 最后再看 Docker 以外的其他目录（8.6 第 3 条）。
 
 #### 上线一个月的实测
 
@@ -2218,7 +2272,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
    docker image rm <旧镜像>          # 不带 -f：还有容器在用的话 Docker 会拒绝
    ```
    注意：别用 `docker image prune -a --filter until=...` 代劳。until 按镜像的创建时间算，一个两年前构建、今天还在用的 pin 会被删掉。
-3. 看一眼 Docker 以外的增长，例如 `du -sh /root/.vscode-server /home/*/.vscode-server /root/.cursor-server /home/*/.cache`。VS Code 远程服务端可以只留正在用的那一份：用 `ls ~/.vscode-server/cli/servers/` 列出所有版本，进程在用的那个之外都能删。
+3. 看一眼 Docker 以外的增长，例如 `du -sh /root/.vscode-server /home/*/.vscode-server /root/.cursor-server /home/*/.cache`，再看 `du -sh /tmp/* | sort -h | tail` 里有没有被取消的 job 留下的目录（8.2）。VS Code 远程服务端可以只留正在用的那一份：用 `ls ~/.vscode-server/cli/servers/` 列出所有版本，进程在用的那个之外都能删。
 4. 核对参数。`/etc/ci-runner.env` 里的参数和按 10 章公式算出来的值是否还一致。workflow 加了重 job、机器上开始或不再有人开发、换了盘，都要按 10 章 10.7 重新量一遍。
 
 ### 8.7 多台机器
@@ -2307,7 +2361,7 @@ sed "s#__RUNNER_SVC__#<runner 服务>#" scripts/ci-health.sh > /usr/local/bin/ci
 
 本章记录部署和运行中踩过的坑，分三部分：
 
-- A. 环境的坑：换一台机器还会遇到。A15 以后是装新机器、准备加第二台机器时遇到的。
+- A. 环境的坑：换一台机器还会遇到。A15–A21 是装新机器、准备加第二台机器时遇到的，A22 是两台都上线以后发现的。
 - B. 判断方法上的错误：换个环境还会以别的形式出现，比 A 更值得读。
 - C. 有争议、未采纳的建议，以及不采纳的数据依据。
 
@@ -2589,6 +2643,23 @@ Ubuntu、Debian 的 sshd 默认是 `PermitRootLogin prohibit-password`（OpenSSH
 
 做法：建机器时就填上 SSH 公钥。忘了填的，用厂商的带外入口（控制台网页终端、串口控制台，裸金属用 IPMI 或救援系统）登录，把公钥写进要登录的那个用户的 `~/.ssh/authorized_keys`（03 章 3.0）。
 
+#### A22. job 被取消时，程序里的清理不执行
+
+参考项目有个算法测试工具，每次运行在 `/tmp` 下打一份约 1 GB 的源码包，再建一个唯一 tag 的镜像（独占约 3 GB），两样都在 finally 里删。workflow 开了 `cancel-in-progress`，同一个 PR 再推一次，正在跑的 job 就被取消。
+
+runner 取消一个步骤时，只给这一步的 bash 发 SIGINT，等 7.5 秒再发 SIGTERM，再等 2.5 秒就杀掉整棵进程树（Worker 日志原文见 05 章 ⑥）。bash 不会把信号转给它正在等的子进程，工具收不到信号，finally 没有机会执行。清理钩子在取消后照常执行（04 章 4.4），但当时它不认识这两样东西：镜像带 CI 标签，要等 6 小时才删；`/tmp` 它根本不管，而 Ubuntu 24.04 默认的 tmpfiles 规则（`D /tmp 1777 root root 30d`）要 30 天没动过才删。
+
+参考项目第一台 14 天的 Worker 日志里，这个 job 成功 200 次、失败 4 次、被取消 9 次。`/tmp` 里正好有 9 份残留，创建时间都落在对应那次被取消的 job 的起止时间内。失败的 4 次都在 30 秒内结束，还没跑到建目录那一步。2026-10-26 一天被取消 4 次，根分区可用空间从 18.4 GB 掉到 5.5 GB，告警到了 CRIT。
+
+修法：
+
+- 工具把临时目录放进 `$RUNNER_TEMP`（05 章 ③）。被取消的 job 结束时，runner 也会清空它。
+- 每次运行各建一份的镜像另打专用标签，配上 `CI_PER_RUN_IMAGE_LABEL`，钩子在下一个 job 开始前就删，不等 6 小时（05 章 ⑫）。
+- 工具一时改不了的，配 `CI_TMP_GLOBS`，由钩子删 `/tmp` 下的残留（04 章 4.4）。
+- 别指望在程序里多捕获几个信号来补救：信号送不到；送到了也只有 10 秒。
+
+排查时用 Worker 日志对账：`_diag/Worker_*.log` 里 `"jobDisplayName"` 后面是 job 名，`Job result after all job steps finish:` 后面是结局，再拿残留文件的创建时间去对。
+
 ---
 
 ### B. 判断方法上的错误
@@ -2859,6 +2930,16 @@ verify.sh 查 GitHub 侧状态时，原来用的是 `curl -H "Authorization: Bea
 
 > 在 CI 机上，密钥不能进命令行参数和 shell 历史。必须落盘的，用完马上删。能不上 CI 机的就不上。
 
+#### B20. 告警文案替人下了结论
+
+ci-health 原来的磁盘告警写的是「GC 腾不出空间了，是 Docker 以外的东西在吃盘」。这句话背后的假设是 Docker 里的东西都有人管：缓存有 GC，镜像和卷有钩子。参考项目 2026-10-26 那次 CRIT 查下来，可用空间少掉的部分七成在 containerd 里，是被取消的 job 留下的镜像，GC 管不到，钩子要 6 小时后才删（A22）。照着告警去翻 Docker 以外的目录，只能找到三成。
+
+修法：告警只给数据。现在的文案列出 containerd、`/tmp` 和其余部分各占多少，再附排查顺序（08 章 8.2）；采样行多记一个 `tmp=`，事后能对出是哪一部分在涨。
+
+教训：
+
+> 告警文案里写的原因，是写告警那天的假设，不是这一次的事实。告警里只写测到的数，结论留给查的人。
+
 ---
 
 ### C. 有争议、未采纳的建议
@@ -3070,6 +3151,7 @@ Reserved = min(10 GB, Max Used ÷ 2)
 - Max Used 小于 W 时，GC 会反复驱逐还在用的缓存，构建退回冷构建（02 章 2.6）。这时要么换大盘，要么先按 08 章 8.4 修 Dockerfile 的层序，把 W 降下来。
 - Max Used 取 W 的 2 倍，是给换 lockfile 前后的两套依赖层都留出位置。盘再大，也不用超过这个数。
 - 公式里减去的 10 GB 是余量，让稳态可用空间停在 Min Free 之上，免得一上线就贴着告警线。
+- 被取消的 job 留下的镜像和 `/tmp` 目录没算在 G 里。它跟着取消次数走，量 G 的时候如果它也在涨，G 会被高估；该做的是配清理钩子把它清掉（04 章 4.4、09 章 A22），不是把盘按它放大。
 
 磁盘告警阈值：
 

@@ -23,9 +23,9 @@ set -uo pipefail
 # 不读回的话，用了非默认 RUNNER_HOME 的机器会报一串假 FAIL。
 # METADATA_IP 由 bootstrap 落盘，但旧版 bootstrap 写的文件里没有这一行，这样的机器重跑 bootstrap 之前要显式传（07 章开头）。
 # CI_MAX_VOLUMES 也列在这里，文件里有这一行就认。bootstrap 不落盘它，重跑 bootstrap 会把文件重写掉，
-# 所以取值不是默认的机器要在运行时显式传（07 章 7.1）。
+# 所以取值不是默认的机器要在运行时显式传（07 章 7.1）。CI_MAX_TMP_MB 同理。
 CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
-ENV_KEYS="GH_REPO RUNNER_NAME RUNNER_USER RUNNER_UID RUNNER_HOME RUNNER_OOM_ADJ CI_LABEL CI_DISK_WARN_MB CI_DISK_CRIT_MB METADATA_IP CI_MAX_VOLUMES"
+ENV_KEYS="GH_REPO RUNNER_NAME RUNNER_USER RUNNER_UID RUNNER_HOME RUNNER_OOM_ADJ CI_LABEL CI_PER_RUN_IMAGE_LABEL CI_TMP_GLOBS CI_DISK_WARN_MB CI_DISK_CRIT_MB METADATA_IP CI_MAX_VOLUMES CI_MAX_TMP_MB"
 declare -A FILE_KV=()   # 文件里的原值，「和落盘参数一致」这类检查只拿它比
 if [ -r "$CI_RUNNER_ENV" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
@@ -120,7 +120,7 @@ grep -qE 'pgrep -c?x Runner\.Worker' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/n
   && ok "钩子带「有 job 在跑就不动」的守卫（每日 timer 不会误删 job 的容器）" \
   || no "钩子缺少运行中 job 的守卫，每日 timer 撞上 job 时会删掉它的容器（按 04 章 4.4 重新部署 scripts/ci-cleanup.sh）"
 # 只看赋值行：守卫那行故意保留 __CI_ 前缀做判据，不是残留（09 章 A12）。
-grep -qE '^(L|APP_PORTS)=.*__CI_' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null \
+grep -qE '^(L|APP_PORTS|PER_RUN_LABEL|TMP_GLOBS)=.*__CI_' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null \
   && no "钩子赋值行仍含未替换的占位符：bootstrap 的 sed 没生效，按标签的清理全部落空" \
   || ok "钩子占位符已全部替换"
 
@@ -150,6 +150,17 @@ if [ -r "$CI_RUNNER_ENV" ]; then
   hl=$(sed -n 's/^L="\${CI_LABEL:-\(.*\)}".*/\1/p' "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null)
   [ -n "$pl" ] && [ "$pl" = "$hl" ] && ok "钩子的 CI 标签与落盘参数一致（$pl）" \
     || no "钩子的 CI 标签（$hl）与 $CI_RUNNER_ENV（$pl）不一致，有人用别的参数重新部署过"
+  # 钩子第 8 步的两个参数（09 章 A22）。两边都没配就不报，/tmp 有没有攒东西看下面干净度那一项
+  for pair in PER_RUN_LABEL:CI_PER_RUN_IMAGE_LABEL TMP_GLOBS:CI_TMP_GLOBS; do
+    hk=${pair%%:*}; fk=${pair#*:}; fv=${FILE_KV[$fk]:-}
+    if ! grep -q "^$hk=" "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null; then
+      [ -n "$fv" ] && no "$CI_RUNNER_ENV 配了 $fk，但钩子是旧版、没有第 8 步，这个参数不起作用（按 04 章 4.4 重新部署 scripts/ci-cleanup.sh）"
+      continue
+    fi
+    hv=$(sed -n "s/^$hk=\"\([^\"]*\)\".*/\1/p" "$RUNNER_HOME/hooks/ci-cleanup.sh" 2>/dev/null)
+    if [ "$fv" != "$hv" ]; then no "钩子的 $fk（$hv）与 $CI_RUNNER_ENV（$fv）不一致，有人用别的参数重新部署过"
+    elif [ -n "$fv" ]; then ok "钩子的 $fk 与落盘参数一致（$fv）"; fi
+  done
   # 落盘的名字和实际注册名对不上，最常见的原因是这个文件从别的机器拷了过来（09 章 A18）
   fn=${FILE_KV[RUNNER_NAME]:-}
   if [ -n "$fn" ] && [ -n "$RN" ]; then
@@ -202,6 +213,13 @@ if [ -z "$av" ]; then no "读不到根分区的可用空间"
 elif [ "$av" -lt "$CRIT_MB" ]; then no "根分区只剩 ${av}MB，低于 CRIT 线 ${CRIT_MB}MB：GC 腾不出空间了，是 Docker 以外的东西在吃盘"
 elif [ "$av" -lt "$WARN_MB" ]; then sk "根分区可用 ${av}MB，低于 WARN 线 ${WARN_MB}MB：GC 已在按 Min Free 驱逐缓存，看看 Docker 以外是什么在涨"
 else ok "根分区可用 ${av}MB（WARN 线 ${WARN_MB}MB，CRIT 线 ${CRIT_MB}MB）"; fi
+# job 被取消时，程序自己建在 /tmp 下的临时目录不会被删（09 章 A22）。/tmp 里也有工具自己的缓存，
+# 多大算异常因项目而异，所以超线只提醒。默认 2048 MiB，用 CI_MAX_TMP_MB 改。
+MAX_TMP="${CI_MAX_TMP_MB:-2048}"
+case "$MAX_TMP" in ''|*[!0-9]*) no "CI_MAX_TMP_MB=$MAX_TMP 不是 MiB 整数，这里按 2048 查"; MAX_TMP=2048 ;; esac
+tu=$(find /tmp -mindepth 1 -maxdepth 1 -user "$RUNNER_USER" -print0 2>/dev/null | du -scBM --files0-from=- 2>/dev/null | tail -1 | cut -f1 | tr -dc 0-9)
+if [ "${tu:-0}" -le "$MAX_TMP" ]; then ok "$RUNNER_USER 用户在 /tmp 下共 ${tu:-0}MB（提醒线 ${MAX_TMP}MB）"
+else sk "$RUNNER_USER 用户在 /tmp 下共 ${tu}MB，超过 ${MAX_TMP}MB：多半是被取消的 job 留下的临时目录。du -sh /tmp/* | sort -h | tail 看是哪些，按 05 章 ③ 改工具，或者配 CI_TMP_GLOBS 让钩子清（09 章 A22）"; fi
 
 hdr "GitHub 侧"
 if [ -z "$GH_REPO" ] || [ -z "${GH_TOKEN:-}" ]; then

@@ -133,6 +133,20 @@ grep -rn '/tmp/' .github/workflows/
 - run: mycmd | tee "$RUNNER_TEMP/out.log" && grep -q "expected" "$RUNNER_TEMP/out.log"
 ```
 
+上面的 grep 只能查到 workflow 里写死的路径。还有一类更隐蔽：工具代码自己建临时目录，用的是语言默认的 `os.tmpdir()`、`mkdtemp`、`mktemp`、`tempfile`，落点都是 `/tmp`。这类目录平时由程序结束时自己删，job 被取消时删不掉（见 ⑥），在常驻机器上会一直留着。Ubuntu 24.04 默认的 tmpfiles 规则只删 `/tmp` 里 30 天没动过的东西。参考项目有个测试工具，每次在 `/tmp` 下打一份约 1 GB 的源码包，一周被取消 9 次，就攒下 9 份。
+
+自查（目录换成你的工具和脚本所在的位置）：
+
+```bash
+grep -rnE 'tmpdir\(\)|mkdtemp|mktemp|tempfile|TemporaryDirectory' tools/ scripts/
+```
+
+怎么改：临时目录的上一级换成 `$RUNNER_TEMP`，没有这个变量时（本地运行）再用系统默认，比如 Node 里写成 `mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), 'x-'))`。runner 在每个 job 结束时清空这个目录，被取消的 job 也一样（Worker 日志里是 `Cleaning runner temp folder`），下一个 job 开始前还会再清一次。
+
+不要图省事在步骤上设 `TMPDIR=$RUNNER_TEMP`。那样工具链放在 `/tmp` 里的编译缓存也会每个 job 被清一次，构建会变慢。
+
+工具一时改不了的，用清理钩子兜底：bootstrap 传 `CI_TMP_GLOBS="<目录名模式>"`，钩子每次在 job 前后删掉 `/tmp` 下一层、属于 runner 用户、名字匹配的条目（04 章 4.4）。
+
 ---
 
 ### ④ 依赖预装工具
@@ -193,6 +207,28 @@ job 被取消时，写在最后一步、又没带 `if: always()` 的清理步骤
 - 在 runner 侧挂 `JOB_STARTED` 钩子兜底。
 
 说明：runner 侧的 `JOB_COMPLETED` 钩子在 job 被取消时其实会执行。它跑不到的情况有两种：job 在初始化阶段就被取消；runner 服务被停掉。详见 04 章 4.4。
+
+#### 程序里的清理也一样不执行
+
+写在程序里的清理更容易漏：try/finally、`trap ... EXIT`、程序自己装的 SIGTERM 处理，在 job 被取消时同样不执行。原因在 runner 取消步骤的方式，下面是 Worker 日志原文（runner 2.338.0）：
+
+```
+Sending SIGINT to process 624280.
+Process did not honor SIGINT signal within 7.5 seconds.
+Sending SIGTERM to process 624280.
+Process did not honor SIGTERM signal within 2.5 seconds.
+Kill entire process tree since both cancel and terminate signal has been ignored by the target process.
+```
+
+624280 是 runner 为这一步起的 bash（`bash -e <步骤脚本>`）。信号只发给这个 bash，bash 不会把信号转给它正在等的子进程，真正干活的程序收不到。10 秒后整棵进程树被 SIGKILL，程序里的清理代码没有机会运行。就算信号送到了，10 秒也常常不够：要先停容器，再删几 GB 的文件。
+
+所以 job 里产生的东西，要交给不依赖程序自己退出的机制去清：
+
+- 临时文件放进 `$RUNNER_TEMP`（③），job 被取消后 runner 也会清。
+- 容器和 `docker build` 出来的镜像打 CI 标签（⑫ 末尾），由清理钩子在下一个 job 开始前删。
+- 每次运行用唯一 tag 建的镜像，另打一个专用标签，并配上 `CI_PER_RUN_IMAGE_LABEL`（同在 ⑫ 末尾）。
+
+参考项目踩过这个坑：一个测试工具在 finally 里删它建的镜像和 `/tmp` 目录，一周被取消 9 次，留下 9 份，每份约 3 GB 镜像加 1 GB 目录，根分区一度只剩 5.5 GB（09 章 A22）。
 
 ---
 
@@ -390,6 +426,10 @@ services:
 
 另外，`docker build` 也要打上 `--label "$CI_LABEL"`，清理钩子才能删掉过期的 CI 镜像；不打标签时，钩子里那条清理匹配到 0 个镜像。标签漏打也不报错，参考项目让每个 build 带 `--iidfile "$RUNNER_TEMP/ci-images/<名字>"`（先 `mkdir -p "$RUNNER_TEMP/ci-images"`），再加一步遍历这些文件核对标签。
 
+每次运行都用唯一 tag 建的镜像（tag 里带 run ID 或随机串，用完就删的那种），还要再打一个专用标签，比如 `--label com.myproj.run=<本次的名字>`，并在 bootstrap 里传 `CI_PER_RUN_IMAGE_LABEL=com.myproj.run`（只写键）。钩子对 CI 标签的镜像只删 6 小时前建的，而这类镜像以后不会再用，没必要等。job 正常结束时程序自己会删；被取消时删不了（⑥），只能靠钩子。不配这个参数，每取消一次就要多占 6 个小时以上的空间，参考项目一个这样的镜像独占约 3 GB。
+
+钩子只删同时带 CI 标签和这个专用标签的镜像。机器上还有别人用 docker、又会在本地跑同一个工具时，让工具只在 CI 里（`GITHUB_ACTIONS=true`）打 CI 标签，本地建的镜像就不会被钩子删掉。
+
 参考项目还在 job 末尾的 `if: always()` 清理里加了一条 `docker image prune -f --filter "label=$CI_LABEL"`（不带 `-a`，只删悬空的，带 tag 的当前版本留着），防的是固定 tag 重建后旧版本变成悬空镜像。这是经典镜像存储的行为；Docker 29 + containerd 快照器上带 `-t` 重建，旧版本直接被删、不留悬空镜像（02 章 2.6 实测，10-16 复测相同），所以在这类机器上这一条只是保险。
 
 ---
@@ -430,12 +470,14 @@ find /opt/actions-runner/_work -not -user runner | head   # 应为空
 grep -rn -- '--name '        .github/workflows/ | grep -v 'run_id'      # 应为空
 grep -rn 'ports:'            .github/workflows/ | grep -v '127.0.0.1'  # 应为空
 grep -rn '/tmp/'             .github/workflows/                        # 应为空或已确认无害
+grep -rnE 'tmpdir\(\)|mkdtemp|mktemp' tools/ scripts/                 # CI 里跑的临时目录应改用 $RUNNER_TEMP（③）
 grep -rc 'if: always()'      .github/workflows/*.yml                   # 清理步骤应该有
 grep -rn 'docker rm -f '     .github/workflows/ | grep -v -- '-fv'      # 应为空（⑫）
 grep -rn -- '--tmpfs'        .github/workflows/                        # 每个声明了 VOLUME 的镜像都应有一条（⑫）
 grep -rn '容器没有挂卷'       .github/workflows/                        # 起了这些容器的 job 都应有这一步（⑫）
 grep -rnE '127\.0\.0\.1:[0-9]+:' .github/workflows/                    # 一台机器跑多个实例时应为空（②）
 find /opt/actions-runner/_work -not -user runner | head                # 在每台 runner 上跑，应为空（⑬）
+find /tmp -maxdepth 1 -user runner -mtime +1 | head                    # 在每台 runner 上跑，应为空或只有工具缓存（③⑥）
 ```
 
 ---

@@ -17,6 +17,9 @@
 #                           这里原来有一条 `buildx prune --filter until=24h`：它删的是 24 小时没被用到的缓存，
 #                           实际上常常是整层几 GB 的依赖层（换了 lockfile、或者安静了一晚上），删完下一次构建就是冷的。
 #                           这些空间 GC 在需要时本来就会回收，提前删只换来更多冷构建。已删。
+#   每次运行各建一份的镜像、/tmp 下的临时目录 → 第 8 步。job 被取消时程序自己的 finally/trap 不执行
+#                           （09 章 A22），参考项目每取消一次留下约 3 GB 镜像和约 1 GB /tmp 目录。
+#                           两项都要按项目配置（CI_PER_RUN_IMAGE_LABEL、CI_TMP_GLOBS），不配就不清。
 #
 # 注意：绝不裸跑 `docker system prune`，也绝不用不带 label 的 `-a`。那样会连基础镜像一起删，
 #    把「稳态 Docker Hub 消耗 ≈0」变回每次冷拉。
@@ -119,6 +122,33 @@ if [ -n "$RH" ] && [ -f "$RH/config.sh" ] && cd "$RH" 2>/dev/null; then
   ls -dt bin.*       2>/dev/null | grep -vx "$cb" | tail -n +2 | xargs -r rm -rf
   ls -dt externals.* 2>/dev/null | grep -vx "$ce" | tail -n +2 | xargs -r rm -rf
   find _diag -name '*.log' -mtime +14 -delete 2>/dev/null || true
+fi
+
+# 8) 被取消的 job 留下的东西。job 被取消时，runner 只给步骤的 shell 发 SIGINT、SIGTERM，
+#    约 10 秒后杀掉整棵进程树，真正干活的程序收不到信号，它自己的 finally/trap 不执行（09 章 A22）。
+#    这一步清两类东西，都按项目配置，留空就不清：
+#    · 每次运行用唯一 tag 建、之后再不会用到的镜像。上面第 4 步对 CI 标签的镜像要等 6 小时，
+#      这类镜像不该等。开头的守卫保证此刻本机没有别的 job，所以还在的都是死掉的 run 留下的。
+#      要同时带 CI 标签才删。守卫只排除 CI job，管不到机器上别的 docker 用户：有人在这台机器上本地跑
+#      同一个工具时，它建的镜像只要不带 CI 标签就不会被删。工具在本地也打 CI 标签的话，这一步只在
+#      机器专用于 CI、或者别的用户不在 docker 组时安全，和第 6 步的前提一样。
+#    · 项目的工具自己在 /tmp 下建的临时目录（用了 os.tmpdir()、mktemp 这类默认）。根治是让工具
+#      改用 $RUNNER_TEMP（05 章 ③），这里兜底。只删 /tmp 下一层、属于当前用户的条目：钩子和 timer
+#      都以 runner 身份运行，同机开发用户的同名目录不会被动到。含 / 或者以 * 、. 开头的模式一律跳过，
+#      含字母、数字和 . _ * - 以外字符的也跳过（和 bootstrap 的校验相同，手工渲染时也成立）。
+#    守卫写法和第 3 步一样，判「是否仍以 __CI_ 开头」，原因见第 3 步的注释。
+PER_RUN_LABEL="__CI_PER_RUN_IMAGE_LABEL__"   # 由 bootstrap.sh 替换；例如 com.myproj.run（只写键，匹配任意值）
+TMP_GLOBS="__CI_TMP_GLOBS__"                 # 由 bootstrap.sh 替换；空格分隔，例如 "myproj-scratch-*"
+if [ -n "$PER_RUN_LABEL" ] && [ "${PER_RUN_LABEL#__CI_}" = "$PER_RUN_LABEL" ]; then
+  docker image prune -af --filter "label=$PER_RUN_LABEL" --filter "label=$L" >/dev/null 2>&1
+fi
+if [ -n "${TMP_GLOBS// /}" ] && [ "${TMP_GLOBS#__CI_}" = "$TMP_GLOBS" ]; then
+  me=$(id -un 2>/dev/null)
+  read -ra globs <<< "$TMP_GLOBS"   # read -a 不做路径展开，模式原样交给 find
+  for g in "${globs[@]}"; do
+    case "$g" in */*|'*'*|.*|*[!A-Za-z0-9._*-]*) continue ;; esac
+    [ -n "$me" ] && find /tmp -mindepth 1 -maxdepth 1 -name "$g" -user "$me" -exec rm -rf {} + 2>/dev/null
+  done
 fi
 
 exit 0   # 清理失败绝不让 job 变红

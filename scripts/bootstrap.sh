@@ -27,6 +27,7 @@
 #   METADATA_IP=169.254.169.254   云 metadata 地址，阿里云、腾讯云等不是这个（04 章 4.5）
 #   APT_LOCK_WAIT=600        apt/dpkg 锁被占用时最多等几秒，0 表示不等
 #   FORCE_REPLACE=1          GitHub 上已有同名 runner、确认那条注册已经作废时才加（03 章 3.4）
+#   CI_PER_RUN_IMAGE_LABEL=... / CI_TMP_GLOBS=...   清理被取消的 job 留下的镜像和 /tmp 目录（05 章 ③⑥、09 章 A22）
 #
 # 参数会落盘到 /etc/ci-runner.env（无密钥，0644）。重跑时没显式传的参数从那里读，
 # 所以在已部署的机器上重跑只需 `bash bootstrap.sh`，不必记得当初传过什么。
@@ -43,7 +44,7 @@ set -euo pipefail
 #    有人哪天直接重跑 bootstrap.sh，清理钩子就换成默认标签（按标签清理全部落空）、
 #    孤儿端口清理被关掉、争抢告警归零，而且什么都不报错。
 CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
-PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_UID RUNNER_HOME RUNNER_MEM_MAX RUNNER_OOM_ADJ BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB METADATA_IP"
+PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_UID RUNNER_HOME RUNNER_MEM_MAX RUNNER_OOM_ADJ BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_PER_RUN_IMAGE_LABEL CI_TMP_GLOBS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB METADATA_IP"
 if [ -r "$CI_RUNNER_ENV" ]; then
   # 「显式传入」按变量是否设置过判断（${!k+x}），所以 CI_APP_PORTS= 这样的空值也能覆盖文件里的值
   while IFS= read -r line || [ -n "$line" ]; do
@@ -78,6 +79,9 @@ BUILDKIT_MAX_USED="${BUILDKIT_MAX_USED:-20GB}"
 BUILDKIT_MIN_FREE="${BUILDKIT_MIN_FREE:-20GB}"
 CI_LABEL="${CI_LABEL:-com.ci.selfhosted=1}"   # 必须与 workflow 里 docker run --label 的值一致
 CI_APP_PORTS="${CI_APP_PORTS:-}"          # e2e 等会在宿主上监听的端口，清理时要杀孤儿。例：3100 3101
+# 下面两个给清理钩子第 8 步用，收拾被取消的 job 留下的东西（09 章 A22）。留空就不清。
+CI_PER_RUN_IMAGE_LABEL="${CI_PER_RUN_IMAGE_LABEL:-}"   # 每次运行用唯一 tag 建的镜像带的标签键。例：com.myproj.run
+CI_TMP_GLOBS="${CI_TMP_GLOBS:-}"          # 项目工具在 /tmp 下建的临时目录，空格分隔的模式。例：myproj-scratch-*
 CI_FIXEDWORK_BASELINE="${CI_FIXEDWORK_BASELINE:-0}"   # preflight --with-load 给的 p50；0 = 只记录不告警
 METADATA_IP="${METADATA_IP:-169.254.169.254}"
 APT_LOCK_WAIT="${APT_LOCK_WAIT:-600}"     # apt/dpkg 锁被占用时最多等几秒（新机器刚开机时常见）
@@ -108,6 +112,14 @@ done
 # 不让 useradd 悄悄换一个：换了的话，CI 容器以这个 uid 写进工作区的文件 runner 删不掉，checkout 会报 EACCES。
 case "$RUNNER_UID" in ''|*[!0-9]*) echo "RUNNER_UID 要是数字，现在是：$RUNNER_UID" >&2; exit 2 ;; esac
 case "$APT_LOCK_WAIT" in ''|*[!0-9]*) echo "APT_LOCK_WAIT 要是秒数，现在是：$APT_LOCK_WAIT" >&2; exit 2 ;; esac
+# 这两个值会被 sed 写进钩子（第 7 步），sed 用 # 作分隔符，& 和 \ 在替换串里有特殊含义，所以只放行安全字符。
+# 模式还要能落到 /tmp 下一层：不能含 /，不能以 * 或 . 开头（钩子里也会再跳过一次）。
+case "$CI_PER_RUN_IMAGE_LABEL" in *[!A-Za-z0-9._=-]*) echo "CI_PER_RUN_IMAGE_LABEL 只能含字母、数字和 . _ = -，现在是：$CI_PER_RUN_IMAGE_LABEL" >&2; exit 2 ;; esac
+case "$CI_TMP_GLOBS" in *[!A-Za-z0-9._*\ -]*) echo "CI_TMP_GLOBS 只能含字母、数字、空格和 . _ * -，现在是：$CI_TMP_GLOBS" >&2; exit 2 ;; esac
+read -ra tmp_globs <<< "$CI_TMP_GLOBS"   # read -a 不做路径展开
+for g in "${tmp_globs[@]}"; do
+  case "$g" in '*'*|.*) echo "CI_TMP_GLOBS 里的模式不能以 * 或 . 开头（会匹配 /tmp 下所有东西）：$g" >&2; exit 2 ;; esac
+done
 if ! id "$RUNNER_USER" >/dev/null 2>&1 && uid_owner=$(getent passwd "$RUNNER_UID" | cut -d: -f1) && [ -n "$uid_owner" ]; then
   echo "uid $RUNNER_UID 已被用户 $uid_owner 占用。先把它删掉或改到别的 uid，或者用 RUNNER_UID= 指定一个所有 runner 机器都一致的 uid（03 章 3.3）" >&2
   exit 1
@@ -403,7 +415,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 直接覆盖正式文件的话，在已部署的机器上试跑失败时坏钩子已经生效，「拒绝接线」就是空话。
 HOOK="$RUNNER_HOME/hooks/ci-cleanup.sh"
 if [ -f "$SELF_DIR/ci-cleanup.sh" ]; then
-  sed -e "s#__CI_APP_PORTS__#${CI_APP_PORTS}#" -e "s#__CI_LABEL__#${CI_LABEL}#" "$SELF_DIR/ci-cleanup.sh" > "$HOOK.new"
+  sed -e "s#__CI_APP_PORTS__#${CI_APP_PORTS}#" -e "s#__CI_LABEL__#${CI_LABEL}#" \
+      -e "s#__CI_PER_RUN_IMAGE_LABEL__#${CI_PER_RUN_IMAGE_LABEL}#" -e "s#__CI_TMP_GLOBS__#${CI_TMP_GLOBS}#" \
+      "$SELF_DIR/ci-cleanup.sh" > "$HOOK.new"
 else
   echo "缺少 $SELF_DIR/ci-cleanup.sh" >&2; exit 1
 fi
@@ -423,7 +437,7 @@ if ! sudo -u "$RUNNER_USER" /usr/bin/bash -e "$HOOK.new"; then
   exit 1
 fi
 # 占位符必须全部替换掉。只看赋值行：守卫那行故意保留 __CI_ 前缀做判据，不是残留。
-if grep -qE '^(L|APP_PORTS)=.*__CI_' "$HOOK.new"; then
+if grep -qE '^(L|APP_PORTS|PER_RUN_LABEL|TMP_GLOBS)=.*__CI_' "$HOOK.new"; then
   echo "钩子仍含未替换的占位符（赋值行），sed 替换失败（正式钩子没动）" >&2; exit 1
 fi
 mv -f "$HOOK.new" "$HOOK"
