@@ -35,6 +35,11 @@
 #  ⑥ 磁盘告警只报数，不替人下结论。原来的文案写的是「是 Docker 以外的东西在吃盘」，参考项目那次 CRIT
 #     查下来，可用空间少掉的部分七成在 containerd 里：被取消的 job 留下的镜像，BuildKit GC 管不到（09 章 B20）。
 #     现在告警带上 containerd、/tmp 和其余部分各占多少，采样行也多记一个 tmp=。
+#  ⑦ 服务 active 不代表 runner 在接 job。服务的主进程是 runsvc.sh，listener 崩了由它在里面重新拉起，
+#     systemd 看不到，NRestarts 一直是 0。参考项目第二台盘满时 listener 一启动就崩，离线四个多小时，
+#     这里一直记 runner=active（09 章 A23）。现在另看 Runner.Listener 进程，采样行多记一个 listener=。
+#  ⑧ 磁盘 WARN 在两个 job 之间量。job 运行时它的镜像、临时目录都还在，参考项目一个算法测试 job 运行中要多占
+#     约 5 GB，整点采样撞上就报 WARN，job 一结束又回来了（09 章 B21）。CRIT 照常立刻报。
 set -uo pipefail
 LOG="${CI_HEALTH_LOG:-/var/log/ci-health.log}"
 SVC="__RUNNER_SVC__"                      # 由 bootstrap.sh 替换；--skip-runner 装的机器上是 none
@@ -97,6 +102,16 @@ tmpm=$(du -sxBM /tmp 2>/dev/null | cut -f1 | tr -dc 0-9)
 used=$(df --output=used -BM / 2>/dev/null | tail -1 | tr -dc 0-9)
 vol=$(du -sBM /var/lib/docker/volumes 2>/dev/null | cut -f1 | tr -dc 0-9)
 run="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && run=$(systemctl is-active "$SVC" 2>/dev/null)
+# listener 进程活了多少秒；不在就输出空。按进程名精确匹配（-x），取最老的那个（-o）
+listener_age(){ local p; p=$(pgrep -xo Runner.Listener 2>/dev/null) || return 0; ps -o etimes= -p "$p" 2>/dev/null | tr -dc 0-9; }
+# 不在、或者活了不到 60 秒时隔一会儿再看一次：刚重启服务、runner 自更新时第一次会不正常，再看就好了；
+# 反复崩溃时（参考项目上是几秒一次）两次都不正常。只有不正常时才多等这一下。
+listener="n/a"
+if [ "$run" = active ]; then
+  la=$(listener_age)
+  if [ "${la:-0}" -lt 60 ]; then sleep "${CI_HEALTH_LISTENER_WAIT:-90}"; la=$(listener_age); fi
+  if [ -z "$la" ]; then listener=none; elif [ "$la" -lt 60 ]; then listener="restarting(${la}s)"; else listener="${la}s"; fi
+fi
 # 内存只记录不告警：runner cgroup 自上次启动以来的峰值（含页缓存，比进程实际占用高），以及整机可用内存
 mem_peak="n/a"
 if [ "$SVC" != "none" ] && [ -n "$SVC" ]; then
@@ -104,6 +119,22 @@ if [ "$SVC" != "none" ] && [ -n "$SVC" ]; then
   case "$p" in ''|*[!0-9]*) ;; *) mem_peak="$((p / 1048576))M" ;; esac
 fi
 mem_avail="$(awk '/^MemAvailable:/{printf "%dM", $2/1024}' /proc/meminfo 2>/dev/null)"
+
+# 可用空间落在 WARN 和 CRIT 之间、又正好有 job 在跑时，等到本机没有 job 的那一刻再量一次，WARN 以那次为准。
+# 那一刻上一个 job 的清理（它自己的和 JOB_COMPLETED 钩子）都已经跑完。job 之间的空档常常只有两三秒，
+# 所以每 0.5 秒看一次，空档里只用 df 量可用空间（毫秒级）；du containerd 要几十秒，来不及，告警里的分项
+# 仍用整点那次的值。等满 CI_HEALTH_IDLE_WAIT 秒（默认 25 分钟）还一直有 job，这一小时就不判 WARN，下一小时再看。
+avail_idle=""
+if [ "${avail:-999999}" -lt "$WARN_MB" ] && [ "${avail:-0}" -ge "$CRIT_MB" ] && pgrep -x Runner.Worker >/dev/null 2>&1; then
+  idle_end=$(( $(date +%s) + ${CI_HEALTH_IDLE_WAIT:-1500} ))
+  while [ "$(date +%s)" -lt "$idle_end" ]; do
+    if ! pgrep -x Runner.Worker >/dev/null 2>&1; then
+      avail_idle=$(df --output=avail -BM / 2>/dev/null | tail -1 | tr -dc 0-9); break
+    fi
+    sleep 0.5
+  done
+  [ -n "$avail_idle" ] || avail_idle=busy
+fi
 
 # ── job 产出采样（2026-09-07 事故后补）──────────────────────────────────
 #
@@ -171,7 +202,7 @@ PY
   fi
 fi
 
-echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M" >> "$LOG"
+echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}" >> "$LOG"
 
 # ── 告警 ────────────────────────────────────────────────────────────────
 # 每条告警一个稳定的 key，用于推送去重（数值每小时都在变，key 不变）。
@@ -190,10 +221,21 @@ disk_parts="${ctr_s}，${tmp_s}，根分区其余 ${rest}MB。先看 docker imag
 if [ "${avail:-999999}" -lt "$CRIT_MB" ]; then
   warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB，已远低于 BuildKit GC 的 Min Free，GC 腾不出空间了。${disk_parts}"
 elif [ "${avail:-999999}" -lt "$WARN_MB" ]; then
-  warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB，已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存。${disk_parts}"
+  case "$avail_idle" in
+    "")   warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB，已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存。${disk_parts}" ;;
+    # 一直有 job，量不到 job 之间的值，这一小时不判。上一次推送里有这条 WARN 的话照旧带上，
+    # 否则告警集合一变，就会推一条「已全部消除」，下一小时又报回来。
+    busy) case " $(cat "$STATE_DIR/keys" 2>/dev/null) " in *" disk_warn "*)
+            warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB（这一小时一直有 job 在跑，量不到两个 job 之间的值，沿用上一次的 WARN）。${disk_parts}" ;; esac ;;
+    *)    [ "$avail_idle" -lt "$WARN_MB" ] && warn disk_warn "WARN 根分区可用 ${avail_idle}MB < ${WARN_MB}MB（两个 job 之间量的），已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存。整点时有 job 在跑，当时 ${disk_parts}" ;;
+  esac
 fi
 [ -n "$CFG_ERR" ] && warn config "WARN 配置无效（应为 MiB 整数）：${CFG_ERR# }，已改用默认阈值"
 [ "$run" != "n/a" ] && [ "$run" != "active" ] && warn runner "CRIT runner 服务不是 active（当前 $run）"
+case "$listener" in
+  none) warn listener "CRIT runner 服务是 active，但隔了一会儿再看，Runner.Listener 进程还是不在，这台实际没在接 job。先看 journalctl -u $SVC 最后几行，常见原因是根分区满了（09 章 A23）" ;;
+  restarting*) warn listener "CRIT runner 服务是 active，但 Runner.Listener 两次查看都是刚启动（${listener#restarting}），在反复崩溃重启，这台实际没在接 job。先看 journalctl -u $SVC 最后几行，常见原因是根分区满了（09 章 A23）" ;;
+esac
 # 产出告警：服务 active 但 job 连红，正是 2026-09-07 那种「假绿」的唯一信号
 case "$jobs" in
   streak=[3-9]|streak=[0-9][0-9]*)

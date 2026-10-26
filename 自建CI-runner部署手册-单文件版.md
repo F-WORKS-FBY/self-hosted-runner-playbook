@@ -1656,8 +1656,9 @@ dead-man's-switch 指机器定期向外部服务发心跳，心跳停了由外�
 # /etc/systemd/system/ci-heartbeat.service
 [Service]
 Type=oneshot
-# 只有 runner 服务在跑时才上报。机器活着、runner 停了，心跳也会断
-ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -m 10 --retry 3 https://hc-ping.com/<UUID> >/dev/null'
+# 只有 runner 服务在跑、listener 也已经稳定运行 60 秒以上时才上报。机器活着、runner 停了或者 listener 在反复崩溃，心跳都会断
+# systemd 会展开 ExecStart 里的 $，要写成 $$ 才能原样交给 bash
+ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && p=$$(pgrep -xo Runner.Listener) && [ "$$(ps -o etimes= -p "$$p" | tr -dc 0-9)" -ge 60 ] && curl -fsS -m 10 --retry 3 https://hc-ping.com/<UUID> >/dev/null'
 ```
 
 再给它配一个 5 分钟的 timer。这一层能发现以下情况：
@@ -1665,12 +1666,13 @@ ExecStart=/bin/bash -c 'systemctl is-active --quiet <runner-unit> && curl -fsS -
 - 机器宕机
 - 网络断开
 - runner 进程退出
+- runner 服务还是 active，但 listener 在反复崩溃（09 章 A23）
 
 装好后先手工执行一次 `ExecStart` 里的命令，确认心跳服务收到了。有的地区的机房访问某些心跳服务不稳定，连不上就换一家或者配代理（02 章 2.9）。
 
 有多台机器时，每台在心跳服务上单独建一个检查，用各自的 UUID，检查名带上主机名或 `RUNNER_NAME`，告警时能看出是哪一台。几台共用一个检查的话，只要还有一台在报，别的机器挂了也发现不了。撤掉一台机器时，要同时删掉它的检查，不然它会一直告警，步骤见 08 章 8.7。
 
-心跳只看 runner 服务是不是 active。服务 active 只说明进程还在，这台机器能不能领到 job、跑得对不对，心跳看不出来。这些要看 verify.sh 的 GitHub 侧检查（07 章）、ci-health 的产出告警（服务 active 但本机的 job 连续失败），以及每台机器最近有没有领到过 job（08 章 8.7）。
+心跳只看 runner 服务和 listener 进程在不在。进程在只说明它还活着，这台机器能不能领到 job、跑得对不对，心跳看不出来。这些要看 verify.sh 的 GitHub 侧检查（07 章）、ci-health 的产出告警（服务 active 但本机的 job 连续失败），以及每台机器最近有没有领到过 job（08 章 8.7）。
 
 #### ② 兜底层：挂在已有 workflow 上（0 新增计费 run）
 
@@ -1778,7 +1780,7 @@ SKIP 有两种。一种是上面说的机器在忙，跳过了会打断 job 的�
 
 | 分组 | 检查项 | 不通过意味着 |
 |---|---|---|
-| 服务与开机自启 | docker / containerd / runner 三个 unit `active + enabled` | 重启后回不来 |
+| 服务与开机自启 | docker / containerd / runner 三个 unit `active + enabled`；`Runner.Listener` 进程在跑 | 重启后回不来；服务 active 但 listener 不在，这台没在接 job（09 章 A23）。listener 刚启动不到 60 秒时只提示 |
 | runner 加固 | `Restart=always`、`StartLimitIntervalSec=0`、`MemoryMax`、`OOMScoreAdjust` 等于 `RUNNER_OOM_ADJ`（没写按 800）且大于 0、`After=docker`；runner 用户的 uid 等于 `RUNNER_UID`（默认 1000） | 前几项见 04 章 4.3。uid 不一致只提示（SKIP），原因见 03 章 3.3 |
 | Docker | `live-restore=true`；BuildKit GC 有 Max Used 与 Min Free 两项 | 见表下说明 |
 | 清理与监控 | 共 11 项，见表下说明 | 见表下说明 |
@@ -2152,9 +2154,11 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
   - WARN < 40 GB：在设计稳态下每小时都会触发，一个月响了 309 次，没有送达任何人。
   - CRIT < 20000 MB：只比 Min Free（20480 MiB）低 480 MiB。
   - 现在的阈值：WARN = Min Free + 1 GiB，对应可用空间被挤到 Min Free 附近、GC 开始为保底驱逐缓存的时刻；CRIT = 10 GiB。
+  - WARN 在两个 job 之间量。整点采样时有 job 在跑，就等到本机没有 job 的那一刻再量，job 自己的临时占用不会触发 WARN（09 章 B21）。CRIT 照常立刻报。
   - bootstrap 会从 `BUILDKIT_MIN_FREE` 自动算出阈值，写进 `/etc/cron.d/ci-health`，同时落盘到 `/etc/ci-runner.env`。以后改了 `BUILDKIT_MIN_FREE`，这个阈值不会跟着重算，做法见 10 章 10.4。
 - 告警要送到人。只写本机 journal 等于没有告警。在 `/etc/ci-health.env` 里配置 `CI_ALERT_WEBHOOK` 后，告警集合一有变化就推送，持续存在的告警每 24 小时提醒一次。消息标题带主机名，几台机器推到同一个群也分得清。脚本目前只实现了飞书自定义机器人的消息格式和签名，换成 Slack、钉钉、企业微信，要改 `ci-health.sh` 里的 `notify()`。
 - 失败连续计数只看落在本机上的 job，按本机的 runner 名匹配。按整个 run 的结论统计会有两种误报：GitHub 托管的检查（PR 标题之类）失败会被算进来；多台机器共用一套标签时，同一个 run 的 job 会分到几台机器上，别的机器上的 job 红了，这台也会报连续失败。读不到本机的 runner 名时，这一项报采样失败，不会退回去统计全仓库；用 `--skip-runner` 装、还没注册的机器上，这一项跳过。被取消的 run 整个不算：新推送顶掉旧 run 时，写了 `if: always()` 的汇总 job 会因为前面的 job 被取消而判失败，不跳过的话 PR 推得勤时很快就凑满 3 次（09 章 B11）。
+- runner 服务是 active，不代表它在接 job。listener 崩了由 `runsvc.sh` 在里面重新拉起，systemd 看不到。ci-health 另看 `Runner.Listener` 进程，不在或者一直是刚启动就报 CRIT（09 章 A23）。
 - 除了水位，也要看增量。日增超过预期两倍时，检查是不是哪个构建的层序坏了。
 
 > 注意：开发工具（VS Code 远程服务端、Claude Code、Codex 等）在 CI 机上同时占磁盘和内存。磁盘方面，VS Code 远程服务端每次客户端升级就多留一份，参考机上一份约 650 MB，一个月攒了 5 份，要在每月巡检时删（8.6）。内存方面后果更重，参考项目在 8 GB 的 CI 机上开发了两天，出了 11 次全局 OOM。最好不在 CI 机上开发；一定要开发，按 04 章 4.8 配置。
@@ -2361,7 +2365,7 @@ sed "s#__RUNNER_SVC__#<runner 服务>#" scripts/ci-health.sh > /usr/local/bin/ci
 
 本章记录部署和运行中踩过的坑，分三部分：
 
-- A. 环境的坑：换一台机器还会遇到。A15–A21 是装新机器、准备加第二台机器时遇到的，A22 是两台都上线以后发现的。
+- A. 环境的坑：换一台机器还会遇到。A15–A21 是装新机器、准备加第二台机器时遇到的，A22、A23 是两台都上线以后发现的。
 - B. 判断方法上的错误：换个环境还会以别的形式出现，比 A 更值得读。
 - C. 有争议、未采纳的建议，以及不采纳的数据依据。
 
@@ -2660,6 +2664,18 @@ runner 取消一个步骤时，只给这一步的 bash 发 SIGINT，等 7.5 秒�
 
 排查时用 Worker 日志对账：`_diag/Worker_*.log` 里 `"jobDisplayName"` 后面是 job 名，`Job result after all job steps finish:` 后面是结局，再拿残留文件的创建时间去对。
 
+#### A23. runner 服务是 active，listener 却一直在崩
+
+参考项目第二台根分区满了以后，runner 的 listener 一启动就要往 `_diag` 里写日志，写不进去就崩，几秒后又被拉起来再崩。从 10:34 到 14:58，这台一个 job 也没接，job 全排到了第一台。这期间 `systemctl is-active` 一直是 active，ci-health 每小时都记 `runner=active`，「服务不是 active」那条告警一次也没响。
+
+原因：runner 服务的主进程是 `runsvc.sh`。listener 是它拉起来的子进程，退出后由它在里面重新拉起，systemd 看不到这些重启，`NRestarts` 一直是 0。盘满时 journald 也写不进去，事后翻 journal 只能看到最后几分钟。
+
+修法：
+
+- ci-health 另看 `Runner.Listener` 进程。进程不在、或者活了不到 60 秒，就隔 90 秒再看一次，两次都不正常才报 CRIT。刚重启服务、runner 自更新时第一次会不正常，第二次就好了。
+- verify.sh 的「服务与开机自启」组加了同样的一项。
+- 外部心跳也要看 listener，写法见 06 章 6.4 ①。
+
 ---
 
 ### B. 判断方法上的错误
@@ -2940,6 +2956,18 @@ ci-health 原来的磁盘告警写的是「GC 腾不出空间了，是 Docker �
 
 > 告警文案里写的原因，是写告警那天的假设，不是这一次的事实。告警里只写测到的数，结论留给查的人。
 
+#### B21. 告警采样撞上了 job 自己的临时占用
+
+A22 修好以后，第一台又报了一次 WARN：可用 20647 MB，低于 21504 MB 的 WARN 线。查下来那一刻正好有个算法测试 job 在跑，它的镜像和 `/tmp` 目录临时多占了约 4.7 GB；job 一结束，可用空间回到 22.3 GB，什么都没漏。
+
+问题在采样方式。ci-health 每小时量一次，量的是那一刻的可用空间，不管当时有没有 job。WARN 线是 Min Free + 1 GiB，而这台空闲时只比 WARN 线高不到 1 GB，任何一个临时写盘超过 1 GB 的 job 撞上整点都会触发。这条告警本来要抓的是「有东西一直在涨，把空间挤向 Min Free」，job 跑完就还回来的那部分不在此列。
+
+修法：可用空间落在 WARN 和 CRIT 之间、又正好有 job 在跑时，ci-health 等到本机没有 job 的那一刻再量一次，以那次为准；一直有 job、等满 25 分钟也没等到，这一小时就不判 WARN。CRIT 照常立刻报。
+
+教训：
+
+> 采样前先想清楚要量的是什么。要量的是稳态，就避开会让它临时偏离的时刻，别拿一个瞬时值去比稳态的阈值。
+
 ---
 
 ### C. 有争议、未采纳的建议
@@ -3159,6 +3187,8 @@ Reserved = min(10 GB, Max Used ÷ 2)
 CI_DISK_WARN_MB = Min Free 换算成 MiB + 1024                    bootstrap 按 BUILDKIT_MIN_FREE 自动算
 CI_DISK_CRIT_MB = max(10240, 2 × k × 单 job 临时写盘（MiB）)     默认 10240，要改就显式传
 ```
+
+WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job 临时写盘留余量；CRIT 是随时量的，上面的公式已经算进了它。
 
 按盘大小查（W = 20 GB，F = 25 GB，k = 1）。表里的盘总量指 Docker 数据所在的那块盘。有的厂商默认系统盘只有几十 GB 甚至更小，建机时改大，或者另挂数据盘放 Docker。脚本按 Docker 数据在根分区上写，分开放的见 02 章 2.9 表下的说明。
 

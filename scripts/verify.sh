@@ -65,6 +65,13 @@ for u in docker containerd ${SVC:-}; do
   [ "$a" = "active" ] && [ "$e" = "enabled" ] && ok "$u  active + enabled" || no "$u  active=$a enabled=$e"
 done
 [ -n "$SVC" ] || no "找不到 runner 服务单元。还没注册？用 --skip-runner 装的机器注册前就是这样，注册后再跑一次"
+# 服务 active 不代表 listener 在跑：listener 崩了由 runsvc.sh 在里面重新拉起，systemd 看不到（09 章 A23）
+if [ -n "$SVC" ] && [ "$(systemctl is-active "$SVC" 2>/dev/null)" = active ]; then
+  lp=$(pgrep -xo Runner.Listener 2>/dev/null); la=""; [ -n "$lp" ] && la=$(ps -o etimes= -p "$lp" 2>/dev/null | tr -dc 0-9)
+  if [ -z "$la" ]; then no "runner 服务是 active，但没有 Runner.Listener 进程，这台没在接 job。journalctl -u $SVC 看原因（09 章 A23）"
+  elif [ "$la" -lt 60 ]; then sk "Runner.Listener 刚启动 ${la} 秒。刚重启过服务就正常；过一分钟再跑还是这样，说明它在反复崩溃（09 章 A23）"
+  else ok "Runner.Listener 在跑（已运行 ${la} 秒）"; fi
+fi
 [ "$NSVC" -gt 1 ] && sk "本机有 $NSVC 个 runner 服务，本脚本只检查第一个（$SVC）。同机多实例的前提见 10 章 10.6"
 
 hdr "runner 加固"

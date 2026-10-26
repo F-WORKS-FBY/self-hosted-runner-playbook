@@ -198,6 +198,7 @@ flowchart LR
 | `preflight.sh` | 第一台实跑 | 13 PASS / 2 WARN |
 | `verify.sh` | 第一台实跑（2026-10-16 重启后；2026-10-26 部署新版后） | 34 PASS / 0 FAIL；37 PASS / 0 FAIL（当时有 job，2 项 SKIP） |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
+| `ci-health.sh` 的 listener 检查、磁盘 WARN 在 job 之间量（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里用假的 `Runner.Listener`、`Runner.Worker` 进程测了 10 种情况；心跳示例在第一台用临时 systemd 单元实跑 | 通过：listener 不在、反复崩溃时报，刚启动后稳定时不报；job 结束后才量、一直忙时不判 WARN（上一次有 WARN 就沿用，不推「已恢复」）、低于 CRIT 时不等 |
 | `ci-cleanup.sh` 第 8 步（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里 24 项用例；两台 runner 空闲时各用真实镜像和 `/tmp` 目录实跑一次 | 通过：只删同时带两种标签的镜像和匹配的 runner 目录，对照对象、编译缓存、别的用户的同名目录都在 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
