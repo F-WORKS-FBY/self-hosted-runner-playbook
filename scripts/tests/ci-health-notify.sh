@@ -205,6 +205,12 @@ check 1 "请求体小于 19000 字节" 'len(raw) < 19000'
 [ "$(keys)" = "disk_warn " ] && ok "状态文件记下 disk_warn" || no "状态文件是「$(keys)」"
 save_sample 1 pb-warn-disk.json
 
+echo "== 2b. 正常时的采样行：fixedwork 只写一次秒数"
+reset_state
+run_health FAKE_AVAIL=999999 FAKE_FIXEDWORK=2.100
+grep ' fixedwork=' "$LOG_T" | tail -1 | grep -q ' fixedwork=2.100s root_avail=' \
+  && ok "采样行是 fixedwork=2.100s" || no "采样行不对：$(grep ' fixedwork=' "$LOG_T" | tail -1)"
+
 echo "== 3. 告警没变：不重复发"
 run_health FAKE_AVAIL=21300
 [ "$(nreq)" = 1 ] && ok "没有新请求" || no "又发了（共 $(nreq) 个）"
@@ -348,9 +354,9 @@ echo "== 16b. 上次报连续失败、这次没配 token（jobs=skip）：只剩
 reset_state; mkdir -p "$T/state"; printf 'streak ' > "$T/state/keys"
 { echo "CI_ALERT_WEBHOOK=$HOOK"; echo "CI_ALERT_SECRET=$SECRET_T"; } > "$T/ci-health.env"
 run_health
-check 1 "橙色告警卡，标题写看不到了，副标题只有变化" 'h["template"] == "orange" and h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 本机 job 连续失败 看不到了" and sub == "1 条看不到了"'
+check 1 "橙色告警卡，标题写看不到了，副标题只有变化" 'h["template"] == "orange" and h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：「CRIT 本机 job 连续失败」看不到了" and sub == "1 条看不到了"'
 check 1 "单条四节，情况写明为什么看不到、不算消除" 'heads == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"] and "\n- `'"$T"'/ci-health.env` 里没有只读 token 或 `GH_REPO=`，这一项没在查\n- 上次报的「CRIT 本机 job 连续失败」看不到了，不算消除\n" in m and "恢复" not in m'
-check 1 "先做什么：root 那句开头，补回两行，token 找人建" '"#### 3. 先做什么\n'"$ROOT_T"'：\n\n1. 看 `'"$T"'/ci-health.env` 里 `GH_REPO=`、`CI_HEALTH_GH_TOKEN=` 两行还在不在\n2. 少了哪行补哪行，token 要找有仓库管理权限的人建只读 token" in m and root_ok()'
+check 1 "先做什么：root 那句开头，补回两行，token 找人建" '"#### 3. 先做什么\n'"$ROOT_T"'：\n\n1. 看 `'"$T"'/ci-health.env` 里 `GH_REPO=`、`CI_HEALTH_GH_TOKEN=` 两行还在不在\n2. 少了哪行补哪行；没有 token 就找有仓库管理权限的人建只读 token" in m and root_ok()'
 [ -z "$(keys)" ] && ok "推送后状态文件清空" || no "状态文件是「$(keys)」"
 save_sample 1 pb-unseen-skip.json
 run_health
@@ -358,6 +364,13 @@ run_health
 reset_state; mkdir -p "$T/state"; printf 'streak ' > "$T/state/keys"; echo "11246 0" > "$T/srv/codes"
 run_health
 check 2 "卡片被拒时的文本消息也写看不到了，不写已全部消除" 'b["msg_type"] == "text" and b["content"]["text"] == "[CI runner 告警] '"$RUNNER_NAME_T"'（'"$HOST_T"'）\n· 上次报的「本机 job 连续失败」这次看不到了（没配只读 token 或 GH_REPO，不查这一项），不算消除"'
+write_env "$HOOK" "$SECRET_T"
+
+echo "== 16b2. 上次报读不到 job 结果、这次没配 token（jobs=skip）：那条也看不到了，不发恢复卡"
+reset_state; mkdir -p "$T/state"; printf 'jobsprobe ' > "$T/state/keys"
+{ echo "CI_ALERT_WEBHOOK=$HOOK"; echo "CI_ALERT_SECRET=$SECRET_T"; } > "$T/ci-health.env"
+run_health
+check 1 "橙色告警卡，标题写「读不到本机 job 结果」看不到了" 'h["template"] == "orange" and h["title"]["content"].endswith("：「WARN 读不到本机 job 结果」看不到了") and sub == "1 条看不到了"'
 write_env "$HOOK" "$SECRET_T"
 
 echo "== 16c. 上次报 CPU 变慢、这次定长任务崩了，同时新出现磁盘 WARN：CPU 那条单列一节标看不到了"

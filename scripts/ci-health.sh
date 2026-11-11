@@ -246,11 +246,13 @@ fi
 jobs_why=${jobs_why:-}; jobs_why=${jobs_why//[$'\t\r\n']/ }; jobs_why=$(hide_token "$jobs_why")
 # 没配 token、没有 runner 服务时连续失败这一项不查
 case "$jobs" in
-  skip)   UNSEEN+=("streak|skip|上次报的「本机 job 连续失败」这次看不到了（没配只读 token 或 GH_REPO，不查这一项），不算消除") ;;
+  skip)   UNSEEN+=("streak|skip|上次报的「本机 job 连续失败」这次看不到了（没配只读 token 或 GH_REPO，不查这一项），不算消除")
+          UNSEEN+=("jobsprobe|skip|上次报的「读不到本机 job 结果」这次看不到了（没配只读 token 或 GH_REPO，不查这一项），不算消除") ;;
   skip:*) UNSEEN+=("streak|no-runner|上次报的「本机 job 连续失败」这次看不到了（这台按没有 runner 服务装的，不查这一项），不算消除") ;;
 esac
 
-echo "$(date -Is) fixedwork=${t:+${t}s}${t:-n/a} root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}" >> "$LOG"
+fw=${t:+${t}s}; fw=${fw:-n/a}   # 有秒数写「2.100s」，没跑出结果写「n/a」
+echo "$(date -Is) fixedwork=${fw} root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}" >> "$LOG"
 # 定长任务没跑出结果时另记一行原因：采样行里只有 fixedwork=n/a
 [ -n "$t" ] || echo "$(date -Is) WARN 定长任务没跑出结果（${t_why}），这一小时不判 vCPU 争抢" >> "$LOG"
 
@@ -556,7 +558,7 @@ def t_unseen(key, why):   # 上次报过、这次量不到的一条，没有别�
         fact = "%s 里没有只读 token 或 `GH_REPO=`，这一项没在查" % code(ENVF)
         impact, links = "这台的 job 连续失败时不会报警", [L_MON, L_TOKEN]
         steps = ["看 %s 里 `GH_REPO=`、`CI_HEALTH_GH_TOKEN=` 两行还在不在" % code(ENVF),
-                 "少了哪行补哪行，token 要" + NEW_TOKEN, "下一小时 " + JOBS_BACK]
+                 "少了哪行补哪行；没有 token 就" + NEW_TOKEN, "下一小时 " + JOBS_BACK]
     elif why == "no-runner":
         fact = "这台的 ci-health 是按没有 runner 服务装的，这一项没在查"
         impact, links = "这台的 job 连续失败、runner 不在接 job 时都不会报警", [L_UPDATE]
@@ -606,7 +608,7 @@ def alert_card():
     keys = [a[0] for a in alerts]
     new, gone = [k for k in keys if k not in PREV], [k for k in PREV if k not in keys]
     unseen = [k for k in gone if k in BLOCKED_BY and BLOCKED_BY[k][0] in keys]   # 写进挡住它的那一条
-    loose = [k for k in gone if k not in unseen and k in UNSEEN]                  # 没有告警挡着：单列一节
+    loose = sorted((k for k in gone if k not in unseen and k in UNSEEN), key=lambda k: LEVELS[k] != "CRIT")  # 没有告警挡着：单列一节，CRIT 在前
     gone = [k for k in gone if k not in unseen and k not in loose]
     crit = sum(a[1] == "CRIT" for a in alerts)
     if not PREV:
@@ -623,7 +625,7 @@ def alert_card():
     # 每条一节：告警在前，看不到了的在后。(多条时的节标题, 单条时的标题, 内容, 情况)
     entries = [(headline(k, lv, f, md=True) + ("（新）" if PREV and k in new else ""), headline(k, lv, f), it, facts(k, it))
                for k, lv, f in alerts for it in [items(k, f)]]
-    entries += [(label(k) + " 看不到了", "%s %s 看不到了" % (LEVELS[k], NAMES[k]), it, it["facts"])
+    entries += [(label(k) + " 看不到了", "「%s %s」看不到了" % (LEVELS[k], NAMES[k]), it, it["facts"])
                 for k in loose for it in [t_unseen(k, UNSEEN[k])]]
     title = "[CI runner 告警] %s：%s%s" % (RUNNER or HOST or "?", entries[0][1],
                                           "，等 %d 条" % len(entries) if len(entries) > 1 else "")
