@@ -481,7 +481,11 @@ systemctl daemon-reload; systemctl enable --now ci-cleanup.timer >/dev/null 2>&1
 info "ci-cleanup.timer $(systemctl is-active ci-cleanup.timer)"
 
 if [ -f "$SELF_DIR/ci-health.sh" ]; then
-  sed "s#__RUNNER_SVC__#${SVC:-none}#" "$SELF_DIR/ci-health.sh" > /usr/local/bin/ci-health.sh
+  # 两个占位符：runner 服务名，和这份手册仓库的目录（ci-health 的告警卡片里写「用 root 跑 bash <目录>/scripts/verify.sh」）。
+  # 目录只认普通路径字符，别的（空格、引号、$ 之类）写空，卡片改写成「装机用的手册仓库」：它要原样进 sed 和脚本里的一行赋值。
+  PB_DIR=$(cd "$SELF_DIR/.." && pwd)
+  case "$PB_DIR" in *[!A-Za-z0-9_./-]*) PB_DIR="" ;; esac
+  sed -e "s#__RUNNER_SVC__#${SVC:-none}#" -e "s#__PLAYBOOK_DIR__#${PB_DIR}#" "$SELF_DIR/ci-health.sh" > /usr/local/bin/ci-health.sh
   chmod 0755 /usr/local/bin/ci-health.sh
   printf 'CI_FIXEDWORK_BASELINE=%s\nCI_DISK_WARN_MB=%s\nCI_DISK_CRIT_MB=%s\n13 * * * * root /usr/local/bin/ci-health.sh\n' \
     "$CI_FIXEDWORK_BASELINE" "$CI_DISK_WARN_MB" "$CI_DISK_CRIT_MB" > /etc/cron.d/ci-health
@@ -497,6 +501,7 @@ if [ -f "$SELF_DIR/ci-health.sh" ]; then
   [ -n "${CI_ALERT_WEBHOOK:-}" ]   && set_kv CI_ALERT_WEBHOOK "$CI_ALERT_WEBHOOK"
   [ -n "${CI_ALERT_SECRET:-}" ]    && set_kv CI_ALERT_SECRET "$CI_ALERT_SECRET"
   info "健康监控已装（每小时 13 分；磁盘 WARN<${CI_DISK_WARN_MB}MB CRIT<${CI_DISK_CRIT_MB}MB）"
+  [ -n "$PB_DIR" ] || info "  手册仓库的路径里有字母、数字和 _./- 以外的字符，告警卡片里不写 verify.sh 的完整路径"
   grep -qE '^(CI_HEALTH_GH_TOKEN|GH_TOKEN)=.+' /etc/ci-health.env || info "  未配 CI_HEALTH_GH_TOKEN：job 产出采样为 skip"
   grep -qE '^GH_TOKEN=' /etc/ci-health.env && info "  注意：/etc/ci-health.env 里有旧版写入的 GH_TOKEN（通常是注册用的管理员 token，CI job 读得到），换成只读的 CI_HEALTH_GH_TOKEN 后删掉那一行"
   grep -qE '^CI_ALERT_WEBHOOK=.+' /etc/ci-health.env || info "  未配 CI_ALERT_WEBHOOK：告警只写本机 journal，没有接收方"

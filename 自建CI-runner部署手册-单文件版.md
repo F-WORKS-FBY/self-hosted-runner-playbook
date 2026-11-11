@@ -2011,7 +2011,7 @@ bash scripts/verify.sh
 - GitHub 上几台都在，名字各不相同，标签相同。老机器那一条的 ID 没变，说明新机器没有用同名把它顶掉（09 章 A18）。在 CI 机以外查的命令见 7.1 末尾。
 - 7.2 ① 的查询里出现了新机器的名字，每种重 job 都在新机器上至少绿过一次。
 - 新机器的 ci-health 只统计自己的 job。执行 `grep -o 'jobs=[^ ]*' /var/log/ci-health.log | tail -3`，应是 `streak=` 开头。`skip` 是没配只读 token；`skip:no-runner` 是 ci-health 在注册之前装的，注册时没有重跑 bootstrap；`error:no-runner-name` 是读不到本机的 `.runner`。
-- 告警卡片的标题带这台的 runner 注册名、副标题带主机名，几台推到同一个群也分得清（08 章 8.2）。
+- 告警卡片的标题带这台的 runner 注册名，几台推到同一个群也分得清；卡片里 `verify.sh` 的路径是这台上手册仓库的路径（08 章 8.2）。
 - 新机器在心跳服务上有自己的检查项（06 章 6.4）。
 
 ---
@@ -2158,10 +2158,14 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
   - bootstrap 会从 `BUILDKIT_MIN_FREE` 自动算出阈值，写进 `/etc/cron.d/ci-health`，同时落盘到 `/etc/ci-runner.env`。以后改了 `BUILDKIT_MIN_FREE`，这个阈值不会跟着重算，做法见 10 章 10.4。
 - 告警要送到人。只写本机 journal 等于没有告警。在 `/etc/ci-health.env` 里配置 `CI_ALERT_WEBHOOK` 后，告警集合一有变化（新出现、部分或全部消除）就推送，持续存在的告警每 24 小时提醒一次。脚本目前只实现了飞书自定义机器人的卡片和签名，换成 Slack、钉钉、企业微信，要改 `ci-health.sh` 里的 `notify()`。
 - 推送的是飞书卡片，看群的人不用读完一整段才知道多严重、先做什么：
-  - 标题「[CI runner 告警] <runner 注册名>：<最严重那条>」，几条同时出现时加「等 N 项」；副标题是主机名、级别和这次的变化（新出现、消除几条、24 小时提醒）。几台机器推到同一个群也分得清。
-  - 颜色：有 CRIT 是红色，只有 WARN 是橙色。全部消除时发绿色的「[CI runner 恢复]」卡片，列出消除了哪几条（取自上一次推送时记下的告警，`/var/lib/ci-health/keys`）。
-  - 每条告警分成情况（测到的数）、影响（一句话）、先做什么（1～3 步命令）、去哪看（这份手册对应章节的链接和本机采样记录；链接指向手册的公开仓库，fork 之后改 `ci-health.sh` 里的 `DOC_URL`）。本机日志和 journal 里仍是原来的单行文本。
-  - 卡片拼不出来、超过 19000 字节，或者飞书以卡片格式不对拒收（返回码 11246、9499）时，改发原来的文本消息，并在 `ci-health.log` 记一行。被限流（11232）等 5 秒重发一次。其余失败只记日志，下一小时重推。
+  - 标题「[CI runner 告警] <runner 注册名>：<级别> <最严重那条>」，比如「…：CRIT 本机 job 连续失败 3 次」；几条同时出现时加「等 N 条」。手机通知只显示标题，级别要在标题里看得到。
+  - 副标题是各级条数和这次的变化（新出现、消除几条、超过 24 小时再提醒）。不放主机名：标题里的注册名已经分开了几台机器，云上的默认主机名常是一串编号，和注册名的编号容易看反。读不到注册名时标题用主机名。
+  - 颜色：有 CRIT 是红色，只有 WARN 是橙色。
+  - 每条告警分成情况（测到的数）、影响（一句话）、先做什么（几步命令，要 root 的写明）、去哪看（这份手册对应章节的链接和这台的采样记录；链接指向手册的公开仓库，fork 之后改 `ci-health.sh` 里的 `DOC_URL`）。本机日志和 journal 里仍是单行文本。
+  - 要人跑 `verify.sh` 时，卡片写出这台上手册仓库的完整路径，比如「用 root 跑 `bash /root/<手册仓库>/scripts/verify.sh`」。路径是 bootstrap 渲染进去的（下面「更新已部署的机器」）；目录挪走了就改写成「装机用的手册仓库里的 `scripts/verify.sh`」。
+  - 一条检查在另一条出现时量不到：job 采样出错时看不到连续失败，runner 服务不是 active 时不查 listener。上次报过的这两条，这次标「看不到了」，不算消除。
+  - 全部消除时发绿色的「[CI runner 恢复]」卡片，列出消除了哪几条（取自上一次推送时记下的告警，`/var/lib/ci-health/keys`）。它只说明这次整点检查没再报，不代表原因查清了，所以照样列出各条告警时的「先做什么」，没做完的接着做。
+  - 卡片拼不出来、超过 19000 字节，或者飞书以卡片格式不对拒收（返回码 11246、9499）时，改发原来的文本消息，并在 `ci-health.log` 记一行。被限流（11232）等 5 秒重发一次。其余失败只记日志，下一小时重推。日志里的推送结果不带推送地址和密钥，地址写错时也一样。
   - 卡片的用例在 `scripts/tests/ci-health-notify.sh`，不要 root、不联网，改了文案或推送逻辑要跑一遍。
 - 失败连续计数只看落在本机上的 job，按本机的 runner 名匹配。按整个 run 的结论统计会有两种误报：GitHub 托管的检查（PR 标题之类）失败会被算进来；多台机器共用一套标签时，同一个 run 的 job 会分到几台机器上，别的机器上的 job 红了，这台也会报连续失败。读不到本机的 runner 名时，这一项报采样失败，不会退回去统计全仓库；用 `--skip-runner` 装、还没注册的机器上，这一项跳过。被取消的 run 整个不算：新推送顶掉旧 run 时，写了 `if: always()` 的汇总 job 会因为前面的 job 被取消而判失败，不跳过的话 PR 推得勤时很快就凑满 3 次（09 章 B11）。
 - runner 服务是 active，不代表它在接 job。listener 崩了由 `runsvc.sh` 在里面重新拉起，systemd 看不到。ci-health 另看 `Runner.Listener` 进程，不在或者一直是刚启动就报 CRIT（09 章 A23）。
@@ -2297,7 +2301,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 - runner 用户的 uid 每台相同（03 章 3.3）。
 - 和机器有关的参数每台单独定。`CI_FIXEDWORK_BASELINE` 用这台自己跑 `preflight.sh --with-load` 得到的 p50，不能抄别的机器，也不能拿来比两台的快慢（8.3）。`RUNNER_MEM_MAX`、`RUNNER_OOM_ADJ`、BuildKit 三个值按这台的内存和盘定（10 章）。
 
-监控也按台看。每台的 ci-health 只统计落在本机的 job，告警标题带主机名。verify.sh 的 GitHub 侧检查按本机 `.runner` 里的注册 ID 找自己那一条。心跳每台单独建一个检查（06 章 6.4）。06 章的排队哨兵在多台时，只有全部下线或全部忙满才会响，单台下线要靠这台自己的心跳发现。
+监控也按台看。每台的 ci-health 只统计落在本机的 job，告警标题带这台的 runner 注册名。verify.sh 的 GitHub 侧检查按本机 `.runner` 里的注册 ID 找自己那一条。心跳每台单独建一个检查（06 章 6.4）。06 章的排队哨兵在多台时，只有全部下线或全部忙满才会响，单台下线要靠这台自己的心跳发现。
 
 #### 加一台机器
 
@@ -2349,17 +2353,33 @@ bash <手册仓库目录>/scripts/verify.sh
 
 一定要先停 runner 服务。bootstrap 只在开头查一次有没有 job，跑的几分钟里接到的 job 会被它末尾的重启打断；daemon.json 有变化时，它还会重启 docker。脚本最后会重新启动 runner。
 
-也可以只换一个文件。清理钩子按 04 章 4.4 的做法换：先写到 `.new`，试跑通过再替换，同样先停 runner 服务。`ci-health.sh` 不影响正在跑的 job，不用停服务：替换占位符，查过语法再换上，最后和仓库渲染出来的逐字节比对。
+也可以只换一个文件。清理钩子按 04 章 4.4 的做法换：先写到 `.new`，试跑通过再替换，同样先停 runner 服务。`ci-health.sh` 不影响正在跑的 job，不用停服务。它有两个占位符，bootstrap 渲染时换成这台的 runner 服务名和手册仓库目录：
+
+```bash
+cd <手册仓库目录>                       # 装机时跑 bootstrap.sh 的那个；目录名只能有字母、数字和 _./-
+git pull --ff-only
+SVC=$(grep -o '^SVC="[^"]*"' /usr/local/bin/ci-health.sh | cut -d'"' -f2)
+echo "SVC=$SVC"                         # 沿用已装那份的服务名，应是 actions.runner.….service
+```
+
+`SVC` 是空的（已装那份太老，没有这一行），就按 bootstrap 的取法再取一次。还是空的、或者是 `none` 而这台明明注册过，就停下来查：带着空的服务名渲染，runner、listener、连续失败三项检查会悄悄关掉，后面的比对照样显示一致。
 
 ```bash
 SVC=$(systemctl list-units --type=service --all --no-legend --plain 'actions.runner.*' | awk '{print $1}' | head -1)
-sed "s#__RUNNER_SVC__#${SVC:-none}#" scripts/ci-health.sh > /usr/local/bin/ci-health.sh.new
-chmod 0755 /usr/local/bin/ci-health.sh.new && bash -n /usr/local/bin/ci-health.sh.new \
-  && mv -f /usr/local/bin/ci-health.sh.new /usr/local/bin/ci-health.sh
-sed "s#__RUNNER_SVC__#${SVC:-none}#" scripts/ci-health.sh | cmp - /usr/local/bin/ci-health.sh && echo 一致
+[ -z "$SVC" ] && SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)")
 ```
 
-`SVC` 的取法和 bootstrap 相同。换完下一个整点（第 13 分）自然会跑一次，不用手工跑；告警集合没变就不推送。
+服务名对了，再渲染、查语法、换上，最后和仓库渲染出来的逐字节比对：
+
+```bash
+render(){ sed -e "s#__RUNNER_SVC__#$SVC#" -e "s#__PLAYBOOK_DIR__#$PWD#" scripts/ci-health.sh; }
+render > /usr/local/bin/ci-health.sh.new && chmod 0755 /usr/local/bin/ci-health.sh.new \
+  && bash -n /usr/local/bin/ci-health.sh.new && mv -f /usr/local/bin/ci-health.sh.new /usr/local/bin/ci-health.sh
+render | cmp - /usr/local/bin/ci-health.sh && echo 一致
+grep -c '__RUNNER_SVC__\|__PLAYBOOK_DIR__' /usr/local/bin/ci-health.sh   # 应是 0
+```
+
+换完下一个整点（第 13 分）自然会跑一次，不用手工跑；告警集合没变就不推送。
 
 #### 撤掉一台机器
 

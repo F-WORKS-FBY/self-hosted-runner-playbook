@@ -44,11 +44,16 @@
 # 2026-11-11 补的一条：
 #
 #  ⑨ 推送改成飞书卡片。原来的文本消息把数字、原因和排查命令挤在一段里，还夹着章节号，群里的人要读完整段
-#     才知道多严重、先做什么。现在每条拆成情况、影响、先做什么、去哪看，CRIT 红、WARN 橙、恢复绿，
-#     章节号换成手册链接（08 章 8.2「监控要点」）。本机日志和 journal 里的单行文本不变。
+#     才知道多严重、先做什么。现在标题带级别和最严重那条，每条拆成情况、影响、先做什么、去哪看，
+#     CRIT 红、WARN 橙、恢复绿，章节号换成手册链接（08 章 8.2「监控要点」）。卡片里要人跑 verify.sh 时
+#     写出这台上手册仓库的完整路径，路径由 bootstrap 渲染进来。本机日志和 journal 里仍是单行文本。
 set -uo pipefail
 LOG="${CI_HEALTH_LOG:-/var/log/ci-health.log}"
 SVC="__RUNNER_SVC__"                      # 由 bootstrap.sh 替换；--skip-runner 装的机器上是 none
+# 装机用的手册仓库目录（绝对路径），由 bootstrap.sh 替换。卡片里写「用 root 跑 bash <目录>/scripts/verify.sh」；
+# 没替换、目录挪走了，就改写成「装机用的手册仓库里的 scripts/verify.sh」。判断用 verify.sh 在不在，
+# 不拿占位符本身做判据：sed 会把判据里的占位符一起换掉（09 章 A12）。
+PLAYBOOK_DIR="__PLAYBOOK_DIR__"
 
 # 部署参数从 /etc/ci-runner.env 读回，读法和 bootstrap.sh 相同：逐行按 KEY=VALUE 解析，只认下面这几个键，不 source。
 # 优先级：环境变量（cron.d 里写的那几行）> 文件 > 默认值。不读回的话，用了非默认 RUNNER_HOME 的机器读不到
@@ -165,7 +170,9 @@ elif [ -n "${GH_REPO:-}" ] && [ -n "$TOKEN" ]; then
     # 都算进来，结果看起来正常其实是错的。
     jobs="error:no-runner-name"
   else
-    jobs=$(GH_REPO="$GH_REPO" TOKEN="$TOKEN" RNAME="$RNAME" python3 - <<'PY' 2>/dev/null || echo "error:python"
+    # 第一行是结果；连不上 GitHub 时多一行原因（DNS、连接被拒、证书之类），写进下面的告警文本，卡片让人去日志里看。
+    # 原因里只有 urllib 给的连接错误，没有请求头，不带 token。
+    jobs_out=$(GH_REPO="$GH_REPO" TOKEN="$TOKEN" RNAME="$RNAME" python3 - <<'PY' 2>/dev/null || echo "error:python"
 import json, os, urllib.error, urllib.request
 repo, tok, name = os.environ["GH_REPO"], os.environ["TOKEN"], os.environ["RNAME"]
 def get(path):
@@ -201,12 +208,18 @@ try:
     print(f"streak={streak}")
 except urllib.error.HTTPError as e:
     print(f"error:HTTP{e.code}")
+except urllib.error.URLError as e:
+    print("error:URLError")
+    print(" ".join(str(e.reason).split())[:200])
 except Exception as e:
     print("error:" + type(e).__name__)
 PY
 )
+    jobs=${jobs_out%%$'\n'*}
+    [ "$jobs_out" = "$jobs" ] || jobs_why=${jobs_out#*$'\n'}
   fi
 fi
+jobs_why=${jobs_why:-}; jobs_why=${jobs_why//[$'\t\r\n']/ }
 
 echo "$(date -Is) fixedwork=${t}s root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}" >> "$LOG"
 
@@ -236,18 +249,18 @@ if [ -n "$rootdev" ] && [ "$(stat -c %d /tmp 2>/dev/null)" = "$rootdev" ]; then 
 disk_parts="${ctr_s}，${tmp_s}，根分区其余 ${rest}MB。先看 docker images 里有没有每次运行留下的镜像、du -sh /tmp/* 里有没有被取消的 job 留下的目录（08 章 8.2）"
 disk_facts=(warn="$WARN_MB" crit="$CRIT_MB" ctr="${ctr:-}" ctr_root="$ctr_root" tmp="${tmpm:-}" tmp_root="$tmp_root" rest="$rest")
 if [ "${avail:-999999}" -lt "$CRIT_MB" ]; then
-  warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB，已远低于 BuildKit GC 的 Min Free，GC 腾不出空间了。${disk_parts}" \
+  warn disk_crit "CRIT 根分区可用 ${avail}MB < ${CRIT_MB}MB。${disk_parts}" \
     avail="$avail" "${disk_facts[@]}"
 elif [ "${avail:-999999}" -lt "$WARN_MB" ]; then
   case "$avail_idle" in
-    "")   warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB，已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存。${disk_parts}" \
+    "")   warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB（整点量时没有 job 在跑）。${disk_parts}" \
             mode=now avail="$avail" "${disk_facts[@]}" ;;
     # 一直有 job，量不到 job 之间的值，这一小时不判。上一次推送里有这条 WARN 的话照旧带上，
     # 否则告警集合一变，就会推一条「已全部消除」，下一小时又报回来。
     busy) case " $(cat "$STATE_DIR/keys" 2>/dev/null) " in *" disk_warn "*)
             warn disk_warn "WARN 根分区可用 ${avail}MB < ${WARN_MB}MB（这一小时一直有 job 在跑，量不到两个 job 之间的值，沿用上一次的 WARN）。${disk_parts}" \
               mode=busy avail="$avail" "${disk_facts[@]}" ;; esac ;;
-    *)    [ "$avail_idle" -lt "$WARN_MB" ] && warn disk_warn "WARN 根分区可用 ${avail_idle}MB < ${WARN_MB}MB（两个 job 之间量的），已逼近 BuildKit GC 的 Min Free，GC 开始为保底而驱逐缓存。整点时有 job 在跑，当时 ${disk_parts}" \
+    *)    [ "$avail_idle" -lt "$WARN_MB" ] && warn disk_warn "WARN 根分区可用 ${avail_idle}MB < ${WARN_MB}MB（两个 job 之间量的）。整点时有 job 在跑，当时 ${disk_parts}" \
             mode=idle avail="$avail_idle" avail_now="$avail" "${disk_facts[@]}" ;;
   esac
 fi
@@ -262,11 +275,11 @@ esac
 # 产出告警：服务 active 但 job 连红，正是 2026-09-07 那种「假绿」的唯一信号
 case "$jobs" in
   streak=[3-9]|streak=[0-9][0-9]*)
-    warn streak "CRIT 最近 ${jobs#streak=} 个用到本机的 run 里，本机的 job 连续失败。服务 active 不代表 CI 可用，先跑 verify.sh 看钩子实跑那一项" \
+    warn streak "CRIT 最近 ${jobs#streak=} 个用到本机的 run 里，本机的 job 连续失败。服务 active 不代表 CI 可用，先看 GitHub 上红在哪一步，再跑 verify.sh 看钩子实跑那一项" \
       n="${jobs#streak=}" runner="${RNAME:-}" repo="${GH_REPO:-}" ;;
   error:*)
-    warn jobsprobe "WARN job 产出采样失败（${jobs#error:}），这一项现在看不到：HTTP401/403 多半是 token 过期或没权限，no-runner-name 是读不到 $RUNNER_HOME/.runner" \
-      reason="${jobs#error:}" runner_home="$RUNNER_HOME" ;;
+    warn jobsprobe "WARN job 产出采样失败（${jobs#error:}${jobs_why:+：$jobs_why}），「本机 job 连续失败」这一项现在看不到" \
+      reason="${jobs#error:}" runner_home="$RUNNER_HOME" repo="${GH_REPO:-}" ;;
 esac
 
 # ── 推送（可选）────────────────────────────────────────────────────────
@@ -278,14 +291,18 @@ esac
 # 签名按飞书自定义机器人「签名校验」的算法：以「时间戳 + 换行 + 密钥」为 key 对空消息做 HMAC-SHA256。
 # 用 Slack、钉钉、企业微信等要改下面的 notify()。
 # 拼卡片、签名与推送都在 python 里做，JSON 由 json.dumps 生成；密钥和地址只经环境变量传入：放进 openssl/curl 的
-# 命令行参数的话，本机任何用户都能从 /proc/<pid>/cmdline 读到。
+# 命令行参数的话，本机任何用户都能从 /proc/<pid>/cmdline 读到。写进日志的推送结果里，地址和密钥都换成「<已隐去>」：
+# 地址写错时 urllib 的报错会原样带上地址。
 # 卡片「去哪看」链到这份手册的公开仓库（只读，链接里不带任何密钥）；fork 之后改成自己的地址。
 DOC_URL="https://github.com/F-WORKS-FBY/self-hosted-runner-playbook/blob/main"
 notify(){   # notify alert|recover <文本消息>：文本消息只在卡片发不了时用
   [ -n "${CI_ALERT_WEBHOOK:-}" ] || return 0
-  local resp rc
+  local resp rc verify="" hid
+  # 卡片里写 verify.sh 的完整路径；这台上找不到就写「装机用的手册仓库」
+  case "$PLAYBOOK_DIR" in /*) [ -f "$PLAYBOOK_DIR/scripts/verify.sh" ] && verify="bash $PLAYBOOK_DIR/scripts/verify.sh" ;; esac
   resp=$(CARD_KIND="$1" CARD_TEXT="$2" CARD_ALERTS="$(printf '%s\n' "${FACTS[@]+"${FACTS[@]}"}")" \
-    CARD_PREV="$prev" CARD_RUNNER="$rn" CARD_HOST="$hn" \
+    CARD_PREV="$prev" CARD_RUNNER="$rn" CARD_HOST="$hn" CARD_SVC="$SVC" CARD_REPO="${GH_REPO:-}" \
+    CARD_RUNNER_HOME="$RUNNER_HOME" CARD_VERIFY="$verify" \
     CARD_LOG="$LOG" CARD_ENV="$CI_HEALTH_ENV" CARD_DOC="$DOC_URL" \
     CI_ALERT_WEBHOOK="$CI_ALERT_WEBHOOK" CI_ALERT_SECRET="${CI_ALERT_SECRET:-}" python3 - <<'PY' 2>&1
 import base64, hashlib, hmac, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
@@ -303,6 +320,13 @@ REASONS = {
     11246: "卡片 JSON 不合 2.0 结构",
     RATE_LIMITED: "被限流（单个机器人 100 次/分钟、5 次/秒）",
 }
+# 输出会写进日志：推送地址、密钥、地址末段的机器人 ID 一律换掉
+HIDDEN = sorted({x for x in (URL, SECRET, URL.rstrip("/").rsplit("/", 1)[-1]) if len(x) >= 8}, key=len, reverse=True)
+def redact(s):
+    s = str(s)
+    for x in HIDDEN:
+        s = s.replace(x, "<已隐去>")
+    return s
 
 # ---- 转义：动态值一律经过这里，再由 json.dumps 做 JSON 转义 ----
 UNSAFE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\ufeff]")   # 控制字符、零宽与双向控制
@@ -319,9 +343,13 @@ def num(s):
 
 KIND, TEXT = E.get("CARD_KIND", "alert"), E.get("CARD_TEXT", "")
 RUNNER, HOST = plain(E.get("CARD_RUNNER")), plain(E.get("CARD_HOST"))
+SVC, REPO, RUNNER_HOME = E.get("CARD_SVC", ""), E.get("CARD_REPO", ""), E.get("CARD_RUNNER_HOME", "")
 LOG, ENVF = E.get("CARD_LOG", ""), E.get("CARD_ENV", "")
 DOC = E.get("CARD_DOC", "").rstrip("/")
 PREV = (E.get("CARD_PREV") or "").split()
+VERIFY = E.get("CARD_VERIFY", "")
+# verify.sh 要 root：它查 iptables、sshd，还以 runner 用户的身份实跑一次清理钩子
+VERIFY_RUN = "用 root 跑" + (" " + code(VERIFY) if VERIFY else "装机用的手册仓库里的 `scripts/verify.sh`")
 
 def doc(label, path, anchor):
     return "[手册：%s](%s/%s#%s)" % (label, DOC, urllib.parse.quote(path), urllib.parse.quote(anchor))
@@ -333,29 +361,42 @@ L_THRESH = doc("BuildKit 与磁盘阈值", "10-按机器规格定参数.md", "10
 L_RESTART = doc("重启和升级，一次只动一台", "08-运维与容量.md", "重启和升级一次只动一台")
 L_VERIFY = doc("verify.sh 查什么", "07-验证.md", "71-verifysh-查什么")
 L_LISTENER = doc("runner 服务是 active，listener 却一直在崩", "09-踩坑记录.md", "a23-runner-服务是-activelistener-却一直在崩")
+L_A11 = doc("runner 调 job 钩子时强加 -e，钩子出错 job 就红", "09-踩坑记录.md", "a11-runner-调-job-钩子时强加--e钩子里任何一条命令非零就让-job-全红")
 L_HOOK = doc("为什么要实跑一次钩子", "07-验证.md", "为什么要实跑一次钩子")
 L_MON = doc("监控要点", "08-运维与容量.md", "监控要点")
 L_TOKEN = doc("job 采样为什么只给只读 token", "09-踩坑记录.md", "b12-把管理员-token-落在了-ci-机上2026-09-14-修-a11-时引入")
-LOG_CMD = code("tail -20 " + LOG)
-LOG_LINE = "本机采样记录：" + LOG_CMD
+LOG_LINE = "这台的采样记录：" + code("tail -20 " + LOG)
+JOBS_BACK = "`jobs=` 变回 `streak=数字` 就好了：" + code("grep -o 'jobs=[^ ]*' %s | tail -3" % LOG)
 
 NAMES = {"contention": "CPU 变慢", "disk_crit": "根分区快满了", "disk_warn": "根分区可用空间偏低",
          "config": "磁盘阈值配置无效", "runner": "runner 服务没在运行", "listener": "runner 没在接 job",
          "streak": "本机 job 连续失败", "jobsprobe": "读不到本机 job 结果"}
 LEVELS = {"contention": "WARN", "disk_crit": "CRIT", "disk_warn": "WARN", "config": "WARN",
           "runner": "CRIT", "listener": "CRIT", "streak": "CRIT", "jobsprobe": "WARN"}
-def name(key):
-    return NAMES.get(key) or code(key)
-def label(key):   # 「WARN 根分区可用空间偏低」：恢复、已消除里用
+# 这几条在另一条出现时量不到：上次在报、这次没报，不能算消除
+BLOCKED_BY = {"streak": ("jobsprobe", ""), "listener": ("runner", "服务不是 active 时不查这一项")}
+def label(key):   # 「WARN 根分区可用空间偏低」：恢复、已消除、看不到了里用
     return ("%s %s" % (LEVELS[key], NAMES[key])) if key in NAMES else code(key)
+def headline(key, lv, f, md=False):   # 标题和多条时每节的标题：级别、名字，连续失败带次数
+    if key not in NAMES:
+        return "%s %s" % (lv, code(key) if md else plain(key))
+    n = num(f.get("n")) if key == "streak" else "?"
+    return "%s %s%s" % (lv, NAMES[key], " %s 次" % n if n != "?" else "")
+def counts(lvs):
+    parts = ["%s %d 条" % (lv, lvs.count(lv)) for lv in ("CRIT", "WARN") if lv in lvs]
+    other = sum(1 for lv in lvs if lv not in ("CRIT", "WARN"))
+    return "、".join(parts + (["其他 %d 条" % other] if other else []))
 
-def disk_parts(f):
-    def part(what, k, root):
-        return "%s %s MB%s" % (what, num(f.get(k)), "" if f.get(root) == "1" else "（不在根分区）")
-    return "占用：%s，%s，根分区其余 %s MB" % (part("containerd", "ctr", "ctr_root"), part("/tmp", "tmp", "tmp_root"), num(f.get("rest")))
+def disk_parts(f, when=""):
+    on, off = [], []
+    for what, k, root in (("containerd", "ctr", "ctr_root"), ("/tmp", "tmp", "tmp_root")):
+        (on if f.get(root) == "1" else off).append("%s %s MB" % (what, num(f.get(k))))
+    s = "%s根分区已用：%s" % (when, "，".join(on + ["其他 %s MB" % num(f.get("rest"))]))
+    return s + ("；不在根分区的：%s" % "，".join(off) if off else "")
+DISK_PRE = "以下用 root 跑，先 `pgrep -x Runner.Worker` 没输出（没有 job 在跑）再删："
 DISK_STEPS = [
-    "`docker images`：找一串名字只差一段随机串的镜像（每次运行建一份、job 被取消后没删掉的），确认不在用了就 `docker image rm` 删，不带 `-f`",
-    "`du -sh /tmp/* | sort -h | tail`：找同一前缀的一串大目录（被取消的 job 留下的临时目录），`pgrep -x Runner.Worker` 没输出（没有 job 在跑）时再删",
+    "`docker images`：有没有一串名字只差一段随机串的镜像（被取消的 job 留下的），有就 `docker image rm` 删，不带 `-f`",
+    "`du -sh /tmp/* | sort -h | tail`：有没有同一前缀的一串大目录（也是被取消的 job 留下的），有就删",
     "前两样都不多，再看 Docker 以外：`du -sh /root/.vscode-server /home/*/.vscode-server /home/*/.cache`",
 ]
 
@@ -366,92 +407,101 @@ def t_contention(f):
     except (ValueError, ZeroDivisionError):
         r = "?"
     return dict(
-        facts=["定长任务（固定量的 sha256 计算）这次用了 **%s 秒**，本机基线 %s 秒，是基线的 %s 倍；超过 1.4 倍就报" % (t, b, r)],
+        facts=["定长任务（固定量的 sha256 计算）这次用了 **%s 秒**，这台的基线 %s 秒，是基线的 %s 倍；超过 1.4 倍就报" % (t, b, r)],
         impact="这台跑 job 会变慢，本来就贴着超时的 job 可能超时",
-        steps=["看最近 24 次：%s，只有这一次超、下一小时回来了，不用管" % code("grep -o 'fixedwork=[0-9.]*s' %s | tail -24" % LOG),
-               "连着几个小时都超：先 `lscpu | grep 'Model name'` 看 CPU 型号变没变（关机再开、被迁移都可能换宿主机），"
-               "变了要重测基线；没变就是邻居在抢核，或者规格按 CPU 积分限速、积分用完了"],
+        steps=["看最近 24 次有几次超：%s" % code("grep -o 'fixedwork=[0-9.]*s' %s | tail -24" % LOG),
+               "连着几个小时都超，`lscpu | grep 'Model name'` 看 CPU 型号变没变，变了要重测基线",
+               "型号没变，按下面「上线后看哪些数」那一节往下查"],
         links=[L_CPU, L_REVIEW])
 
 def t_disk_crit(f):
     return dict(
-        facts=["根分区可用 **%s MB**，低于 CRIT 线 %s MB，已远低于 BuildKit GC 的保底线（Min Free），GC 腾不出空间了" % (num(f.get("avail")), num(f.get("crit"))),
-               disk_parts(f)],
-        impact="再满下去 job 会因为写不进盘而失败；盘满时 runner 会掉线（接 job 的进程写不了日志就崩）",
-        steps=DISK_STEPS, links=[L_DISK, L_CANCEL])
+        facts=["根分区可用 **%s MB**，低于 CRIT 线 %s MB" % (num(f.get("avail")), num(f.get("crit"))), disk_parts(f)],
+        impact="再满下去，job 会因为写不进盘而失败；盘满时 runner 会掉线",
+        pre=DISK_PRE, steps=DISK_STEPS, links=[L_DISK, L_CANCEL])
 
 def t_disk_warn(f):
-    line = " WARN 线 %s MB（BuildKit GC 的保底线 Min Free 加 1 GiB）" % num(f.get("warn"))
-    mode, avail = f.get("mode"), num(f.get("avail"))
+    mode, avail, line = f.get("mode"), num(f.get("avail")), "低于 WARN 线 %s MB" % num(f.get("warn"))
     if mode == "idle":
-        facts = ["两个 job 之间量的根分区可用 **%s MB**，低于%s" % (avail, line),
-                 "整点那次有 job 在跑，当时可用 %s MB；%s" % (num(f.get("avail_now")), disk_parts(f))]
+        facts = ["两个 job 之间量的根分区可用 **%s MB**，%s" % (avail, line),
+                 "整点时有 job 在跑，当时可用 %s MB" % num(f.get("avail_now")), disk_parts(f, "整点时")]
     elif mode == "busy":
-        facts = ["根分区可用 **%s MB**，低于%s" % (avail, line),
+        facts = ["根分区可用 **%s MB**，%s" % (avail, line),
                  "这一小时一直有 job 在跑，量不到两个 job 之间的值，沿用上一次的 WARN", disk_parts(f)]
     else:
-        facts = ["根分区可用 **%s MB**，低于%s" % (avail, line), disk_parts(f)]
-    return dict(facts=facts, impact="CI 照常跑；BuildKit 开始删构建缓存来保住 Min Free，部分构建会变慢",
-                steps=DISK_STEPS, links=[L_DISK, L_CANCEL])
+        facts = ["根分区可用 **%s MB**，%s" % (avail, line), "整点量时没有 job 在跑", disk_parts(f)]
+    return dict(facts=facts, impact="CI 照常跑；可用空间降到 Min Free 以下，BuildKit 才会删构建缓存来保底，部分构建会变慢",
+                pre=DISK_PRE, steps=DISK_STEPS, links=[L_DISK, L_CANCEL])
 
 def t_config(f):
     return dict(
         facts=["%s 不是 MiB 整数" % code(f.get("bad")),
                "这次判磁盘用的是：WARN 线 %s MB，CRIT 线 %s MB（写错的那项换成了默认值）" % (num(f.get("warn")), num(f.get("crit")))],
         impact="磁盘告警的阈值可能和这台盘的大小对不上",
-        steps=["改 `/etc/cron.d/ci-health` 和 `/etc/ci-runner.env` 里的这一项，写成 MiB 整数，取值按下面手册算；两处都有时以 cron.d 为准"],
+        steps=["改 `/etc/cron.d/ci-health` 和 `/etc/ci-runner.env` 里的这一项，写成 MiB 整数",
+               "取值按下面手册算；两处都有时以 cron.d 为准"],
         links=[L_THRESH])
 
 def t_runner(f):
-    svc = f.get("svc") or "?"
+    svc = f.get("svc") or SVC or "?"
     return dict(
-        facts=["runner 服务 %s 当前是 %s，不是 active" % (code(svc), code(f.get("state")))],
+        facts=["runner 服务当前是 %s，不是 active" % code(f.get("state"))],
         impact="这台不接 job；job 会排给别的 runner，没有别的就一直排队",
         steps=["先确认是不是有人在维护这台：重启、升级前都会先停服务",
-               "不是的话，%s 看原因，再 %s" % (code("journalctl -u %s -n 50" % svc), code("systemctl start %s" % svc)),
-               "起来以后在手册仓库目录里跑 `bash scripts/verify.sh`"],
+               "不是的话，%s 看原因" % code("journalctl -u %s -n 50" % svc),
+               "处理完 %s" % code("systemctl start %s" % svc),
+               "起来以后%s" % VERIFY_RUN],
         links=[L_RESTART, L_VERIFY])
 
 def t_listener(f):
-    svc = f.get("svc") or "?"
+    svc, wait = f.get("svc") or SVC or "?", num(f.get("wait"))
     if f.get("mode") == "restarting":
-        fact = "runner 服务是 active，但接 job 的 `Runner.Listener` 进程隔 %s 秒看了两次，都是刚启动（第二次 %s 秒），在反复崩溃重启" % (num(f.get("wait")), num(f.get("age")))
+        facts = ["runner 服务是 active，但接 job 的 `Runner.Listener` 进程在反复崩溃重启",
+                 "隔 %s 秒看了两次，都是刚启动（第二次 %s 秒）" % (wait, num(f.get("age")))]
     else:
-        fact = "runner 服务是 active，但隔 %s 秒再看，接 job 的 `Runner.Listener` 进程不在" % num(f.get("wait"))
+        facts = ["runner 服务是 active，但接 job 的 `Runner.Listener` 进程不在", "隔 %s 秒再看还是不在" % wait]
     return dict(
-        facts=[fact], impact="这台实际没在接 job，`systemctl` 只看得到服务 active",
+        facts=facts, impact="这台实际没在接 job；看服务状态只能看到 active",
         steps=["%s 看最后几行" % code("journalctl -u %s -n 50" % svc),
                "`df -h /` 看根分区是不是满了：盘满时它一启动就崩，之前出过",
-               "处理完在手册仓库目录里跑 `bash scripts/verify.sh`，`Runner.Listener` 那一项要 PASS"],
+               "处理完%s，要有一行 `Runner.Listener 在跑`" % VERIFY_RUN],
         links=[L_LISTENER])
 
 def t_streak(f):
-    who, repo = f.get("runner"), f.get("repo") or ""
-    links = [L_HOOK]
+    repo, links = f.get("repo") or REPO, []
     if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
         links.append("[GitHub Actions 运行记录](https://github.com/%s/actions)" % repo)
+    first = "打开%sGitHub Actions，看落在这台的 job 红在哪一步、几次是不是同一处" % ("下面的 " if links else " ")
+    if RUNNER:
+        first += "（job 日志开头 Set up job 里 Runner name 是 %s）" % code(RUNNER)
     return dict(
-        facts=["从最近一次往回数，落在本机%s的 job 连续失败 **%s 次**；被取消的 run 不算，3 次起报" % ("（%s）" % code(who) if who else "", num(f.get("n")))],
-        impact="这台接到的 job 可能还会接着失败，服务显示 active 看不出来",
-        steps=["在这台的手册仓库目录里跑 `bash scripts/verify.sh`，先看「钩子按 `bash -e` 实跑」那一项",
-               "打开 GitHub Actions，看最近失败的 run 里落在本机的 job 红在哪一步，几次是不是同一处"],
-        links=links)
+        facts=["这台上的 job 从最近一次往回数连续失败 **%s 次**（被取消的 run 不算，满 3 次就报）" % num(f.get("n"))],
+        impact="这台接的 job 可能继续失败；runner 服务照样显示 active，光看服务状态发现不了",
+        steps=[first,
+               "%s，看带 `清理钩子` 和 `bash -e` 的那一行是 PASS 还是 FAIL" % VERIFY_RUN,
+               "有 job 在跑时这一项会跳过，那一行换成 `有 job 正在运行，跳过钩子实跑`，等 `pgrep -x Runner.Worker` 没输出再跑"],
+        links=links + [L_A11, L_HOOK])
 
 def t_jobsprobe(f):
     reason = f.get("reason") or ""
     reason = reason if re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", reason) else "?"
-    if reason in ("HTTP401", "HTTP403"):
-        first = ("多半是 token 过期或没权限：换一个只读 token（fine-grained，只授权这个仓库，Actions 只读），"
-                 "写进 %s 的 `CI_HEALTH_GH_TOKEN=` 那一行" % code(ENVF))
+    auth = reason in ("HTTP401", "HTTP403", "HTTP404")
+    if auth:   # GitHub 对 token 失效回 401，没权限回 403，没授权的私有仓库和不存在的仓库一样回 404
+        fact = "统计这台 job 结果时，GitHub 回了 %s：token 失效、没权限或仓库名不对" % code(reason)
+        steps = ["先核仓库名：%s 里 `GH_REPO=` 现在是 %s" % (code(ENVF), code(f.get("repo") or REPO)),
+                 "仓库名没错，就换一个只读 token（fine-grained，只授权这个仓库，Actions 只读），写进同一个文件的 `CI_HEALTH_GH_TOKEN=`",
+                 "下一小时 " + JOBS_BACK]
     elif reason == "no-runner-name":
-        first = "读不到 %s 里的注册名：看这台注册了没有、文件还在不在" % code((f.get("runner_home") or "") + "/.runner")
-    else:
-        first = "网络或 GitHub 接口出错，下一小时会自动再试；连着几个小时都这样，再查这台到 api.github.com 的网络"
+        fact = "统计这台 job 结果时出错：读不到 %s 里的 runner 注册名" % code((f.get("runner_home") or RUNNER_HOME) + "/.runner")
+        steps = ["看这台注册了没有、这个文件还在不在", "下一小时 " + JOBS_BACK]
+    else:      # 采样脚本自己出错、连不上 GitHub、GitHub 回了别的码：不猜原因
+        fact = "统计这台 job 结果时出错（%s）" % code(reason)
+        steps = ["原因见日志：%s" % code("grep 采样失败 %s | tail -3" % LOG), "下一小时会自动再试，" + JOBS_BACK]
     return dict(
-        facts=["统计本机 job 结果时出错（%s），「本机 job 连续失败」这一项现在看不到" % code(reason)],
-        impact="本机 job 连续失败时不会报警",
-        steps=[first, "下一小时的采样行里 `jobs=` 变回 `streak=数字` 就好了：%s" % code("tail -1 " + LOG)],
-        links=[L_MON] + ([L_TOKEN] if reason in ("HTTP401", "HTTP403") else []))
+        facts=[fact, "「本机 job 连续失败」这一项现在看不到"],
+        impact="这台的 job 连续失败时不会报警",
+        steps=[] if f.get("_recover") else steps,   # 恢复卡里不再列：采样已经回来了
+        links=[L_MON] + ([L_TOKEN] if auth else []))
 
 TEMPLATES = {"contention": t_contention, "disk_crit": t_disk_crit, "disk_warn": t_disk_warn, "config": t_config,
              "runner": t_runner, "listener": t_listener, "streak": t_streak, "jobsprobe": t_jobsprobe}
@@ -463,6 +513,8 @@ def ul(xs):
     return "\n".join("- " + x for x in xs)
 def ol(xs):
     return "\n".join("%d. %s" % (i, x) for i, x in enumerate(xs, 1))
+def todo(it):   # 先做什么：前提一句（有的话）加有序列表
+    return (it["pre"] + "\n\n" if it.get("pre") else "") + ol(it["steps"])
 def sections(secs):
     return "\n\n".join("#### %d. %s\n%s" % (i, h, c) for i, (h, c) in enumerate(secs, 1))
 
@@ -473,6 +525,8 @@ def card(title, subtitle, template, content):
     return {"schema": "2.0", "config": {"update_multi": True, "summary": {"content": title}},
             "header": header, "body": {"elements": [{"tag": "markdown", "content": content}]}}
 
+# 标题先写机器（runner 注册名，没有才用主机名），再写最严重那条和它的级别。副标题只放各级条数和这次的变化，
+# 不放主机名：标题已经分开了几台机器，云上的默认主机名又常是一串编号，和注册名的编号容易看反。
 def alert_card():
     alerts = []
     for line in (E.get("CARD_ALERTS") or "").split("\n"):
@@ -484,60 +538,67 @@ def alert_card():
     alerts.sort(key=lambda a: a[1] != "CRIT")      # CRIT 在前；同级保持脚本里的检查顺序
     keys = [a[0] for a in alerts]
     new, gone = [k for k in keys if k not in PREV], [k for k in PREV if k not in keys]
+    unseen = [k for k in gone if k in BLOCKED_BY and BLOCKED_BY[k][0] in keys]
+    gone = [k for k in gone if k not in unseen]
     crit = sum(a[1] == "CRIT" for a in alerts)
-    if len(alerts) == 1:
-        level = alerts[0][1]
-    else:
-        level = "、".join(x for x in ("CRIT %d 条" % crit if crit else "", "WARN %d 条" % (len(alerts) - crit) if len(alerts) > crit else "") if x)
     if not PREV:
         change = "新出现"
-    elif not new and not gone:
+    elif not (new or gone or unseen):
         change = "超过 24 小时未消除，再提醒一次"
     else:
-        change = "，".join(x for x in ("新出现 %d 条" % len(new) if new else "", "消除 %d 条" % len(gone) if gone else "") if x)
-    machine = RUNNER or HOST or "?"
-    title = "[CI runner 告警] %s：%s%s" % (machine, plain(NAMES.get(alerts[0][0], alerts[0][0])), "等 %d 项" % len(alerts) if len(alerts) > 1 else "")
-    subtitle = " · ".join(x for x in (HOST if RUNNER else "", level, change) if x)
+        change = "，".join(x for x in ("新出现 %d 条" % len(new) if new else "", "消除 %d 条" % len(gone) if gone else "",
+                                      "%d 条看不到了" % len(unseen) if unseen else "") if x)
+    key0, lv0, f0 = alerts[0]
+    title = "[CI runner 告警] %s：%s%s" % (RUNNER or HOST or "?", headline(key0, lv0, f0), "等 %d 条" % len(alerts) if len(alerts) > 1 else "")
+    subtitle = " · ".join(x for x in (counts([a[1] for a in alerts]), change) if x)
+    def facts(key, it):   # 这条让哪几条量不到了，写在这条的情况里
+        return it["facts"] + ["上次报的「%s」看不到了%s，不算消除" % (label(u), "（%s）" % BLOCKED_BY[u][1] if BLOCKED_BY[u][1] else "")
+                              for u in unseen if BLOCKED_BY[u][0] == key]
     if len(alerts) == 1:
-        key, _, f = alerts[0]
-        it = items(key, f)
-        facts = it["facts"] + (["同时消除：" + "、".join(label(g) for g in gone)] if gone else [])
-        secs = [("情况", ul(facts))]
+        it = items(key0, f0)
+        secs = [("情况", ul(facts(key0, it) + (["同时消除：" + "、".join(label(g) for g in gone)] if gone else [])))]
         if it["impact"]:
             secs.append(("影响", it["impact"]))
         if it["steps"]:
-            secs.append(("先做什么", ol(it["steps"])))
+            secs.append(("先做什么", todo(it)))
         secs.append(("去哪看", ul(it["links"] + [LOG_LINE])))
         content = sections(secs)
     else:
         blocks = []
         for i, (key, lv, f) in enumerate(alerts, 1):
             it = items(key, f)
-            blk = ["#### %d. %s %s%s\n**情况**\n%s" % (i, lv, name(key), "（新）" if PREV and key in new else "", ul(it["facts"]))]
+            blk = ["#### %d. %s%s\n**情况**\n%s" % (i, headline(key, lv, f, md=True), "（新）" if PREV and key in new else "", ul(facts(key, it)))]
             if it["impact"]:
-                blk.append("**影响**：" + it["impact"])
+                blk.append("**影响**\n" + it["impact"])
             if it["steps"]:
-                blk.append("**先做什么**\n" + ol(it["steps"]))
+                blk.append("**先做什么**\n" + todo(it))
             if it["links"]:
                 blk.append("**去哪看**\n" + ul(it["links"]))
             blocks.append("\n\n".join(blk))
-        n = len(alerts)
         if gone:
-            n += 1
-            blocks.append("#### %d. 已消除\n%s" % (n, ul(label(g) for g in gone)))
-        blocks.append("#### %d. 本机采样记录\n%s" % (n + 1, LOG_CMD))
+            blocks.append("#### %d. 已消除\n%s" % (len(alerts) + 1, ul(label(g) for g in gone)))
+        blocks.append(LOG_LINE)
         content = "\n\n".join(blocks)
     return card(title, subtitle, "red" if crit else "orange", content)
 
+# 恢复只说明这次整点检查没再报，不代表原因查清了：列出告警时各条的先做什么，没做完的接着做（与 metta-app D481 同一口径）
 def recover_card():
-    machine = RUNNER or HOST or "?"
     prev = sorted(PREV, key=lambda k: LEVELS.get(k) != "CRIT")   # CRIT 在前
-    was = ("这次检查，之前的告警都没再出现：\n" + ul(label(k) for k in prev)) if prev else "这次检查，之前的告警都没再出现"
-    return card("[CI runner 恢复] %s：告警已全部消除" % machine,
-                " · ".join(x for x in (HOST if RUNNER else "", "已恢复") if x), "green",
-                sections([("情况", was),
-                          ("要不要处理", "不用。消除只说明这次检查的数回到了线内，原因不一定查清了；之前开始的排查没做完的，接着做"),
-                          ("去哪看", ul([LOG_LINE]))]))
+    base = {"svc": SVC, "repo": REPO, "runner_home": RUNNER_HOME, "_recover": "1"}
+    steps, links = [], []
+    for k in prev:
+        if k not in TEMPLATES:
+            continue
+        it = TEMPLATES[k](dict(base))
+        if it["steps"]:
+            steps.append("**%s**\n%s" % (label(k), todo(it)))
+        links += [l for l in it["links"] if l not in links]
+    handle = "这次整点检查没再报，不代表原因查清了。" + (
+        "告警时的这几步没做完的，接着做：\n\n" + "\n\n".join(steps) if steps else "告警时开始的排查没做完的，接着做")
+    was = "之前的告警这次都没再出现" + ("：\n" + ul(label(k) for k in prev) if prev else "")
+    return card("[CI runner 恢复] %s：告警已全部消除" % (RUNNER or HOST or "?"),
+                "之前 " + counts([LEVELS.get(k) for k in prev]) if prev else "", "green",
+                sections([("情况", was), ("要不要处理", handle), ("去哪看", ul(links + [LOG_LINE]))]))
 
 # ---- 发送：飞书对签名错、关键词不符等也回 HTTP 200，成败只看返回体里的 code（没有才看旧版 StatusCode），0 为成功 ----
 def clip(s, n=400):
@@ -549,10 +610,10 @@ def send(payload):
         ts = str(int(time.time()))
         body["timestamp"] = ts
         body["sign"] = base64.b64encode(hmac.new(f"{ts}\n{SECRET}".encode(), b"", hashlib.sha256).digest()).decode()
-    req = urllib.request.Request(URL, data=json.dumps(body, ensure_ascii=False).encode(),
-                                 headers={"Content-Type": "application/json; charset=utf-8"})
     status = 200
-    try:
+    try:   # 地址写错时 Request() 自己就会报错，也要在 try 里
+        req = urllib.request.Request(URL, data=json.dumps(body, ensure_ascii=False).encode(),
+                                     headers={"Content-Type": "application/json; charset=utf-8"})
         with urllib.request.urlopen(req, timeout=15) as r:
             raw = r.read(65536).decode(errors="replace")
     except urllib.error.HTTPError as e:
@@ -562,7 +623,8 @@ def send(payload):
         except Exception:
             raw = ""
     except Exception as e:
-        return None, "请求失败：%s: %s" % (type(e).__name__, e)
+        return None, "请求失败：%s: %s" % (type(e).__name__, redact(e))
+    raw = redact(raw)
     try:
         obj = json.loads(raw)
     except ValueError:
@@ -585,7 +647,7 @@ try:
     if len(json.dumps(payload, ensure_ascii=False).encode()) > MAX_BODY:
         payload, note = text_payload, "告警卡片超过 %d 字节，改发了文本" % MAX_BODY
 except Exception as e:   # 卡片拼不出来也不能让告警丢掉
-    payload, note = text_payload, "告警卡片拼装出错（%s: %s），改发了文本" % (type(e).__name__, e)
+    payload, note = text_payload, "告警卡片拼装出错（%s: %s），改发了文本" % (type(e).__name__, redact(e))
 c, raw = send_retry(payload)
 if c in CARD_REJECTED and payload is not text_payload:
     note = "告警卡片被飞书拒收（%d，%s；返回体：%s），改发了文本" % (c, REASONS[c], raw)
@@ -599,7 +661,11 @@ sys.exit(1)
 PY
 )
   rc=$?
+  # python 之外的报错（比如 traceback）也会进 resp：写日志前同样把地址、密钥和机器人 ID 换掉
   resp=${resp//$'\n'/ }
+  resp=${resp//"$CI_ALERT_WEBHOOK"/<已隐去>}
+  [ -n "${CI_ALERT_SECRET:-}" ] && resp=${resp//"$CI_ALERT_SECRET"/<已隐去>}
+  hid=${CI_ALERT_WEBHOOK%/}; hid=${hid##*/}; [ "${#hid}" -ge 8 ] && resp=${resp//"$hid"/<已隐去>}
   if [ "$rc" -eq 0 ]; then
     [ -z "${resp// /}" ] || echo "$(date -Is) WARN $resp" >> "$LOG"
     return 0
@@ -613,7 +679,7 @@ if [ -n "${CI_ALERT_WEBHOOK:-}" ]; then
   last=$(stat -c %Y "$STATE_DIR/keys" 2>/dev/null || echo 0)
   now=$(date +%s)
   if [ "$keys" != "$prev" ] || { [ -n "$keys" ] && [ $((now - last)) -ge 86400 ]; }; then
-    # 标题带上 runner 注册名（GitHub 上 job 页面「Set up job」和 Settings → Runners 里显示的就是它），副标题带主机名。
+    # 卡片标题用 runner 注册名（GitHub 上 job 页面「Set up job」和 Settings → Runners 里显示的就是它），读不到才用主机名。
     # 几台机器推到同一个群时，只看主机名分不清哪台是哪台：云上的默认主机名常常是一串编号。
     rn=$(RUNNER_FILE="$RUNNER_HOME/.runner" python3 -c 'import json,os;print(json.load(open(os.environ["RUNNER_FILE"],encoding="utf-8-sig")).get("agentName",""))' 2>/dev/null)
     hn=$(hostname -s)

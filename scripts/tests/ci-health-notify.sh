@@ -3,14 +3,18 @@
 #
 #   bash scripts/tests/ci-health-notify.sh
 #   SAMPLES_DIR=<目录> bash scripts/tests/ci-health-notify.sh   # 另把几张典型卡片（card 对象）存成 JSON
+#   DEBUG_CARDS=1 bash scripts/tests/ci-health-notify.sh          # 断言失败时打出那张卡片的标题和正文
 #
-# 做法：按 bootstrap 的方式渲染出 ci-health.sh，PATH 前面放 systemctl、pgrep、ps、df、du、stat、hostname、logger、sleep
-# 的桩，按 FAKE_* 变量给出磁盘、服务、listener、job 的读数；python3 也包一层，只把定长任务和 job 产出采样两段换成
-# FAKE_FIXEDWORK、FAKE_JOBS（不烧 CPU、不连 GitHub），其余照常交给真的 python3。
+# 做法：按 bootstrap 的方式渲染出 ci-health.sh（替换服务名和手册仓库目录两个占位符），PATH 前面放 systemctl、pgrep、ps、
+# df、du、stat、hostname、logger、sleep 的桩，按 FAKE_* 变量给出磁盘、服务、listener、job 的读数；python3 也包一层，
+# 只把定长任务和 job 产出采样两段换成 FAKE_FIXEDWORK、FAKE_JOBS（不烧 CPU、不连 GitHub），其余照常交给真的 python3。
 # 推送地址指向 127.0.0.1 上的假 webhook：它把请求体存下来，按 codes 文件依次回飞书的返回码（默认 0）。
-# 核：卡片结构、颜色、标题与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、恢复、限流重试、
-# 卡片被拒改发文本、失败不写状态、日志里不出现地址和密钥。
+# codes 里写「状态码:返回码」时回那个 HTTP 状态，返回码写「-」时回一段不是 JSON 的返回体。
+# 核：卡片结构、颜色、标题与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除、恢复、
+# verify.sh 的路径、限流重试、卡片被拒或超长改发文本、失败不写状态、所有日志和输出里不出现地址和密钥、手册链接的锚点。
 # 名字可换：TEST_RUNNER_NAME、TEST_HOST、TEST_REPO（默认 ci-1、ubuntu-4gb-hel1-1、owner/repo）。
+# 样张里的路径换成机器上的：日志 /var/log/ci-health.log、凭据 /etc/ci-health.env、runner /opt/actions-runner，
+# 手册仓库目录用 SAMPLE_PLAYBOOK_DIR（默认 /root/self-hosted-runner-playbook）。
 # 下面关掉的两条 shellcheck 提示是故意的：桩和断言用单引号，交给桩或 python 再展开（SC2016）；ok、no 总是返回 0（SC2015）。
 # shellcheck disable=SC2016,SC2015
 set -uo pipefail
@@ -24,12 +28,17 @@ trap cleanup EXIT
 RUNNER_NAME_T="${TEST_RUNNER_NAME:-ci-1}"; HOST_T="${TEST_HOST:-ubuntu-4gb-hel1-1}"; REPO_T="${TEST_REPO:-owner/repo}"
 SVC_T="actions.runner.${REPO_T//\//-}.${RUNNER_NAME_T}.service"
 SECRET_T="test-secret-$RANDOM$RANDOM"
+BAD_HOOK_ID="bad-hook-id-$RANDOM$RANDOM"
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS + 1)); printf '  PASS %s\n' "$1"; }
 no(){ FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
 
-# ---- 渲染：和 bootstrap.sh 一样只替换服务名占位符 ----
-sed "s#__RUNNER_SVC__#${SVC_T}#" "$SRC" > "$T/ci-health.sh"; chmod 0755 "$T/ci-health.sh"
+# ---- 渲染：和 bootstrap.sh 一样替换两个占位符；手册仓库目录里放一个 verify.sh，卡片才会写出完整路径 ----
+PB_T="$T/pb"; mkdir -p "$PB_T/scripts"; : > "$PB_T/scripts/verify.sh"
+sed -e "s#__RUNNER_SVC__#${SVC_T}#" -e "s#__PLAYBOOK_DIR__#${PB_T}#" "$SRC" > "$T/ci-health.sh"; chmod 0755 "$T/ci-health.sh"
+# 只替换服务名的一份：模拟旧的渲染方式，卡片里改写「装机用的手册仓库」
+sed "s#__RUNNER_SVC__#${SVC_T}#" "$SRC" > "$T/ci-health-nodir.sh"; chmod 0755 "$T/ci-health-nodir.sh"
+SCRIPT="$T/ci-health.sh"
 
 # ---- 桩 ----
 mkdir -p "$T/bin" "$T/fake" "$T/srv" "$T/runner"
@@ -77,9 +86,12 @@ class H(http.server.BaseHTTPRequestHandler):
         p = os.path.join(d, "codes")
         codes = open(p).read().split() if os.path.exists(p) else []
         open(p, "w").write(" ".join(codes[1:]))
-        code = int(codes[0]) if codes else 0
-        out = json.dumps({"code": code, "msg": "success" if code == 0 else "fail", "data": {}}).encode()
-        self.send_response(200)
+        status, _, code = (codes[0] if codes else "0").rpartition(":")
+        if code == "-":
+            out = b"<html>bad gateway</html>"
+        else:
+            out = json.dumps({"code": int(code), "msg": "success" if code == "0" else "fail", "data": {}}).encode()
+        self.send_response(int(status or 200))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
@@ -110,56 +122,73 @@ run_health(){
   env -i HOME="$T" PATH="$T/bin:/usr/bin:/bin" FAKE_DIR="$T/fake" FAKE_HOST="$HOST_T" \
     FAKE_FIXEDWORK=2.100 FAKE_JOBS=streak=0 FAKE_LISTENER_AGE=3600 \
     CI_HEALTH_LOG="$T/ci-health.log" CI_HEALTH_STATE_DIR="$T/state" CI_HEALTH_ENV="$T/ci-health.env" \
-    CI_RUNNER_ENV="$T/ci-runner.env" CI_HEALTH_IDLE_WAIT=1 "$@" bash "$T/ci-health.sh"
+    CI_RUNNER_ENV="$T/ci-runner.env" CI_HEALTH_IDLE_WAIT=1 "$@" bash "$SCRIPT"
 }
 nreq(){ find "$T/srv" -name 'req.*.json' | wc -l | tr -d ' '; }
 keys(){ cat "$T/state/keys" 2>/dev/null; }
-# check <请求序号> <说明> <python 表达式>：b 是请求体，c 是卡片，m 是卡片正文，h 是头部，raw 是原始字节
+# check <请求序号> <说明> <python 表达式>：b 是请求体，c 是卡片，m 是卡片正文，h 是头部，raw 是原始字节，
+# heads 是正文里的四级标题，sub 是副标题
 check(){
   local f="$T/srv/req.$1.json"
   if [ ! -f "$f" ]; then no "$2（没有第 $1 个请求）"; return; fi
-  if SECRET="$SECRET_T" "$REAL_PY" -I - "$f" "$3" <<'PY'
+  if SECRET="$SECRET_T" DEBUG_CARDS="${DEBUG_CARDS:-}" "$REAL_PY" -I - "$f" "$3" <<'PY'
 import base64, hashlib, hmac, json, os, sys, time
 raw = open(sys.argv[1], "rb").read()
 b = json.loads(raw)
 c = b.get("card") or {}
 h = c.get("header") or {}
 m = "\n".join(e.get("content", "") for e in (c.get("body") or {}).get("elements", []))
+heads = [l for l in m.split("\n") if l.startswith("#### ")]
+sub = (h.get("subtitle") or {}).get("content")
 def signed():
     ts = b.get("timestamp", "")
     want = base64.b64encode(hmac.new(("%s\n%s" % (ts, os.environ["SECRET"])).encode(), b"", hashlib.sha256).digest()).decode()
     return ts.isdigit() and abs(time.time() - int(ts)) < 120 and b.get("sign") == want
-sys.exit(0 if eval(sys.argv[2]) else 1)
+if eval(sys.argv[2]):
+    sys.exit(0)
+if os.environ.get("DEBUG_CARDS"):   # 排查用：失败时把标题、副标题和正文打出来
+    print(h, "\n" + m, file=sys.stderr)
+sys.exit(1)
 PY
   then ok "$2"; else no "$2"; fi
 }
 save_sample(){ [ -n "${SAMPLES_DIR:-}" ] || return 0; mkdir -p "$SAMPLES_DIR"
   "$REAL_PY" -I -c 'import json,sys; c=json.load(open(sys.argv[1]))["card"]; json.dump(c, open(sys.argv[2],"w"), ensure_ascii=False, indent=2)' \
     "$T/srv/req.$1.json" "$SAMPLES_DIR/$2"
-  sed -i "s#$T/ci-health.log#/var/log/ci-health.log#g" "$SAMPLES_DIR/$2"; }   # 样张里写机器上的日志路径
-reset_state(){ rm -rf "$T/state" "$T/srv"/req.*.json "$T/ci-health.log"; : > "$T/srv/codes"; }
+  sed -i -e "s#$T/ci-health.log#/var/log/ci-health.log#g" -e "s#$T/ci-health.env#/etc/ci-health.env#g" \
+    -e "s#$T/runner#/opt/actions-runner#g" -e "s#$PB_T#${SAMPLE_PLAYBOOK_DIR:-/root/self-hosted-runner-playbook}#g" "$SAMPLES_DIR/$2"; }
+# 每组开始前清掉状态和请求；日志攒进 all.log，最后一组查全程有没有漏出地址和密钥
+reset_state(){ [ -f "$T/ci-health.log" ] && cat "$T/ci-health.log" >> "$T/all.log"
+  rm -rf "$T/state" "$T/srv"/req.*.json "$T/ci-health.log"; : > "$T/srv/codes"; }
+LOG_T="$T/ci-health.log"
+DOC_T="https://github.com/F-WORKS-FBY/self-hosted-runner-playbook/blob/main"
+VERIFY_T="用 root 跑 \`bash $PB_T/scripts/verify.sh\`"
 
 echo "== 1. 没配推送地址：只记日志，不发"
 write_env; reset_state
 run_health FAKE_AVAIL=21300; rc=$?
 [ "$rc" = 0 ] && ok "退出码 0" || no "退出码 $rc"
 [ "$(nreq)" = 0 ] && ok "没有请求" || no "发了 $(nreq) 个请求"
-grep -q 'WARN 根分区可用 21300MB < 21504MB' "$T/ci-health.log" && ok "日志照旧记一行文本" || no "日志里没有那行文本"
+grep -q 'WARN 根分区可用 21300MB < 21504MB（整点量时没有 job 在跑）。containerd' "$LOG_T" && ok "日志记一行文本，不写 GC 怎样" || no "日志里没有那行文本"
 
 echo "== 2. WARN 磁盘：橙色卡片，四节，签名对"
 write_env "$HOOK" "$SECRET_T"; reset_state
 run_health FAKE_AVAIL=21300
 check 1 "msg_type 是 interactive，schema 2.0" 'b["msg_type"] == "interactive" and c["schema"] == "2.0"'
 check 1 "timestamp、sign 在顶层且签名对" 'signed()'
-check 1 "标题" 'h["title"] == {"tag": "plain_text", "content": "[CI runner 告警] '"$RUNNER_NAME_T"'：根分区可用空间偏低"}'
-check 1 "副标题：主机名、级别、新出现" 'h["subtitle"]["content"] == "'"$HOST_T"' · WARN · 新出现"'
+check 1 "标题带级别和最严重那条" 'h["title"] == {"tag": "plain_text", "content": "[CI runner 告警] '"$RUNNER_NAME_T"'：WARN 根分区可用空间偏低"}'
+check 1 "副标题是条数和变化，不放主机名" 'sub == "WARN 1 条 · 新出现"'
 check 1 "颜色 orange" 'h["template"] == "orange"'
 check 1 "预览文字就是标题" 'c["config"]["summary"]["content"] == h["title"]["content"]'
-check 1 "四节依次是情况、影响、先做什么、去哪看" '[l for l in m.split("\n") if l.startswith("#### ")] == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"]'
-check 1 "数字照报" '"**21300 MB**" in m and "低于 WARN 线 21504 MB" in m and "containerd 32339 MB" in m and "/tmp 1411 MB" in m'
-check 1 "先做什么是有序列表，命令用代码样式" '"\n1. `docker images`" in m and "\n3. " in m and "\n4. " not in m'
-check 1 "去哪看链到手册公开仓库，锚点已编码" '"(https://github.com/F-WORKS-FBY/self-hosted-runner-playbook/blob/main/08-%E8%BF%90%E7%BB%B4%E4%B8%8E%E5%AE%B9%E9%87%8F.md#82-%E7%A3%81%E7%9B%98" in m'
-check 1 "正文不再出现章节号" '"08 章" not in m and "8.2" not in m and "A22" not in m'
+check 1 "四节依次是情况、影响、先做什么、去哪看" 'heads == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"]'
+check 1 "数字照报，WARN 线不带括号" '"**21300 MB**，低于 WARN 线 21504 MB\n" in m and "GiB" not in m'
+check 1 "写明整点量时没有 job 在跑" '"\n- 整点量时没有 job 在跑\n" in m'
+check 1 "已用分项" '"- 根分区已用：containerd 32339 MB，/tmp 1411 MB，其他 18370 MB\n" in m'
+check 1 "影响：降到 Min Free 以下才删缓存" '"\n#### 2. 影响\nCI 照常跑；可用空间降到 Min Free 以下，BuildKit 才会删构建缓存来保底" in m'
+check 1 "先做什么：前提一句在前，再是有序列表" '"#### 3. 先做什么\n以下用 root 跑，先 `pgrep -x Runner.Worker` 没输出（没有 job 在跑）再删：\n\n1. `docker images`" in m and "\n3. " in m and "\n4. " not in m'
+check 1 "去哪看链到手册公开仓库，锚点已编码" '"('"$DOC_T"'/08-%E8%BF%90%E7%BB%B4%E4%B8%8E%E5%AE%B9%E9%87%8F.md#82-%E7%A3%81%E7%9B%98" in m'
+check 1 "采样记录在去哪看里" 'm.endswith("\n- 这台的采样记录：`tail -20 '"$LOG_T"'`")'
+check 1 "正文不出现章节号，也不出现「本机」" '"08 章" not in m and "8.2" not in m and "A22" not in m and "本机" not in m'
 check 1 "请求体小于 19000 字节" 'len(raw) < 19000'
 [ "$(keys)" = "disk_warn " ] && ok "状态文件记下 disk_warn" || no "状态文件是「$(keys)」"
 save_sample 1 pb-warn-disk.json
@@ -171,122 +200,234 @@ run_health FAKE_AVAIL=21300
 echo "== 4. 满 24 小时：再提醒一次"
 touch -d '25 hours ago' "$T/state/keys"
 run_health FAKE_AVAIL=21300
-check 2 "副标题写明是 24 小时提醒" 'h["subtitle"]["content"].endswith("超过 24 小时未消除，再提醒一次")'
+check 2 "副标题写明是 24 小时提醒" 'sub == "WARN 1 条 · 超过 24 小时未消除，再提醒一次"'
 
 echo "== 5. CRIT 连续失败 + 原有的 WARN：红色，按条分节，新的标出来"
 run_health FAKE_AVAIL=21300 FAKE_JOBS=streak=4
 check 3 "颜色 red" 'h["template"] == "red"'
-check 3 "标题取最高级那条，注明几项" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：本机 job 连续失败等 2 项"'
-check 3 "副标题：各级条数与变化" 'h["subtitle"]["content"] == "'"$HOST_T"' · CRIT 1 条、WARN 1 条 · 新出现 1 条"'
-check 3 "每条一节，CRIT 在前，新出现的标（新）" '[l for l in m.split("\n") if l.startswith("#### ")] == ["#### 1. CRIT 本机 job 连续失败（新）", "#### 2. WARN 根分区可用空间偏低", "#### 3. 本机采样记录"]'
-check 3 "节内有情况、影响、先做什么、去哪看" 'm.count("**情况**") == 2 and m.count("**影响**：") == 2 and m.count("**先做什么**") == 2 and m.count("**去哪看**") == 2'
-check 3 "连续失败次数与 runner 名" '"连续失败 **4 次**" in m and "`'"$RUNNER_NAME_T"'`" in m'
-check 3 "附 GitHub Actions 链接" '"(https://github.com/'"$REPO_T"'/actions)" in m'
+check 3 "标题取最严重那条，带次数，注明几条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 本机 job 连续失败 4 次等 2 条"'
+check 3 "副标题：各级条数与变化" 'sub == "CRIT 1 条、WARN 1 条 · 新出现 1 条"'
+check 3 "每条一节，CRIT 在前，新出现的标（新），采样记录不单独成节" 'heads == ["#### 1. CRIT 本机 job 连续失败 4 次（新）", "#### 2. WARN 根分区可用空间偏低"]'
+check 3 "节内情况、影响、先做什么、去哪看各自另起一行" 'all(m.count(x) == 2 for x in ("**情况**\n- ", "**影响**\n", "**先做什么**\n", "**去哪看**\n- ")) and "**影响**：" not in m'
+check 3 "采样记录放在最后一行" 'm.endswith("\n\n这台的采样记录：`tail -20 '"$LOG_T"'`")'
+check 3 "连续失败次数" '"这台上的 job 从最近一次往回数连续失败 **4 次**（被取消的 run 不算，满 3 次就报）" in m'
+check 3 "先看 GitHub 上红在哪一步，再跑 verify.sh" 'm.index("1. 打开下面的 GitHub Actions") < m.index("2. '"$VERIFY_T"'")'
+check 3 "附 GitHub Actions 链接和钩子强加 -e 那一篇" '"(https://github.com/'"$REPO_T"'/actions)" in m and "#a11-runner-" in m'
 save_sample 3 pb-mixed.json
 
 echo "== 6. 磁盘那条消除、连续失败还在：单条格式，写明同时消除"
 run_health FAKE_JOBS=streak=5
-check 4 "副标题：新出现 0、消除 1" 'h["subtitle"]["content"] == "'"$HOST_T"' · CRIT · 消除 1 条"'
+check 4 "副标题：消除 1 条" 'sub == "CRIT 1 条 · 消除 1 条"'
 check 4 "情况里列出同时消除的那条" '"- 同时消除：WARN 根分区可用空间偏低" in m'
 check 4 "单条格式四节" 'm.startswith("#### 1. 情况\n") and "#### 4. 去哪看" in m'
 
-echo "== 7. 全部消除：绿色恢复卡，列出之前的告警（CRIT 在前）"
+echo "== 7. 全部消除：绿色恢复卡，列出之前的告警和当时的先做什么"
 printf 'disk_warn streak ' > "$T/state/keys"
 run_health
 check 5 "颜色 green" 'h["template"] == "green"'
-check 5 "标题与副标题" 'h["title"]["content"] == "[CI runner 恢复] '"$RUNNER_NAME_T"'：告警已全部消除" and h["subtitle"]["content"] == "'"$HOST_T"' · 已恢复"'
-check 5 "列出消除的告警" '"：\n- CRIT 本机 job 连续失败\n- WARN 根分区可用空间偏低\n\n#### 2. 要不要处理" in m'
+check 5 "标题；副标题是之前的条数，不重复「已恢复」" 'h["title"]["content"] == "[CI runner 恢复] '"$RUNNER_NAME_T"'：告警已全部消除" and sub == "之前 CRIT 1 条、WARN 1 条"'
+check 5 "列出消除的告警（CRIT 在前）" '"#### 1. 情况\n之前的告警这次都没再出现：\n- CRIT 本机 job 连续失败\n- WARN 根分区可用空间偏低\n\n#### 2. 要不要处理\n" in m'
+check 5 "要不要处理：不说「不用」，说明没再报不代表查清" '"#### 2. 要不要处理\n这次整点检查没再报，不代表原因查清了。告警时的这几步没做完的，接着做：" in m and "不用" not in m'
+check 5 "按条列出当时的先做什么" '"\n\n**CRIT 本机 job 连续失败**\n1. 打开下面的 GitHub Actions" in m and "\n\n**WARN 根分区可用空间偏低**\n以下用 root 跑" in m'
+check 5 "去哪看有两条的手册链接和采样记录" '"#a11-runner-" in m and "#82-%E7%A3%81%E7%9B%98" in m and m.endswith("这台的采样记录：`tail -20 '"$LOG_T"'`")'
 [ -z "$(keys)" ] && ok "状态文件清空" || no "状态文件是「$(keys)」"
 save_sample 5 pb-recover.json
 
-echo "== 8. 单条 CRIT 连续失败（样张）"
+echo "== 8. 单条 CRIT 连续失败（样张）：verify.sh 写完整路径"
 reset_state
 run_health FAKE_JOBS=streak=3
-check 1 "红色，单条四节" 'h["template"] == "red" and m.startswith("#### 1. 情况\n") and "#### 3. 先做什么" in m'
-check 1 "先跑 verify.sh 看钩子那一项" '"1. 在这台的手册仓库目录里跑 `bash scripts/verify.sh`" in m'
+check 1 "红色，单条四节，标题带次数" 'h["template"] == "red" and heads == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"] and h["title"]["content"].endswith("：CRIT 本机 job 连续失败 3 次")'
+check 1 "情况里不重复 runner 名" '"#### 1. 情况\n- 这台上的 job 从最近一次往回数连续失败 **3 次**（被取消的 run 不算，满 3 次就报）\n\n" in m'
+check 1 "第 1 步看 GitHub，写明怎么认出这台" '"\n1. 打开下面的 GitHub Actions，看落在这台的 job 红在哪一步、几次是不是同一处（job 日志开头 Set up job 里 Runner name 是 `'"$RUNNER_NAME_T"'`）\n" in m'
+check 1 "第 2 步用 root 跑这台上的 verify.sh，看钩子那一行" '"\n2. '"$VERIFY_T"'，看带 `清理钩子` 和 `bash -e` 的那一行是 PASS 还是 FAIL\n" in m'
+check 1 "第 3 步写明有 job 时会跳过，照原文" '"\n3. 有 job 在跑时这一项会跳过，那一行换成 `有 job 正在运行，跳过钩子实跑`" in m'
 save_sample 1 pb-crit-streak.json
+# 卡片里引用的 verify.sh 原文要和脚本对得上
+grep -q 'ok "清理钩子按 runner 的调用方式（bash -e）可正常退出"' "$HERE/../verify.sh" \
+  && grep -q 'no "清理钩子在 bash -e 下非零退出' "$HERE/../verify.sh" \
+  && grep -q 'sk "有 job 正在运行，跳过钩子实跑' "$HERE/../verify.sh" \
+  && grep -q 'ok "Runner.Listener 在跑' "$HERE/../verify.sh" \
+  && ok "卡片引用的 verify.sh 输出与脚本原文一致" || no "verify.sh 的输出原文变了，卡片要跟着改"
 
-echo "== 9. 多条混合 + 外来字符：转义、排序、体积"
+echo "== 9. 手册仓库目录没渲染或不在了：写「装机用的手册仓库」"
+reset_state; SCRIPT="$T/ci-health-nodir.sh"
+run_health FAKE_JOBS=streak=3
+check 1 "改写成装机用的手册仓库" '"\n2. 用 root 跑装机用的手册仓库里的 `scripts/verify.sh`，看" in m and "__PLAYBOOK" not in m'
+SCRIPT="$T/ci-health.sh"
+
+echo "== 10. 多条混合 + 外来字符：转义、排序、体积"
 reset_state
 printf 'RUNNER_HOME=%s\nCI_FIXEDWORK_BASELINE=2.000\nCI_DISK_WARN_MB=3`0*G_[x](y)<at id=all></at>\nCI_DISK_CRIT_MB=10240\n' "$T/runner" > "$T/ci-runner.env"
 run_health FAKE_AVAIL=5500 FAKE_TMP_DEV=40 FAKE_SVC_STATE=failed FAKE_FIXEDWORK=3.300 FAKE_JOBS=streak=6
-check 1 "CRIT 在前（磁盘、服务、连续失败），WARN 在后（CPU、配置）" '[l.split(" ", 3)[2] for l in m.split("\n") if l.startswith("#### ") and ("CRIT" in l or "WARN" in l)] == ["CRIT", "CRIT", "CRIT", "WARN", "WARN"]'
+check 1 "CRIT 在前（磁盘、服务、连续失败），WARN 在后（CPU、配置）" '[l.split(" ", 3)[2] for l in heads] == ["CRIT", "CRIT", "CRIT", "WARN", "WARN"]'
+check 1 "标题注明 5 条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 根分区快满了等 5 条" and sub == "CRIT 3 条、WARN 2 条 · 新出现"'
 check 1 "配置原值进代码样式：没有反引号、拼不出 <at>" '"<at" not in m and "`CI_DISK_WARN_MB=3'"'"'0*G_[x](y)＜at id=all＞＜/at＞`" in m'
-check 1 "/tmp 不在根分区时注明" '"/tmp 1411 MB（不在根分区）" in m'
-check 1 "服务状态与服务名" '"`failed`" in m and "`'"$SVC_T"'`" in m'
-check 1 "CPU 倍数" '"**3.300 秒**" in m and "1.65 倍" in m'
+check 1 "/tmp 不在根分区时单列" '"根分区已用：containerd 32339 MB，其他 19781 MB；不在根分区的：/tmp 1411 MB" in m'
+check 1 "服务状态在情况里，服务名在命令里" '"runner 服务当前是 `failed`，不是 active" in m and "\n2. 不是的话，`journalctl -u '"$SVC_T"' -n 50` 看原因\n3. 处理完 `systemctl start '"$SVC_T"'`\n4. 起来以后'"$VERIFY_T"'" in m'
+check 1 "CPU 倍数" '"**3.300 秒**，这台的基线 2.000 秒，是基线的 1.65 倍" in m'
 check 1 "请求体小于 19000 字节" 'len(raw) < 19000'
 printf 'RUNNER_HOME=%s\nCI_FIXEDWORK_BASELINE=2.000\nCI_DISK_WARN_MB=21504\nCI_DISK_CRIT_MB=10240\n' "$T/runner" > "$T/ci-runner.env"
 
-echo "== 10. listener 反复崩溃、job 采样 401"
+echo "== 11. listener 反复崩溃、job 采样 401"
 reset_state
 run_health FAKE_LISTENER_AGE=5 FAKE_JOBS=error:HTTP401
-check 1 "listener：两次都是刚启动" '"隔 90 秒看了两次，都是刚启动（第二次 5 秒）" in m and "`journalctl -u '"$SVC_T"' -n 50`" in m'
-check 1 "jobsprobe：401 给换 token 的步骤" '"`HTTP401`" in m and "CI_HEALTH_GH_TOKEN=" in m'
+check 1 "listener：两次都是刚启动" '"- 隔 90 秒看了两次，都是刚启动（第二次 5 秒）" in m and "`journalctl -u '"$SVC_T"' -n 50`" in m'
+check 1 "listener：处理完跑 verify.sh 看 Runner.Listener 那一行" '"处理完'"$VERIFY_T"'，要有一行 `Runner.Listener 在跑`" in m'
+check 1 "jobsprobe：401 写成 token 失效、没权限或仓库名不对" '"GitHub 回了 `HTTP401`：token 失效、没权限或仓库名不对" in m'
+check 1 "jobsprobe：先核仓库名，再换 token" '"1. 先核仓库名：`'"$T"'/ci-health.env` 里 `GH_REPO=` 现在是 `'"$REPO_T"'`" in m and "\n2. 仓库名没错，就换一个只读 token" in m and "CI_HEALTH_GH_TOKEN=" in m'
+check 1 "jobsprobe：用 grep 看 jobs=，不用 tail -1" '"`grep -o '"'"'jobs=[^ ]*'"'"' '"$LOG_T"' | tail -3`" in m and "tail -1" not in m'
 
-echo "== 11. 磁盘 WARN 在两个 job 之间量"
+echo "== 12. job 采样 404：并进 token 没权限或仓库名不对"
+reset_state
+run_health FAKE_JOBS=error:HTTP404
+check 1 "404 也给核仓库名、换 token 的步骤" '"GitHub 回了 `HTTP404`：token 失效、没权限或仓库名不对" in m and "先核仓库名" in m and "#b12-" in m'
+
+echo "== 13. job 采样连不上：只写原因见日志，日志里有原因"
+reset_state
+run_health FAKE_JOBS=$'error:URLError\n[Errno -3] Temporary failure in name resolution'
+check 1 "情况里是出错类型，不猜原因" '"统计这台 job 结果时出错（`URLError`）" in m and "网络" not in m and "多半" not in m'
+check 1 "第 1 步：原因见日志" '"\n1. 原因见日志：`grep 采样失败 '"$LOG_T"' | tail -3`\n2. 下一小时会自动再试，`jobs=` 变回 `streak=数字` 就好了" in m'
+grep -q 'jobs=error:URLError mem_peak' "$LOG_T" && grep -q 'WARN job 产出采样失败（URLError：\[Errno -3\] Temporary failure in name resolution），「本机 job 连续失败」这一项现在看不到' "$LOG_T" \
+  && ok "采样行只记类型，告警行带原因" || no "日志里的采样行或告警行不对"
+
+echo "== 14. job 采样脚本自己出错：只写原因见日志"
+reset_state
+run_health FAKE_JOBS=error:python
+check 1 "python 出错：原因见日志" '"统计这台 job 结果时出错（`python`）" in m and "原因见日志" in m and "网络" not in m'
+
+echo "== 15. 上次报连续失败、这次采样出错：连续失败那条看不到了，不算消除（样张）"
+reset_state; mkdir -p "$T/state"; printf 'streak ' > "$T/state/keys"
+run_health FAKE_JOBS=error:HTTP401
+check 1 "副标题：新出现 1 条，1 条看不到了，没有消除" 'sub == "WARN 1 条 · 新出现 1 条，1 条看不到了" and "消除" not in sub'
+check 1 "情况里写明看不到了、不算消除" '"\n- 上次报的「CRIT 本机 job 连续失败」看不到了，不算消除\n" in m and "同时消除" not in m'
+[ "$(keys)" = "jobsprobe " ] && ok "状态文件换成 jobsprobe" || no "状态文件是「$(keys)」"
+save_sample 1 pb-streak-unseen.json
+
+echo "== 16. 上次报 listener、这次服务不是 active：listener 那条看不到了"
+reset_state; mkdir -p "$T/state"; printf 'listener ' > "$T/state/keys"
+run_health FAKE_SVC_STATE=failed
+check 1 "情况里写明 listener 那条看不到了" '"上次报的「CRIT runner 没在接 job」看不到了（服务不是 active 时不查这一项），不算消除" in m and sub == "CRIT 1 条 · 新出现 1 条，1 条看不到了"'
+
+echo "== 17. 磁盘 WARN 在两个 job 之间量"
 reset_state
 run_health FAKE_AVAIL=20000 FAKE_WORKER_BUSY_CALLS=1 FAKE_AVAIL_IDLE=21000
-check 1 "写明两个 job 之间量的值和整点值" '"两个 job 之间量的根分区可用 **21000 MB**" in m and "当时可用 20000 MB" in m'
+check 1 "写明两个 job 之间量的值和整点值" '"两个 job 之间量的根分区可用 **21000 MB**，低于 WARN 线 21504 MB" in m and "- 整点时有 job 在跑，当时可用 20000 MB\n- 整点时根分区已用：" in m and "整点量时没有" not in m'
 
-echo "== 12. 一直有 job：沿用上一次的 WARN"
+echo "== 18. 一直有 job：沿用上一次的 WARN"
 printf 'disk_warn ' > "$T/state/keys"; touch -d '25 hours ago' "$T/state/keys"
 run_health FAKE_AVAIL=20000 FAKE_WORKER_BUSY_CALLS=999999
 check 2 "写明沿用上一次" '"沿用上一次的 WARN" in m'
 
-echo "== 13. 限流：等一会儿、重新签名再发一次"
+echo "== 19. 限流：等一会儿、重新签名再发一次"
 reset_state; echo "11232 0" > "$T/srv/codes"
 run_health FAKE_AVAIL=21300
 [ "$(nreq)" = 2 ] && ok "发了两次" || no "发了 $(nreq) 次"
 check 2 "第二次签名也对" 'signed() and b["msg_type"] == "interactive"'
 [ "$(keys)" = "disk_warn " ] && ok "成功后写状态" || no "状态文件是「$(keys)」"
 
-echo "== 14. 卡片被拒（11246）：改发文本，日志记一行"
+echo "== 20. 卡片被拒（11246）：改发文本，日志记一行"
 reset_state; echo "11246 0" > "$T/srv/codes"
 run_health FAKE_AVAIL=21300
 check 2 "第二次是原来的文本消息" 'b["msg_type"] == "text" and b["content"]["text"].startswith("[CI runner 告警] '"$RUNNER_NAME_T"'（'"$HOST_T"'）\n· WARN 根分区可用 21300MB") and signed()'
-grep -q '告警卡片被飞书拒收（11246' "$T/ci-health.log" && ok "日志记了卡片被拒" || no "日志里没有卡片被拒"
+grep -q '告警卡片被飞书拒收（11246' "$LOG_T" && ok "日志记了卡片被拒" || no "日志里没有卡片被拒"
 [ "$(keys)" = "disk_warn " ] && ok "文本发成功也写状态" || no "状态文件是「$(keys)」"
 
-echo "== 15. 签名错（19021）：记失败，不写状态，下一小时重发"
+echo "== 21. 请求体格式不对（9499）：同样改发文本"
+reset_state; echo "9499 0" > "$T/srv/codes"
+run_health FAKE_AVAIL=21300
+check 2 "第二次是文本" 'b["msg_type"] == "text"'
+grep -q '告警卡片被飞书拒收（9499，请求体格式不对' "$LOG_T" && ok "日志记了 9499" || no "日志里没有 9499"
+
+echo "== 22. HTTP 400 带 JSON 返回体（走 HTTPError 那条路）：照样按 code 判"
+reset_state; echo "400:9499 0" > "$T/srv/codes"
+run_health FAKE_AVAIL=21300
+[ "$(nreq)" = 2 ] && ok "卡片被拒后改发文本" || no "发了 $(nreq) 次"
+grep -q '告警卡片被飞书拒收（9499' "$LOG_T" && [ "$(keys)" = "disk_warn " ] && ok "日志记了拒收，文本发成功后写状态" || no "日志或状态不对：「$(keys)」"
+
+echo "== 23. HTTP 502、返回体不是 JSON：记失败，不写状态"
+reset_state; echo "502:-" > "$T/srv/codes"
+run_health FAKE_AVAIL=21300
+grep -q '告警推送失败：HTTP 502，返回体认不出：<html>bad gateway</html>' "$LOG_T" && ok "日志写明状态码和返回体" || no "日志里没有 502"
+[ ! -s "$T/state/keys" ] && ok "没写状态" || no "状态文件是「$(keys)」"
+
+echo "== 24. 签名错（19021）：记失败，不写状态，下一小时重发"
 reset_state; echo "19021" > "$T/srv/codes"
 run_health FAKE_AVAIL=21300
-grep -q '告警推送失败：飞书返回 19021（签名或时间戳不对' "$T/ci-health.log" && ok "日志写明返回码和原因" || no "日志里没有失败原因"
+grep -q '告警推送失败：飞书返回 19021（签名或时间戳不对' "$LOG_T" && ok "日志写明返回码和原因" || no "日志里没有失败原因"
 [ ! -s "$T/state/keys" ] && ok "没写状态" || no "状态文件是「$(keys)」"
 run_health FAKE_AVAIL=21300
 [ "$(nreq)" = 2 ] && [ "$(keys)" = "disk_warn " ] && ok "下一次重发并成功" || no "请求 $(nreq) 个，状态「$(keys)」"
 
-echo "== 16. 地址连不上：记失败，不写状态"
+echo "== 25. 地址连不上：记失败，不写状态"
 write_env "http://127.0.0.1:9/open-apis/bot/v2/hook/test-hook-id" "$SECRET_T"; reset_state
 run_health FAKE_AVAIL=21300
-grep -q '告警推送失败：请求失败' "$T/ci-health.log" && ok "日志写明请求失败" || no "日志里没有请求失败"
+grep -q '告警推送失败：请求失败' "$LOG_T" && ok "日志写明请求失败" || no "日志里没有请求失败"
 [ ! -s "$T/state/keys" ] && ok "没写状态" || no "状态文件是「$(keys)」"
 
-echo "== 17. 没配签名密钥：不带 timestamp、sign"
+echo "== 26. 地址写错（没有 https://）：报错里不带地址"
+write_env "open.feishu.invalid/open-apis/bot/v2/hook/$BAD_HOOK_ID" "$SECRET_T"; reset_state
+run_health FAKE_AVAIL=21300
+grep -q '告警推送失败：请求失败：ValueError: unknown url type' "$LOG_T" && ok "日志写明地址格式不对" || no "日志里没有 ValueError：$(tail -1 "$LOG_T")"
+grep -qF -e "$BAD_HOOK_ID" -e "open.feishu.invalid" "$LOG_T" && no "日志里出现了推送地址" || ok "日志里地址换成了 <已隐去>"
+
+echo "== 27. 没配签名密钥：不带 timestamp、sign"
 write_env "$HOOK"; reset_state
 run_health FAKE_AVAIL=21300
 check 1 "请求体里没有 timestamp、sign" '"timestamp" not in b and "sign" not in b and b["msg_type"] == "interactive"'
+write_env "$HOOK" "$SECRET_T"
 
-echo "== 18. 日志和 journal 里没有推送地址和密钥"
-if grep -rqF -e "$SECRET_T" -e "test-hook-id" "$T/ci-health.log" "$T/fake/journal" 2>/dev/null; then no "日志里出现了地址或密钥"; else ok "日志里没有地址和密钥"; fi
-
-echo "== 19. 没写文案的 key（以后新加的检查）：照样送达，原文转义后放进情况"
+echo "== 28. 没写文案的 key（以后新加的检查）：照样送达，原文转义后放进情况"
 # 直接跑 notify() 里那段 python，喂一条 ci-health 现在不会产生的 key
 awk '/^notify\(\)\{/{n=1} n&&/^PY$/{exit} n>1{print} n&&/<<.PY. 2>&1$/{n=2}' "$T/ci-health.sh" > "$T/notify.py"
 reset_state
 CARD_KIND=alert CARD_TEXT="[CI runner 告警] x" CARD_RUNNER="$RUNNER_NAME_T" CARD_HOST="$HOST_T" CARD_LOG=/var/log/ci-health.log \
   CARD_ALERTS="$(printf 'newcheck\tWARN\ttext=WARN 新检查 *x* [a](b) <at id=all></at>')" CARD_PREV="" CARD_DOC=https://example.invalid \
-  CI_ALERT_WEBHOOK="$HOOK" CI_ALERT_SECRET="$SECRET_T" "$REAL_PY" -I "$T/notify.py"; rc=$?
+  CI_ALERT_WEBHOOK="$HOOK" CI_ALERT_SECRET="$SECRET_T" "$REAL_PY" -I "$T/notify.py" > "$T/out.28.txt"; rc=$?
 [ "$rc" = 0 ] && ok "退出码 0" || no "退出码 $rc"
-check 1 "标题用 key 本身" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：newcheck"'
+check 1 "标题用级别和 key 本身" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：WARN newcheck"'
 check 1 "原文转义后放进情况，拼不出链接和 @" '"- WARN 新检查 &#42;x&#42; &#91;a&#93;&#40;b&#41; &#60;at id=all&#62;&#60;/at&#62;" in m and "<at" not in m'
 
-echo "== 20. 卡片拼装出错：改发文本"
+echo "== 29. 卡片拼装出错：改发文本"
 reset_state
 CARD_KIND=alert CARD_TEXT="[CI runner 告警] x" CARD_ALERTS="$(printf 'disk_warn\tWARN\tmode=now')" CARD_PREV="" CARD_DOC=x CARD_LOG=x \
-  CI_ALERT_WEBHOOK="$HOOK" CI_ALERT_SECRET="$SECRET_T" "$REAL_PY" -I -c 'import sys; exec(open(sys.argv[1]).read().replace("def disk_parts(f):", "def disk_parts(f):\n    raise RuntimeError(\"boom\")"))' "$T/notify.py" > "$T/out.txt"; rc=$?
-[ "$rc" = 0 ] && grep -q '告警卡片拼装出错（RuntimeError' "$T/out.txt" && ok "发成功并说明改发了文本" || no "退出码 $rc，输出：$(cat "$T/out.txt")"
+  CI_ALERT_WEBHOOK="$HOOK" CI_ALERT_SECRET="$SECRET_T" "$REAL_PY" -I -c 'import sys; exec(open(sys.argv[1]).read().replace("def disk_parts(f, when=\"\"):", "def disk_parts(f, when=\"\"):\n    raise RuntimeError(\"boom\")"))' "$T/notify.py" > "$T/out.29.txt"; rc=$?
+[ "$rc" = 0 ] && grep -q '告警卡片拼装出错（RuntimeError' "$T/out.29.txt" && ok "发成功并说明改发了文本" || no "退出码 $rc，输出：$(cat "$T/out.29.txt")"
 check 1 "发的是文本消息" 'b["msg_type"] == "text" and b["content"]["text"] == "[CI runner 告警] x"'
+
+echo "== 30. 卡片超过 19000 字节：改发文本"
+reset_state
+big=$(for i in $(seq 40); do printf 'newcheck%d\tWARN\ttext=%s\n' "$i" "$(printf '*%.0s' $(seq 400))"; done)
+CARD_KIND=alert CARD_TEXT="[CI runner 告警] x" CARD_ALERTS="$big" CARD_PREV="" CARD_DOC=x CARD_LOG=x \
+  CI_ALERT_WEBHOOK="$HOOK" CI_ALERT_SECRET="$SECRET_T" "$REAL_PY" -I "$T/notify.py" > "$T/out.30.txt"; rc=$?
+[ "$rc" = 0 ] && grep -q '告警卡片超过 19000 字节，改发了文本' "$T/out.30.txt" && ok "发成功并说明改发了文本" || no "退出码 $rc，输出：$(cat "$T/out.30.txt")"
+check 1 "只发了一次，是文本" 'b["msg_type"] == "text"'
+[ "$(nreq)" = 1 ] || no "发了 $(nreq) 次"
+
+echo "== 31. 卡片里的手册链接，锚点都在手册的章节标题里"
+"$REAL_PY" -I - "$HERE/../ci-health.sh" "$HERE/../.." <<'PY' && ok "锚点都对得上" || no "有锚点在手册里找不到"
+import re, sys, unicodedata
+src, root = open(sys.argv[1], encoding="utf-8").read(), sys.argv[2]
+def slug(h):   # GitHub 的标题锚点：转小写，去掉标点和符号（- 和 _ 除外），空格换成 -
+    return "".join(ch for ch in h.lower() if ch in "-_ " or unicodedata.category(ch)[0] not in "PS").replace(" ", "-")
+bad = []
+for path, anchor in re.findall(r'doc\("[^"]*", "([^"]+)", "([^"]+)"\)', src):
+    heads = [slug(l.lstrip("#").strip()) for l in open("%s/%s" % (root, path), encoding="utf-8") if re.match(r"#{2,6} ", l)]
+    if anchor not in heads:
+        bad.append("%s#%s" % (path, anchor))
+print("\n".join(bad), file=sys.stderr)
+sys.exit(1 if bad or not re.search(r'doc\(', src) else 0)
+PY
+
+echo "== 32. bootstrap 按同样的方式渲染两个占位符，渲染后不剩占位符"
+grep -q 's#__RUNNER_SVC__#${SVC:-none}#' "$HERE/../bootstrap.sh" && grep -q 's#__PLAYBOOK_DIR__#${PB_DIR}#' "$HERE/../bootstrap.sh" \
+  && ok "bootstrap 替换服务名和手册仓库目录" || no "bootstrap 的渲染和用例不一致"
+! grep -q '__RUNNER_SVC__\|__PLAYBOOK_DIR__' "$T/ci-health.sh" && grep -qx "PLAYBOOK_DIR=\"$PB_T\"" "$T/ci-health.sh" \
+  && ok "渲染后没有占位符，目录写进去了" || no "渲染结果不对"
+
+echo "== 33. 全程的日志、journal 和输出里没有推送地址和密钥"
+reset_state
+if grep -rqF -e "$SECRET_T" -e "test-hook-id" -e "$BAD_HOOK_ID" "$T/all.log" "$T/fake/journal" "$T"/out.*.txt 2>/dev/null; then
+  no "出现了地址或密钥"; else ok "没有地址和密钥（$(wc -l < "$T/all.log") 行日志）"; fi
 
 echo
 echo "通过 $PASS，失败 $FAIL"
