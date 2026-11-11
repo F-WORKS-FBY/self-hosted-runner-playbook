@@ -211,14 +211,15 @@ nv=$(docker volume ls -q 2>/dev/null | wc -l)
 [ "$nv" -le "$MAX_VOL" ] && ok "匿名卷没有累积（$nv 个，上限 $MAX_VOL）" \
   || no "有 $nv 个卷，超过上限 $MAX_VOL：清理钩子的 volume prune 可能没在跑，或者这个项目的服务容器多，要调高 CI_MAX_VOLUMES（07 章 7.1）"
 # 阈值和 ci-health 用同一套，从 /etc/ci-runner.env 读（bootstrap 按 BUILDKIT_MIN_FREE + 1 GiB 推算后落盘），
-# 盘大小不同的机器不会误报。低于 CRIT 是 FAIL；低于 WARN 说明 GC 已在按 Min Free 驱逐缓存，只提示。
+# 盘大小不同的机器不会误报。低于 CRIT 是 FAIL；低于 WARN 只提示。输出只报数，不写原因：
+# 空间是被什么占掉的，要按 08 章 8.2 的顺序查了才知道（09 章 B20）。
 WARN_MB="${CI_DISK_WARN_MB:-21504}"; CRIT_MB="${CI_DISK_CRIT_MB:-10240}"
 case "$WARN_MB" in ''|*[!0-9]*) no "CI_DISK_WARN_MB=$WARN_MB 不是 MiB 整数（ci-health 会改用默认值并告警），这里按 21504 查"; WARN_MB=21504 ;; esac
 case "$CRIT_MB" in ''|*[!0-9]*) no "CI_DISK_CRIT_MB=$CRIT_MB 不是 MiB 整数（ci-health 会改用默认值并告警），这里按 10240 查"; CRIT_MB=10240 ;; esac
 av=$(df --output=avail -BM / 2>/dev/null | tail -1 | tr -dc 0-9)
 if [ -z "$av" ]; then no "读不到根分区的可用空间"
-elif [ "$av" -lt "$CRIT_MB" ]; then no "根分区只剩 ${av}MB，低于 CRIT 线 ${CRIT_MB}MB：GC 腾不出空间了，是 Docker 以外的东西在吃盘"
-elif [ "$av" -lt "$WARN_MB" ]; then sk "根分区可用 ${av}MB，低于 WARN 线 ${WARN_MB}MB：GC 已在按 Min Free 驱逐缓存，看看 Docker 以外是什么在涨"
+elif [ "$av" -lt "$CRIT_MB" ]; then no "根分区可用 ${av}MB，低于 CRIT 线 ${CRIT_MB}MB。各部分占用按 08 章 8.2 的顺序查"
+elif [ "$av" -lt "$WARN_MB" ]; then sk "根分区可用 ${av}MB，低于 WARN 线 ${WARN_MB}MB。各部分占用按 08 章 8.2 的顺序查"
 else ok "根分区可用 ${av}MB（WARN 线 ${WARN_MB}MB，CRIT 线 ${CRIT_MB}MB）"; fi
 # job 被取消时，程序自己建在 /tmp 下的临时目录不会被删（09 章 A22）。/tmp 里也有工具自己的缓存，
 # 多大算异常因项目而异，所以超线只提醒。默认 2048 MiB，用 CI_MAX_TMP_MB 改。

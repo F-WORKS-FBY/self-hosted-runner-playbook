@@ -8,10 +8,12 @@
 # 做法：按 bootstrap 的方式渲染出 ci-health.sh（替换服务名和手册仓库目录两个占位符），PATH 前面放 systemctl、pgrep、ps、
 # df、du、stat、hostname、logger、sleep 的桩，按 FAKE_* 变量给出磁盘、服务、listener、job 的读数；python3 也包一层，
 # 只把定长任务和 job 产出采样两段换成 FAKE_FIXEDWORK、FAKE_JOBS（不烧 CPU、不连 GitHub），其余照常交给真的 python3。
+# FAKE_FIXEDWORK=crash、FAKE_JOBS_STDERR=<一行> 模拟那段 python 自己崩溃：往 stderr 写一段 traceback、退 1。
 # 推送地址指向 127.0.0.1 上的假 webhook：它把请求体存下来，按 codes 文件依次回飞书的返回码（默认 0）。
 # codes 里写「状态码:返回码」时回那个 HTTP 状态，返回码写「-」时回一段不是 JSON 的返回体。
-# 核：卡片结构、颜色、标题与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除、恢复、
-# verify.sh 的路径、限流重试、卡片被拒或超长改发文本、失败不写状态、所有日志和输出里不出现地址和密钥、手册链接的锚点。
+# 核：卡片结构、颜色、标题与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除（含没配 token、
+# 定长任务没跑出结果）、恢复、先做什么以「以下在这台上用 root 跑」开头、verify.sh 的路径、401 单独写、采样出错时日志带原因
+# 且不带 token、限流重试、卡片被拒或超长改发文本、失败不写状态、所有日志和输出里不出现地址和密钥、手册链接的锚点。
 # 名字可换：TEST_RUNNER_NAME、TEST_HOST、TEST_REPO（默认 ci-1、ubuntu-4gb-hel1-1、owner/repo）。
 # 样张里的路径换成机器上的：日志 /var/log/ci-health.log、凭据 /etc/ci-health.env、runner /opt/actions-runner，
 # 手册仓库目录用 SAMPLE_PLAYBOOK_DIR（默认 /root/self-hosted-runner-playbook）。
@@ -65,8 +67,12 @@ stub python3 "REAL=$(printf '%q' "$REAL_PY")"'
 if [ "${1:-}" = - ]; then
   src=$(cat)
   case "$src" in
-    *workflow_runs*) [ -n "${FAKE_JOBS:-}" ] && { echo "$FAKE_JOBS"; exit 0; } ;;
-    *"range(180000)"*) [ -n "${FAKE_FIXEDWORK:-}" ] && { echo "$FAKE_FIXEDWORK"; exit 0; } ;;
+    *workflow_runs*)
+      [ -n "${FAKE_JOBS_STDERR:-}" ] && { printf "Traceback (most recent call last):\n  File \"<stdin>\", line 9\n%s\n\n" "$FAKE_JOBS_STDERR" >&2; exit 1; }
+      [ -n "${FAKE_JOBS:-}" ] && { echo "$FAKE_JOBS"; exit 0; } ;;
+    *"range(180000)"*)
+      [ "${FAKE_FIXEDWORK:-}" = crash ] && { printf "Traceback (most recent call last):\nMemoryError: boom\n" >&2; exit 1; }
+      [ -n "${FAKE_FIXEDWORK:-}" ] && { echo "$FAKE_FIXEDWORK"; exit 0; } ;;
   esac
   printf "%s\n" "$src" | "$REAL" -
   exit $?
@@ -127,12 +133,12 @@ run_health(){
 nreq(){ find "$T/srv" -name 'req.*.json' | wc -l | tr -d ' '; }
 keys(){ cat "$T/state/keys" 2>/dev/null; }
 # check <请求序号> <说明> <python 表达式>：b 是请求体，c 是卡片，m 是卡片正文，h 是头部，raw 是原始字节，
-# heads 是正文里的四级标题，sub 是副标题
+# heads 是正文里的四级标题，sub 是副标题，todos 是各个先做什么的内容，root_ok() 核 root 那句的位置
 check(){
   local f="$T/srv/req.$1.json"
   if [ ! -f "$f" ]; then no "$2（没有第 $1 个请求）"; return; fi
   if SECRET="$SECRET_T" DEBUG_CARDS="${DEBUG_CARDS:-}" "$REAL_PY" -I - "$f" "$3" <<'PY'
-import base64, hashlib, hmac, json, os, sys, time
+import base64, hashlib, hmac, json, os, re, sys, time
 raw = open(sys.argv[1], "rb").read()
 b = json.loads(raw)
 c = b.get("card") or {}
@@ -140,6 +146,11 @@ h = c.get("header") or {}
 m = "\n".join(e.get("content", "") for e in (c.get("body") or {}).get("elements", []))
 heads = [l for l in m.split("\n") if l.startswith("#### ")]
 sub = (h.get("subtitle") or {}).get("content")
+ROOT = "以下在这台上用 root 跑"
+todos = [t.split("\n\n**")[0].split("\n\n#### ")[0] for t in re.split(r"(?:\*\*先做什么\*\*|#### \d+\. 先做什么)\n", m)[1:]]
+def root_ok():   # 每个先做什么都以 root 那句开头；第 1 步不用登机时，root 那句在第 2 步里
+    return bool(todos) and all(t.startswith(ROOT) or ROOT not in t.split("\n2. ")[0] and ROOT in t.split("\n2. ")[1].split("\n")[0]
+                               for t in todos)
 def signed():
     ts = b.get("timestamp", "")
     want = base64.b64encode(hmac.new(("%s\n%s" % (ts, os.environ["SECRET"])).encode(), b"", hashlib.sha256).digest()).decode()
@@ -162,7 +173,8 @@ reset_state(){ [ -f "$T/ci-health.log" ] && cat "$T/ci-health.log" >> "$T/all.lo
   rm -rf "$T/state" "$T/srv"/req.*.json "$T/ci-health.log"; : > "$T/srv/codes"; }
 LOG_T="$T/ci-health.log"
 DOC_T="https://github.com/F-WORKS-FBY/self-hosted-runner-playbook/blob/main"
-VERIFY_T="用 root 跑 \`bash $PB_T/scripts/verify.sh\`"
+VCMD_T="\`bash $PB_T/scripts/verify.sh\`"
+ROOT_T="以下在这台上用 root 跑"
 
 echo "== 1. 没配推送地址：只记日志，不发"
 write_env; reset_state
@@ -184,8 +196,8 @@ check 1 "四节依次是情况、影响、先做什么、去哪看" 'heads == ["
 check 1 "数字照报，WARN 线不带括号" '"**21300 MB**，低于 WARN 线 21504 MB\n" in m and "GiB" not in m'
 check 1 "写明整点量时没有 job 在跑" '"\n- 整点量时没有 job 在跑\n" in m'
 check 1 "已用分项" '"- 根分区已用：containerd 32339 MB，/tmp 1411 MB，其他 18370 MB\n" in m'
-check 1 "影响：降到 Min Free 以下才删缓存" '"\n#### 2. 影响\nCI 照常跑；可用空间降到 Min Free 以下，BuildKit 才会删构建缓存来保底" in m'
-check 1 "先做什么：前提一句在前，再是有序列表" '"#### 3. 先做什么\n以下用 root 跑，先 `pgrep -x Runner.Worker` 没输出（没有 job 在跑）再删：\n\n1. `docker images`" in m and "\n3. " in m and "\n4. " not in m'
+check 1 "影响：Min Free 第一次出现时说明是 BuildKit 的保底线" '"\n#### 2. 影响\nCI 照常跑；可用空间降到 BuildKit 的保底线 Min Free 以下时，它才会删构建缓存" in m and m.count("Min Free") == 1'
+check 1 "先做什么：root 那句加前提在前，再是有序列表" '"#### 3. 先做什么\n'"$ROOT_T"'，先 `pgrep -x Runner.Worker` 没输出（没有 job 在跑）再删：\n\n1. `docker images`" in m and "\n3. " in m and "\n4. " not in m and root_ok()'
 check 1 "去哪看链到手册公开仓库，锚点已编码" '"('"$DOC_T"'/08-%E8%BF%90%E7%BB%B4%E4%B8%8E%E5%AE%B9%E9%87%8F.md#82-%E7%A3%81%E7%9B%98" in m'
 check 1 "采样记录在去哪看里" 'm.endswith("\n- 这台的采样记录：`tail -20 '"$LOG_T"'`")'
 check 1 "正文不出现章节号，也不出现「本机」" '"08 章" not in m and "8.2" not in m and "A22" not in m and "本机" not in m'
@@ -205,13 +217,13 @@ check 2 "副标题写明是 24 小时提醒" 'sub == "WARN 1 条 · 超过 24 �
 echo "== 5. CRIT 连续失败 + 原有的 WARN：红色，按条分节，新的标出来"
 run_health FAKE_AVAIL=21300 FAKE_JOBS=streak=4
 check 3 "颜色 red" 'h["template"] == "red"'
-check 3 "标题取最严重那条，带次数，注明几条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 本机 job 连续失败 4 次等 2 条"'
+check 3 "标题取最严重那条，带次数，逗号后注明几条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 本机 job 连续失败 4 次，等 2 条"'
 check 3 "副标题：各级条数与变化" 'sub == "CRIT 1 条、WARN 1 条 · 新出现 1 条"'
 check 3 "每条一节，CRIT 在前，新出现的标（新），采样记录不单独成节" 'heads == ["#### 1. CRIT 本机 job 连续失败 4 次（新）", "#### 2. WARN 根分区可用空间偏低"]'
 check 3 "节内情况、影响、先做什么、去哪看各自另起一行" 'all(m.count(x) == 2 for x in ("**情况**\n- ", "**影响**\n", "**先做什么**\n", "**去哪看**\n- ")) and "**影响**：" not in m'
 check 3 "采样记录放在最后一行" 'm.endswith("\n\n这台的采样记录：`tail -20 '"$LOG_T"'`")'
 check 3 "连续失败次数" '"这台上的 job 从最近一次往回数连续失败 **4 次**（被取消的 run 不算，满 3 次就报）" in m'
-check 3 "先看 GitHub 上红在哪一步，再跑 verify.sh" 'm.index("1. 打开下面的 GitHub Actions") < m.index("2. '"$VERIFY_T"'")'
+check 3 "先看 GitHub 上红在哪一步，再登机用 root 跑 verify.sh" 'm.index("1. 打开下面的 GitHub Actions") < m.index("2. '"$ROOT_T"'：'"$VCMD_T"'") and root_ok()'
 check 3 "附 GitHub Actions 链接和钩子强加 -e 那一篇" '"(https://github.com/'"$REPO_T"'/actions)" in m and "#a11-runner-" in m'
 save_sample 3 pb-mixed.json
 
@@ -228,7 +240,7 @@ check 5 "颜色 green" 'h["template"] == "green"'
 check 5 "标题；副标题是之前的条数，不重复「已恢复」" 'h["title"]["content"] == "[CI runner 恢复] '"$RUNNER_NAME_T"'：告警已全部消除" and sub == "之前 CRIT 1 条、WARN 1 条"'
 check 5 "列出消除的告警（CRIT 在前）" '"#### 1. 情况\n之前的告警这次都没再出现：\n- CRIT 本机 job 连续失败\n- WARN 根分区可用空间偏低\n\n#### 2. 要不要处理\n" in m'
 check 5 "要不要处理：不说「不用」，说明没再报不代表查清" '"#### 2. 要不要处理\n这次整点检查没再报，不代表原因查清了。告警时的这几步没做完的，接着做：" in m and "不用" not in m'
-check 5 "按条列出当时的先做什么" '"\n\n**CRIT 本机 job 连续失败**\n1. 打开下面的 GitHub Actions" in m and "\n\n**WARN 根分区可用空间偏低**\n以下用 root 跑" in m'
+check 5 "按条列出当时的先做什么" '"\n\n**CRIT 本机 job 连续失败**\n1. 打开下面的 GitHub Actions" in m and "\n\n**WARN 根分区可用空间偏低**\n'"$ROOT_T"'，先" in m'
 check 5 "去哪看有两条的手册链接和采样记录" '"#a11-runner-" in m and "#82-%E7%A3%81%E7%9B%98" in m and m.endswith("这台的采样记录：`tail -20 '"$LOG_T"'`")'
 [ -z "$(keys)" ] && ok "状态文件清空" || no "状态文件是「$(keys)」"
 save_sample 5 pb-recover.json
@@ -238,9 +250,9 @@ reset_state
 run_health FAKE_JOBS=streak=3
 check 1 "红色，单条四节，标题带次数" 'h["template"] == "red" and heads == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"] and h["title"]["content"].endswith("：CRIT 本机 job 连续失败 3 次")'
 check 1 "情况里不重复 runner 名" '"#### 1. 情况\n- 这台上的 job 从最近一次往回数连续失败 **3 次**（被取消的 run 不算，满 3 次就报）\n\n" in m'
-check 1 "第 1 步看 GitHub，写明怎么认出这台" '"\n1. 打开下面的 GitHub Actions，看落在这台的 job 红在哪一步、几次是不是同一处（job 日志开头 Set up job 里 Runner name 是 `'"$RUNNER_NAME_T"'`）\n" in m'
-check 1 "第 2 步用 root 跑这台上的 verify.sh，看钩子那一行" '"\n2. '"$VERIFY_T"'，看带 `清理钩子` 和 `bash -e` 的那一行是 PASS 还是 FAIL\n" in m'
-check 1 "第 3 步写明有 job 时会跳过，照原文" '"\n3. 有 job 在跑时这一项会跳过，那一行换成 `有 job 正在运行，跳过钩子实跑`" in m'
+check 1 "第 1 步看 GitHub，怎么认出这台单独成句" '"\n1. 打开下面的 GitHub Actions，看落在这台的 job 红在哪一步、几次是不是同一处。job 日志开头 Set up job 里 Runner name 是 `'"$RUNNER_NAME_T"'` 的，就是落在这台的\n" in m'
+check 1 "第 2 步先写 root 那句，再跑这台上的 verify.sh，看钩子那一行" '"\n2. '"$ROOT_T"'：'"$VCMD_T"'，看带 `清理钩子` 和 `bash -e` 的那一行是 PASS 还是 FAIL。" in m and root_ok()'
+check 1 "有 job 时会跳过并进第 2 步，照原文；只有 2 步" '"。有 job 在跑时这一项会跳过，那一行换成 `有 job 正在运行，跳过钩子实跑`，等 `pgrep -x Runner.Worker` 没输出再跑\n" in m and "\n3. " not in m'
 save_sample 1 pb-crit-streak.json
 # 卡片里引用的 verify.sh 原文要和脚本对得上
 grep -q 'ok "清理钩子按 runner 的调用方式（bash -e）可正常退出"' "$HERE/../verify.sh" \
@@ -248,11 +260,14 @@ grep -q 'ok "清理钩子按 runner 的调用方式（bash -e）可正常退出"
   && grep -q 'sk "有 job 正在运行，跳过钩子实跑' "$HERE/../verify.sh" \
   && grep -q 'ok "Runner.Listener 在跑' "$HERE/../verify.sh" \
   && ok "卡片引用的 verify.sh 输出与脚本原文一致" || no "verify.sh 的输出原文变了，卡片要跟着改"
+# 卡片让人去跑 verify.sh：它的根分区那一项也只报数，不替人下结论（09 章 B20）
+grep -q 'no "根分区可用 ${av}MB，低于 CRIT 线 ${CRIT_MB}MB。' "$HERE/../verify.sh" && ! grep -q 'GC 腾不出\|GC 已在按' "$HERE/../verify.sh" \
+  && ok "verify.sh 的根分区那一项只报数" || no "verify.sh 的根分区那一项又写了原因"
 
 echo "== 9. 手册仓库目录没渲染或不在了：写「装机用的手册仓库」"
 reset_state; SCRIPT="$T/ci-health-nodir.sh"
 run_health FAKE_JOBS=streak=3
-check 1 "改写成装机用的手册仓库" '"\n2. 用 root 跑装机用的手册仓库里的 `scripts/verify.sh`，看" in m and "__PLAYBOOK" not in m'
+check 1 "改写成装机用的手册仓库" '"\n2. '"$ROOT_T"'：装机用的手册仓库里的 `scripts/verify.sh`，看" in m and "__PLAYBOOK" not in m'
 SCRIPT="$T/ci-health.sh"
 
 echo "== 10. 多条混合 + 外来字符：转义、排序、体积"
@@ -260,10 +275,12 @@ reset_state
 printf 'RUNNER_HOME=%s\nCI_FIXEDWORK_BASELINE=2.000\nCI_DISK_WARN_MB=3`0*G_[x](y)<at id=all></at>\nCI_DISK_CRIT_MB=10240\n' "$T/runner" > "$T/ci-runner.env"
 run_health FAKE_AVAIL=5500 FAKE_TMP_DEV=40 FAKE_SVC_STATE=failed FAKE_FIXEDWORK=3.300 FAKE_JOBS=streak=6
 check 1 "CRIT 在前（磁盘、服务、连续失败），WARN 在后（CPU、配置）" '[l.split(" ", 3)[2] for l in heads] == ["CRIT", "CRIT", "CRIT", "WARN", "WARN"]'
-check 1 "标题注明 5 条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 根分区快满了等 5 条" and sub == "CRIT 3 条、WARN 2 条 · 新出现"'
+check 1 "标题注明 5 条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 根分区快满了，等 5 条" and sub == "CRIT 3 条、WARN 2 条 · 新出现"'
+check 1 "5 条的先做什么都有 root 那句，位置对" 'len(todos) == 5 and root_ok()'
 check 1 "配置原值进代码样式：没有反引号、拼不出 <at>" '"<at" not in m and "`CI_DISK_WARN_MB=3'"'"'0*G_[x](y)＜at id=all＞＜/at＞`" in m'
 check 1 "/tmp 不在根分区时单列" '"根分区已用：containerd 32339 MB，其他 19781 MB；不在根分区的：/tmp 1411 MB" in m'
-check 1 "服务状态在情况里，服务名在命令里" '"runner 服务当前是 `failed`，不是 active" in m and "\n2. 不是的话，`journalctl -u '"$SVC_T"' -n 50` 看原因\n3. 处理完 `systemctl start '"$SVC_T"'`\n4. 起来以后'"$VERIFY_T"'" in m'
+check 1 "服务状态在情况里，服务名在命令里" '"runner 服务当前是 `failed`，不是 active" in m'
+check 1 "runner 三步：先在群里问，再登机用 root 看日志，处理完启动、跑 verify" '"\n1. 先在群里问一声是不是有人在维护这台：重启、升级前都会先停服务\n2. 没人在维护的话，'"$ROOT_T"'：`journalctl -u '"$SVC_T"' -n 50` 看原因\n3. 处理完 `systemctl start '"$SVC_T"'`，起来以后跑 '"$VCMD_T"'\n\n**去哪看**" in m'
 check 1 "CPU 倍数" '"**3.300 秒**，这台的基线 2.000 秒，是基线的 1.65 倍" in m'
 check 1 "请求体小于 19000 字节" 'len(raw) < 19000'
 printf 'RUNNER_HOME=%s\nCI_FIXEDWORK_BASELINE=2.000\nCI_DISK_WARN_MB=21504\nCI_DISK_CRIT_MB=10240\n' "$T/runner" > "$T/ci-runner.env"
@@ -272,34 +289,53 @@ echo "== 11. listener 反复崩溃、job 采样 401"
 reset_state
 run_health FAKE_LISTENER_AGE=5 FAKE_JOBS=error:HTTP401
 check 1 "listener：两次都是刚启动" '"- 隔 90 秒看了两次，都是刚启动（第二次 5 秒）" in m and "`journalctl -u '"$SVC_T"' -n 50`" in m'
-check 1 "listener：处理完跑 verify.sh 看 Runner.Listener 那一行" '"处理完'"$VERIFY_T"'，要有一行 `Runner.Listener 在跑`" in m'
-check 1 "jobsprobe：401 写成 token 失效、没权限或仓库名不对" '"GitHub 回了 `HTTP401`：token 失效、没权限或仓库名不对" in m'
-check 1 "jobsprobe：先核仓库名，再换 token" '"1. 先核仓库名：`'"$T"'/ci-health.env` 里 `GH_REPO=` 现在是 `'"$REPO_T"'`" in m and "\n2. 仓库名没错，就换一个只读 token" in m and "CI_HEALTH_GH_TOKEN=" in m'
+check 1 "listener：root 那句在前，处理完再跑 verify.sh 看 Runner.Listener 那一行" '"**先做什么**\n'"$ROOT_T"'：\n\n1. `journalctl -u" in m and "处理完再跑 '"$VCMD_T"'，要有一行 `Runner.Listener 在跑`" in m'
+check 1 "jobsprobe：401 单独写成 token 失效" '"GitHub 回了 `HTTP401`：token 失效（过期、被撤销或写错）\n" in m and "仓库名" not in m'
+check 1 "jobsprobe：401 第 1 步直接找人建 token，root 那句在第 2 步" '"\n1. 找有仓库管理权限的人建只读 token（fine-grained，只授权这个仓库，Actions 只读）\n2. '"$ROOT_T"'：把新 token 写进 `'"$T"'/ci-health.env` 的 `CI_HEALTH_GH_TOKEN=`\n3. 下一小时" in m and root_ok()'
 check 1 "jobsprobe：用 grep 看 jobs=，不用 tail -1" '"`grep -o '"'"'jobs=[^ ]*'"'"' '"$LOG_T"' | tail -3`" in m and "tail -1" not in m'
 
 echo "== 12. job 采样 404：并进 token 没权限或仓库名不对"
 reset_state
 run_health FAKE_JOBS=error:HTTP404
-check 1 "404 也给核仓库名、换 token 的步骤" '"GitHub 回了 `HTTP404`：token 失效、没权限或仓库名不对" in m and "先核仓库名" in m and "#b12-" in m'
+check 1 "404 也给核仓库名、换 token 的步骤" '"GitHub 回了 `HTTP404`：token 失效、没权限或仓库名不对" in m and "#b12-" in m'
+check 1 "404：root 那句在前，先核仓库名，再找人建 token" '"#### 3. 先做什么\n'"$ROOT_T"'：\n\n1. 先核仓库名：`'"$T"'/ci-health.env` 里 `GH_REPO=` 现在是 `'"$REPO_T"'`\n2. 仓库名没错，就找有仓库管理权限的人建只读 token（fine-grained，只授权这个仓库，Actions 只读），写进同一个文件的 `CI_HEALTH_GH_TOKEN=`\n" in m'
 
 echo "== 13. job 采样连不上：只写原因见日志，日志里有原因"
 reset_state
 run_health FAKE_JOBS=$'error:URLError\n[Errno -3] Temporary failure in name resolution'
 check 1 "情况里是出错类型，不猜原因" '"统计这台 job 结果时出错（`URLError`）" in m and "网络" not in m and "多半" not in m'
-check 1 "第 1 步：原因见日志" '"\n1. 原因见日志：`grep 采样失败 '"$LOG_T"' | tail -3`\n2. 下一小时会自动再试，`jobs=` 变回 `streak=数字` 就好了" in m'
+check 1 "第 1 步：原因见日志" '"\n1. 原因见日志：`grep 采样失败 '"$LOG_T"' | tail -3`\n2. 下一小时会自动再试，`jobs=` 变回 `streak=数字` 就好了" in m and root_ok()'
 grep -q 'jobs=error:URLError mem_peak' "$LOG_T" && grep -q 'WARN job 产出采样失败（URLError：\[Errno -3\] Temporary failure in name resolution），「本机 job 连续失败」这一项现在看不到' "$LOG_T" \
   && ok "采样行只记类型，告警行带原因" || no "日志里的采样行或告警行不对"
 
-echo "== 14. job 采样脚本自己出错：只写原因见日志"
+echo "== 14. job 采样脚本自己崩了：卡片写原因见日志，日志里是 stderr 最后一行，截 200 字、不带 token"
 reset_state
-run_health FAKE_JOBS=error:python
+run_health FAKE_JOBS_STDERR="RuntimeError: boom Bearer fake-read-only $(printf 'x%.0s' $(seq 300))"
 check 1 "python 出错：原因见日志" '"统计这台 job 结果时出错（`python`）" in m and "原因见日志" in m and "网络" not in m'
+"$REAL_PY" -I - "$LOG_T" <<'PY' && ok "日志里有原因：stderr 最后一行，token 换成 <已隐去>，截 200 字" || no "日志里的原因不对：$(grep 采样失败 "$LOG_T")"
+import sys
+line = [l for l in open(sys.argv[1], encoding="utf-8") if "job 产出采样失败（python：" in l][0]
+why = line.split("python：", 1)[1].split("），「本机", 1)[0]
+sys.exit(0 if why.startswith("RuntimeError: boom Bearer <已隐去> xxx") and len(why) <= 200 and "fake-read-only" not in line else 1)
+PY
+
+echo "== 14b. job 采样抛出别的异常（token 里夹着回车，请求头不合法）：日志带异常文本，token 换成 <已隐去>"
+# 走真的采样代码：http.client 在连网之前就拒掉这个请求头；万一连了，也只会连到 127.0.0.1:9 的代理上
+reset_state
+TOK_A="tokpart-$RANDOM$RANDOM"; TOK_B="secretpart-$RANDOM$RANDOM"
+{ echo "GH_REPO=$REPO_T"; printf 'CI_HEALTH_GH_TOKEN=%s\r%s\n' "$TOK_A" "$TOK_B"; echo "CI_ALERT_WEBHOOK=$HOOK"; echo "CI_ALERT_SECRET=$SECRET_T"; } > "$T/ci-health.env"
+run_health FAKE_JOBS= https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9
+check 1 "情况里是异常类型" '"统计这台 job 结果时出错（`ValueError`）" in m'
+grep -q 'jobs=error:ValueError mem_peak' "$LOG_T" && grep -q 'WARN job 产出采样失败（ValueError：.*<已隐去>.*），「本机 job 连续失败」这一项现在看不到' "$LOG_T" \
+  && ok "告警行带异常文本，token 已隐去" || no "日志不对：$(grep 采样失败 "$LOG_T")"
+grep -qF -e "$TOK_A" -e "$TOK_B" "$LOG_T" "$T/fake/journal" && no "日志里出现了 token" || ok "日志和 journal 里没有 token"
+write_env "$HOOK" "$SECRET_T"
 
 echo "== 15. 上次报连续失败、这次采样出错：连续失败那条看不到了，不算消除（样张）"
 reset_state; mkdir -p "$T/state"; printf 'streak ' > "$T/state/keys"
 run_health FAKE_JOBS=error:HTTP401
 check 1 "副标题：新出现 1 条，1 条看不到了，没有消除" 'sub == "WARN 1 条 · 新出现 1 条，1 条看不到了" and "消除" not in sub'
-check 1 "情况里写明看不到了、不算消除" '"\n- 上次报的「CRIT 本机 job 连续失败」看不到了，不算消除\n" in m and "同时消除" not in m'
+check 1 "情况里写明看不到了、不算消除，不再出通用那一句" '"\n- 上次报的「CRIT 本机 job 连续失败」看不到了，不算消除\n" in m and "同时消除" not in m and "这一项现在看不到" not in m'
 [ "$(keys)" = "jobsprobe " ] && ok "状态文件换成 jobsprobe" || no "状态文件是「$(keys)」"
 save_sample 1 pb-streak-unseen.json
 
@@ -307,6 +343,32 @@ echo "== 16. 上次报 listener、这次服务不是 active：listener 那条看
 reset_state; mkdir -p "$T/state"; printf 'listener ' > "$T/state/keys"
 run_health FAKE_SVC_STATE=failed
 check 1 "情况里写明 listener 那条看不到了" '"上次报的「CRIT runner 没在接 job」看不到了（服务不是 active 时不查这一项），不算消除" in m and sub == "CRIT 1 条 · 新出现 1 条，1 条看不到了"'
+
+echo "== 16b. 上次报连续失败、这次没配 token（jobs=skip）：只剩看不到了，发橙色告警卡，不发恢复卡（样张）"
+reset_state; mkdir -p "$T/state"; printf 'streak ' > "$T/state/keys"
+{ echo "CI_ALERT_WEBHOOK=$HOOK"; echo "CI_ALERT_SECRET=$SECRET_T"; } > "$T/ci-health.env"
+run_health
+check 1 "橙色告警卡，标题写看不到了，副标题只有变化" 'h["template"] == "orange" and h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT 本机 job 连续失败 看不到了" and sub == "1 条看不到了"'
+check 1 "单条四节，情况写明为什么看不到、不算消除" 'heads == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"] and "\n- `'"$T"'/ci-health.env` 里没有只读 token 或 `GH_REPO=`，这一项没在查\n- 上次报的「CRIT 本机 job 连续失败」看不到了，不算消除\n" in m and "恢复" not in m'
+check 1 "先做什么：root 那句开头，补回两行，token 找人建" '"#### 3. 先做什么\n'"$ROOT_T"'：\n\n1. 看 `'"$T"'/ci-health.env` 里 `GH_REPO=`、`CI_HEALTH_GH_TOKEN=` 两行还在不在\n2. 少了哪行补哪行，token 要找有仓库管理权限的人建只读 token" in m and root_ok()'
+[ -z "$(keys)" ] && ok "推送后状态文件清空" || no "状态文件是「$(keys)」"
+save_sample 1 pb-unseen-skip.json
+run_health
+[ "$(nreq)" = 1 ] && ok "下一小时照旧没配 token：不再推" || no "又发了（共 $(nreq) 个）"
+reset_state; mkdir -p "$T/state"; printf 'streak ' > "$T/state/keys"; echo "11246 0" > "$T/srv/codes"
+run_health
+check 2 "卡片被拒时的文本消息也写看不到了，不写已全部消除" 'b["msg_type"] == "text" and b["content"]["text"] == "[CI runner 告警] '"$RUNNER_NAME_T"'（'"$HOST_T"'）\n· 上次报的「本机 job 连续失败」这次看不到了（没配只读 token 或 GH_REPO，不查这一项），不算消除"'
+write_env "$HOOK" "$SECRET_T"
+
+echo "== 16c. 上次报 CPU 变慢、这次定长任务崩了，同时新出现磁盘 WARN：CPU 那条单列一节标看不到了"
+reset_state; mkdir -p "$T/state"; printf 'contention ' > "$T/state/keys"
+run_health FAKE_AVAIL=21300 FAKE_FIXEDWORK=crash
+check 1 "标题取告警那条，逗号后注明 2 条；副标题不算消除" 'h["title"]["content"].endswith("：WARN 根分区可用空间偏低，等 2 条") and sub == "WARN 1 条 · 新出现 1 条，1 条看不到了"'
+check 1 "看不到了的那条单列一节，在告警后面" 'heads == ["#### 1. WARN 根分区可用空间偏低（新）", "#### 2. WARN CPU 变慢 看不到了"] and "- 定长任务这次没跑出结果，这一项没在查\n- 上次报的「WARN CPU 变慢」看不到了，不算消除" in m'
+check 1 "先做什么：原因见日志，两节都有 root 那句" '"1. 原因见日志：`grep 定长任务没跑出结果 '"$LOG_T"' | tail -3`" in m and len(todos) == 2 and root_ok()'
+grep -q ' fixedwork=n/a root_avail=' "$LOG_T" && grep -q 'WARN 定长任务没跑出结果（MemoryError: boom），这一小时不判 vCPU 争抢' "$LOG_T" \
+  && ok "采样行记 fixedwork=n/a，另一行写原因" || no "日志不对：$(head -3 "$LOG_T")"
+[ "$(keys)" = "disk_warn " ] && ok "状态文件只剩 disk_warn" || no "状态文件是「$(keys)」"
 
 echo "== 17. 磁盘 WARN 在两个 job 之间量"
 reset_state
@@ -424,9 +486,9 @@ grep -q 's#__RUNNER_SVC__#${SVC:-none}#' "$HERE/../bootstrap.sh" && grep -q 's#_
 ! grep -q '__RUNNER_SVC__\|__PLAYBOOK_DIR__' "$T/ci-health.sh" && grep -qx "PLAYBOOK_DIR=\"$PB_T\"" "$T/ci-health.sh" \
   && ok "渲染后没有占位符，目录写进去了" || no "渲染结果不对"
 
-echo "== 33. 全程的日志、journal 和输出里没有推送地址和密钥"
+echo "== 33. 全程的日志、journal 和输出里没有推送地址、密钥和 token"
 reset_state
-if grep -rqF -e "$SECRET_T" -e "test-hook-id" -e "$BAD_HOOK_ID" "$T/all.log" "$T/fake/journal" "$T"/out.*.txt 2>/dev/null; then
+if grep -rqF -e "$SECRET_T" -e "test-hook-id" -e "$BAD_HOOK_ID" -e "$TOK_A" -e "$TOK_B" "$T/all.log" "$T/fake/journal" "$T"/out.*.txt 2>/dev/null; then
   no "出现了地址或密钥"; else ok "没有地址和密钥（$(wc -l < "$T/all.log") 行日志）"; fi
 
 echo
