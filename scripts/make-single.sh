@@ -24,7 +24,7 @@ for f in "${CHAPTERS[@]}"; do
 done
 
 # 从 README 里取一段原文：$1 是所在小节的标题行（整行），$2 是 code 或 table，
-# 分别取这一节里第一个 ```bash 代码块（连同围栏）和第一张表。到下一个标题还没找到就算取不到，直接报错。
+# 分别取这一节里第一个 ```bash 代码块（连同围栏）和第一张表；note 取第一张表后面的第一段文字。到下一个标题还没找到就算取不到，直接报错。
 from_readme() {
   local out
   out=$(awk -v h="$1" -v kind="$2" '
@@ -38,6 +38,10 @@ from_readme() {
       if (/^\|/) { p = 1; done = 1; print; next }
       if (p) exit
     }
+    kind == "note" {
+      if (/^\|/) { t = 1; next }
+      if (t && $0 != "") { print; done = 1; exit }
+    }
     /^#+ / { exit }
     END { exit done ? 0 : 1 }
   ' README.md) || { echo "README.md 里「$1」这一节下没取到 $2" >&2; exit 1; }
@@ -45,6 +49,7 @@ from_readme() {
 }
 QUICKSTART=$(from_readme '## 快速开始' code)
 TEST_TABLE=$(from_readme '### 这些脚本测到了什么程度' table)
+TABLE_NOTE=$(from_readme '### 这些脚本测到了什么程度' note)
 
 {
 cat <<'HEAD'
@@ -122,9 +127,9 @@ cat <<'TAIL'
 
 TAIL
 printf '%s\n' "$TEST_TABLE"
+echo
+printf '%s\n' "$TABLE_NOTE"
 cat <<'TAIL'
-
-上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 
 ## 附：手册没覆盖、需要你自己做的三件事
 

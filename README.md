@@ -227,7 +227,7 @@ flowchart LR
 </details>
 
 > [!CAUTION]
-> 2026-10-25 这一轮修订加的东西（等 apt 锁、检查架构、`RUNNER_UID`、注册前查同名、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数）只做过函数级测试，还没在机器上整体跑过。用它装下一台机器时请盯着输出。换云厂商或换发行版版本时也一样，换厂商前先对一遍 02 章 2.9。
+> 2026-10-25 这一轮修订加的东西里，verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数已在两台上实跑过；只在装机时用到的部分（等 apt 锁、检查架构、`RUNNER_UID`、注册前查同名、token 经标准输入传给 curl）只做过函数级测试，还没用 `bootstrap.sh` 从零装一台整体跑过。用它装下一台机器时请盯着输出。换云厂商或换发行版版本时也一样，换厂商前先对一遍 02 章 2.9。
 
 ---
 
