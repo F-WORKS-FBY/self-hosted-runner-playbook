@@ -123,6 +123,7 @@ cat <<'TAIL'
 | `scripts/ci-cleanup.sh` | 清理钩子，由 bootstrap 装到 runner 的 `hooks/` 目录 |
 | `scripts/ci-health.sh` | 每小时健康采点，由 bootstrap 装到 `/usr/local/bin/` |
 | `scripts/ssh-guard.sh` | SSH 加固的安全网：一条 SSH 会话都不剩时才回滚配置（04 章 4.6） |
+| `scripts/tests/ci-health-notify.sh` | ci-health 推送卡片的用例：桩加本地假 webhook，不要 root、不联网 |
 | `scripts/analysis/` | 调研期的测量工具：连通性采样、排队仿真、单步资源画像、整机内存采样 |
 
 现在的脚本一台机器只装一个 runner 实例。同机多实例的前提见 10 章 10.6。
@@ -140,6 +141,7 @@ cat <<'TAIL'
 | `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
 | `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
+| `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`，桩加本地假 webhook，20 组 62 项 | 通过；还没部署到 runner 上，也没往真的飞书群发过 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 

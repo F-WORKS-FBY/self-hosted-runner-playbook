@@ -2011,7 +2011,7 @@ bash scripts/verify.sh
 - GitHub 上几台都在，名字各不相同，标签相同。老机器那一条的 ID 没变，说明新机器没有用同名把它顶掉（09 章 A18）。在 CI 机以外查的命令见 7.1 末尾。
 - 7.2 ① 的查询里出现了新机器的名字，每种重 job 都在新机器上至少绿过一次。
 - 新机器的 ci-health 只统计自己的 job。执行 `grep -o 'jobs=[^ ]*' /var/log/ci-health.log | tail -3`，应是 `streak=` 开头。`skip` 是没配只读 token；`skip:no-runner` 是 ci-health 在注册之前装的，注册时没有重跑 bootstrap；`error:no-runner-name` 是读不到本机的 `.runner`。
-- 告警推送的标题里带主机名，几台推到同一个群也分得清。
+- 告警卡片的标题带这台的 runner 注册名、副标题带主机名，几台推到同一个群也分得清（08 章 8.2）。
 - 新机器在心跳服务上有自己的检查项（06 章 6.4）。
 
 ---
@@ -2156,7 +2156,13 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
   - 现在的阈值：WARN = Min Free + 1 GiB，对应可用空间被挤到 Min Free 附近、GC 开始为保底驱逐缓存的时刻；CRIT = 10 GiB。
   - WARN 在两个 job 之间量。整点采样时有 job 在跑，就等到本机没有 job 的那一刻再量，job 自己的临时占用不会触发 WARN（09 章 B21）。CRIT 照常立刻报。
   - bootstrap 会从 `BUILDKIT_MIN_FREE` 自动算出阈值，写进 `/etc/cron.d/ci-health`，同时落盘到 `/etc/ci-runner.env`。以后改了 `BUILDKIT_MIN_FREE`，这个阈值不会跟着重算，做法见 10 章 10.4。
-- 告警要送到人。只写本机 journal 等于没有告警。在 `/etc/ci-health.env` 里配置 `CI_ALERT_WEBHOOK` 后，告警集合一有变化就推送，持续存在的告警每 24 小时提醒一次。消息标题带主机名，几台机器推到同一个群也分得清。脚本目前只实现了飞书自定义机器人的消息格式和签名，换成 Slack、钉钉、企业微信，要改 `ci-health.sh` 里的 `notify()`。
+- 告警要送到人。只写本机 journal 等于没有告警。在 `/etc/ci-health.env` 里配置 `CI_ALERT_WEBHOOK` 后，告警集合一有变化（新出现、部分或全部消除）就推送，持续存在的告警每 24 小时提醒一次。脚本目前只实现了飞书自定义机器人的卡片和签名，换成 Slack、钉钉、企业微信，要改 `ci-health.sh` 里的 `notify()`。
+- 推送的是飞书卡片，看群的人不用读完一整段才知道多严重、先做什么：
+  - 标题「[CI runner 告警] <runner 注册名>：<最严重那条>」，几条同时出现时加「等 N 项」；副标题是主机名、级别和这次的变化（新出现、消除几条、24 小时提醒）。几台机器推到同一个群也分得清。
+  - 颜色：有 CRIT 是红色，只有 WARN 是橙色。全部消除时发绿色的「[CI runner 恢复]」卡片，列出消除了哪几条（取自上一次推送时记下的告警，`/var/lib/ci-health/keys`）。
+  - 每条告警分成情况（测到的数）、影响（一句话）、先做什么（1～3 步命令）、去哪看（这份手册对应章节的链接和本机采样记录；链接指向手册的公开仓库，fork 之后改 `ci-health.sh` 里的 `DOC_URL`）。本机日志和 journal 里仍是原来的单行文本。
+  - 卡片拼不出来、超过 19000 字节，或者飞书以卡片格式不对拒收（返回码 11246、9499）时，改发原来的文本消息，并在 `ci-health.log` 记一行。被限流（11232）等 5 秒重发一次。其余失败只记日志，下一小时重推。
+  - 卡片的用例在 `scripts/tests/ci-health-notify.sh`，不要 root、不联网，改了文案或推送逻辑要跑一遍。
 - 失败连续计数只看落在本机上的 job，按本机的 runner 名匹配。按整个 run 的结论统计会有两种误报：GitHub 托管的检查（PR 标题之类）失败会被算进来；多台机器共用一套标签时，同一个 run 的 job 会分到几台机器上，别的机器上的 job 红了，这台也会报连续失败。读不到本机的 runner 名时，这一项报采样失败，不会退回去统计全仓库；用 `--skip-runner` 装、还没注册的机器上，这一项跳过。被取消的 run 整个不算：新推送顶掉旧 run 时，写了 `if: always()` 的汇总 job 会因为前面的 job 被取消而判失败，不跳过的话 PR 推得勤时很快就凑满 3 次（09 章 B11）。
 - runner 服务是 active，不代表它在接 job。listener 崩了由 `runsvc.sh` 在里面重新拉起，systemd 看不到。ci-health 另看 `Runner.Listener` 进程，不在或者一直是刚启动就报 CRIT（09 章 A23）。
 - 除了水位，也要看增量。日增超过预期两倍时，检查是不是哪个构建的层序坏了。
@@ -2343,11 +2349,17 @@ bash <手册仓库目录>/scripts/verify.sh
 
 一定要先停 runner 服务。bootstrap 只在开头查一次有没有 job，跑的几分钟里接到的 job 会被它末尾的重启打断；daemon.json 有变化时，它还会重启 docker。脚本最后会重新启动 runner。
 
-也可以只换一个文件。清理钩子按 04 章 4.4 的做法换：先写到 `.new`，试跑通过再替换，同样先停 runner 服务。`ci-health.sh` 不影响正在跑的 job，替换占位符后直接覆盖：
+也可以只换一个文件。清理钩子按 04 章 4.4 的做法换：先写到 `.new`，试跑通过再替换，同样先停 runner 服务。`ci-health.sh` 不影响正在跑的 job，不用停服务：替换占位符，查过语法再换上，最后和仓库渲染出来的逐字节比对。
 
 ```bash
-sed "s#__RUNNER_SVC__#<runner 服务>#" scripts/ci-health.sh > /usr/local/bin/ci-health.sh
+SVC=$(systemctl list-units --type=service --all --no-legend --plain 'actions.runner.*' | awk '{print $1}' | head -1)
+sed "s#__RUNNER_SVC__#${SVC:-none}#" scripts/ci-health.sh > /usr/local/bin/ci-health.sh.new
+chmod 0755 /usr/local/bin/ci-health.sh.new && bash -n /usr/local/bin/ci-health.sh.new \
+  && mv -f /usr/local/bin/ci-health.sh.new /usr/local/bin/ci-health.sh
+sed "s#__RUNNER_SVC__#${SVC:-none}#" scripts/ci-health.sh | cmp - /usr/local/bin/ci-health.sh && echo 一致
 ```
+
+`SVC` 的取法和 bootstrap 相同。换完下一个整点（第 13 分）自然会跑一次，不用手工跑；告警集合没变就不推送。
 
 #### 撤掉一台机器
 
@@ -3332,6 +3344,7 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 | `scripts/ci-cleanup.sh` | 清理钩子，由 bootstrap 装到 runner 的 `hooks/` 目录 |
 | `scripts/ci-health.sh` | 每小时健康采点，由 bootstrap 装到 `/usr/local/bin/` |
 | `scripts/ssh-guard.sh` | SSH 加固的安全网：一条 SSH 会话都不剩时才回滚配置（04 章 4.6） |
+| `scripts/tests/ci-health-notify.sh` | ci-health 推送卡片的用例：桩加本地假 webhook，不要 root、不联网 |
 | `scripts/analysis/` | 调研期的测量工具：连通性采样、排队仿真、单步资源画像、整机内存采样 |
 
 现在的脚本一台机器只装一个 runner 实例。同机多实例的前提见 10 章 10.6。
@@ -3349,6 +3362,7 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 | `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
 | `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
+| `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`，桩加本地假 webhook，20 组 62 项 | 通过；还没部署到 runner 上，也没往真的飞书群发过 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 

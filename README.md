@@ -94,7 +94,7 @@ gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64"
 
 ## 装好之后，机器上在跑什么
 
-`bootstrap.sh` 把清理钩子挂在 job 的开始和结束两处，另配一个每日 timer 兜底；`ci-health.sh` 每小时采一次点，配了飞书机器人地址就推送告警。告警目前只支持飞书自定义机器人，换别的 IM 要改 `ci-health.sh` 里的 `notify()`。
+`bootstrap.sh` 把清理钩子挂在 job 的开始和结束两处，另配一个每日 timer 兜底；`ci-health.sh` 每小时采一次点，配了飞书机器人地址就推送告警卡片：CRIT 红、WARN 橙、全部消除时发绿色的恢复卡，每条告警分成情况、影响、先做什么、去哪看（08 章 8.2）。告警目前只支持飞书自定义机器人，换别的 IM 要改 `ci-health.sh` 里的 `notify()`。
 
 有多台机器时每台各跑一套，互相不通信，GitHub 按标签把 job 派给空闲的那台。
 
@@ -161,6 +161,7 @@ flowchart LR
 | `scripts/ci-health.sh` | 每小时健康采点（由 bootstrap 安装到 /usr/local/bin/） | 是 |
 | `scripts/ssh-guard.sh` | SSH 加固的安全网：一条 SSH 会话都不剩时才回滚配置 | 是 |
 | `scripts/make-single.sh` | 由分章生成单文件版 | 是 |
+| `scripts/tests/ci-health-notify.sh` | ci-health 推送卡片的用例：桩加本地假 webhook，不要 root、不联网 | 只写临时目录 |
 | `scripts/analysis/` | 调研期的测量工具（连通性采样、排队仿真、单步资源画像、整机内存采样） | 不适用 |
 
 补充说明：
@@ -199,6 +200,7 @@ flowchart LR
 | `verify.sh` | 第一台实跑（2026-10-16 重启后；2026-10-26 部署新版后） | 34 PASS / 0 FAIL；37 PASS / 0 FAIL（当时有 job，2 项 SKIP） |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 | `ci-health.sh` 的 listener 检查、磁盘 WARN 在 job 之间量（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里用假的 `Runner.Listener`、`Runner.Worker` 进程测了 10 种情况；心跳示例在第一台用临时 systemd 单元实跑 | 通过：listener 不在、反复崩溃时报，刚启动后稳定时不报；job 结束后才量、一直忙时不判 WARN（上一次有 WARN 就沿用，不推「已恢复」）、低于 CRIT 时不等 |
+| `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`：渲染出的脚本整段实跑，系统命令换成桩，推送打到本地假 webhook，20 组 62 项 | 通过：结构、颜色、标题副标题、分节、转义、签名、去重、24 小时提醒、部分消除、恢复、限流重发、卡片被拒改发文本、失败不写状态。还没部署到 runner 上，也没往真的飞书群发过 |
 | `ci-cleanup.sh` 第 8 步（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里 24 项用例；两台 runner 空闲时各用真实镜像和 `/tmp` 目录实跑一次 | 通过：只删同时带两种标签的镜像和匹配的 runner 目录，对照对象、编译缓存、别的用户的同名目录都在 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
