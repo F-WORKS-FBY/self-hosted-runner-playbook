@@ -2,7 +2,8 @@
 # make-single.sh：由分章文件拼装出单文件版（飞书/知识库粘贴用）。
 #
 # 为什么要生成而不是手写：两版并存必然漂移。改内容只改分章文件，然后跑这个。
-# 下面 HEAD 里的快速开始是 README 那段命令的副本，改了 README 要同步改这里。
+# 快速开始的命令块和附录「脚本验证到什么程度」那张表直接从 README 取，改 README 就行。
+# 附录的脚本清单和「需要你自己做的三件事」是另写的精简版，README 里对应的内容改了要同步改这里。
 #
 # 用法： bash scripts/make-single.sh
 set -euo pipefail
@@ -22,6 +23,29 @@ for f in "${CHAPTERS[@]}"; do
   [ -f "$f" ] || { echo "CHAPTERS 里的 $f 不存在" >&2; exit 1; }
 done
 
+# 从 README 里取一段原文：$1 是所在小节的标题行（整行），$2 是 code 或 table，
+# 分别取这一节里第一个 ```bash 代码块（连同围栏）和第一张表。到下一个标题还没找到就算取不到，直接报错。
+from_readme() {
+  local out
+  out=$(awk -v h="$1" -v kind="$2" '
+    $0 == h { s = 1; next }
+    !s { next }
+    kind == "code" {
+      if (p) { print; if ($0 == "```") { done = 1; exit } next }
+      if ($0 == "```bash") { p = 1; print; next }
+    }
+    kind == "table" {
+      if (/^\|/) { p = 1; done = 1; print; next }
+      if (p) exit
+    }
+    /^#+ / { exit }
+    END { exit done ? 0 : 1 }
+  ' README.md) || { echo "README.md 里「$1」这一节下没取到 $2" >&2; exit 1; }
+  printf '%s\n' "$out"
+}
+QUICKSTART=$(from_readme '## 快速开始' code)
+TEST_TABLE=$(from_readme '### 这些脚本测到了什么程度' table)
+
 {
 cat <<'HEAD'
 # 自建 GitHub Actions CI runner 部署手册（单文件版）
@@ -37,43 +61,9 @@ cat <<'HEAD'
 
 ## 快速开始
 
-```bash
-# 1. 验机（只读）。端口填你项目 CI 占用的宿主端口（02 章开头）
-CI_HOST_PORTS="<CI 会占用的宿主端口，空格分隔>" bash scripts/preflight.sh --with-load
-REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一台没有参考机，不给 REF
-
-# 2. 装机和加固，先不注册，不需要 token。参数存到 /etc/ci-runner.env，下次重跑不用再传
-#    新机器先跑这一步，再建开发用户等其他普通用户：它按 RUNNER_UID（默认 1000）建 runner 用户（03 章 3.3）
-#    RUNNER_NAME 每台机器不同；标签所有机器相同
-#    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
-#    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
-GH_REPO=owner/repo \
-RUNNER_NAME=<每台不同，比如 ci-1> \
-RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
-CI_LABEL=com.myorg.ci=1 \
-CI_APP_PORTS="<CI 在宿主上监听的端口，空格分隔，没有就留空>" \
-CI_FIXEDWORK_BASELINE=<第 1 步 preflight 给的 p50> \
-bash scripts/bootstrap.sh --skip-runner
-#    然后以 runner 用户回放最慢的 job，核对超时余量（02 章 2.7）
-
-# 3. 注册。PAT 用 read -s 输入，不留在 shell 历史里；注册完去 GitHub 撤销
-read -rsp 'PAT: ' GH_TOKEN; echo; export GH_TOKEN
-bash scripts/bootstrap.sh
-unset GH_TOKEN
-#    可选：CI_HEALTH_GH_TOKEN（只读 token，监控「本机 job 是否连续失败」用）、
-#    CI_ALERT_WEBHOOK 和 CI_ALERT_SECRET（告警推送到飞书群）。同样用 read -s 输入后 export，再跑这一步
-
-# 4. 自检。GitHub 侧那一组要只读 token，最好在 CI 机以外查（07 章）
-bash scripts/verify.sh
-
-# 5. 改 workflow：没有脚本，必须有人读一遍第 05 章
-#    改完之前不要打开开关，否则第 2 个 PR 就会失败
-
-# 6. 接线
-gh variable set CI_RUNNER --repo owner/repo --body '["self-hosted","linux","x64","myproj-ci"]'
-
-# 7. 连开两个测试 PR，再手动触发一次定时 workflow
-```
+HEAD
+printf '%s\n' "$QUICKSTART"
+cat <<'HEAD'
 
 第 5 步是唯一不能跳过的人工步骤。前四步配置的是机器；第 5 步要找出仓库里那些只在一次性 VM 上才成立的写法并改掉，CI 出问题大多出在这里。
 
@@ -130,18 +120,9 @@ cat <<'TAIL'
 
 ## 附：脚本验证到什么程度
 
-| 场景 | 怎么验证的 | 结果 |
-|---|---|---|
-| `bootstrap.sh` 在已配置的机器上重跑 | 第一台完整重跑（2026-09） | 通过，退出码 0，12 项关键状态逐字节相同 |
-| `bootstrap.sh` 从零安装工具链 | 干净的 `ubuntu:24.04` 容器 | 通过，docker、node、gh、psmisc 都能从零装上 |
-| `bootstrap.sh --skip-runner` 从零安装 | 全新的 Ubuntu 24.04 云主机 | 2026-10-19 第一次跑出几处问题（09 章 A15–A17），已修；修复后 10-19 和 10-25 各跑通一次，退出码 0 |
-| 全新机器上的注册和 `verify.sh` | 第二台 runner（全新 Ubuntu 24.04，2026-10-25） | 注册后立刻接到排队的 job；`verify.sh` 33 PASS，0 FAIL |
-| `machine-check.sh` | 在现有 runner 和三台候选机上实跑 | 两台 Intel Skylake 是现有 runner 的 1.7–1.9 倍，判不合格；一台 AMD EPYC-Rome 1.16 倍，判合格 |
-| `hetzner-pick.py` | 模拟的 Hetzner API 加一台真机（真实 SSH 和验机） | 合格停止、不合格删除、机房开不出来时换机房、随机等待、Ctrl-C / SIGTERM / SIGHUP 时清理，都按预期 |
-| `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
-| `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
-| `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
-| `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`，桩加本地假 webhook，36 组 121 项 | 通过；还没部署到 runner 上，也没往真的飞书群发过 |
+TAIL
+printf '%s\n' "$TEST_TABLE"
+cat <<'TAIL'
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 

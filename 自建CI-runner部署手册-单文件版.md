@@ -21,6 +21,8 @@ REF=<现有 runner 的单核分数> bash scripts/machine-check.sh     # 第一�
 #    RUNNER_NAME 每台机器不同；标签所有机器相同
 #    RUNNER_MEM_MAX、RUNNER_OOM_ADJ、BUILDKIT_* 不传就用默认值 6G、800、10GB/20GB/20GB，
 #    这是参考项目 8 GB 内存、75 GB 盘、不在上面开发时的取值。别的规格按 10 章 10.3、10.4 算好后显式传
+#    CI 里有工具在 /tmp 下建临时目录、或者每次运行建一个唯一 tag 的镜像时，
+#    再加 CI_TMP_GLOBS、CI_PER_RUN_IMAGE_LABEL，job 被取消后钩子才清得掉（03 章 3.1）
 GH_REPO=owner/repo \
 RUNNER_NAME=<每台不同，比如 ci-1> \
 RUNNER_LABELS=self-hosted,linux,x64,myproj-ci \
@@ -3373,18 +3375,20 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 
 ## 附：脚本验证到什么程度
 
-| 场景 | 怎么验证的 | 结果 |
+| 路径 | 验证方式 | 结果 |
 |---|---|---|
-| `bootstrap.sh` 在已配置的机器上重跑 | 第一台完整重跑（2026-09） | 通过，退出码 0，12 项关键状态逐字节相同 |
-| `bootstrap.sh` 从零安装工具链 | 干净的 `ubuntu:24.04` 容器 | 通过，docker、node、gh、psmisc 都能从零装上 |
-| `bootstrap.sh --skip-runner` 从零安装 | 全新的 Ubuntu 24.04 云主机 | 2026-10-19 第一次跑出几处问题（09 章 A15–A17），已修；修复后 10-19 和 10-25 各跑通一次，退出码 0 |
-| 全新机器上的注册和 `verify.sh` | 第二台 runner（全新 Ubuntu 24.04，2026-10-25） | 注册后立刻接到排队的 job；`verify.sh` 33 PASS，0 FAIL |
+| `bootstrap.sh` 幂等重跑 | 在第一台已配置完成的机器上完整重跑（2026-09） | 通过 |
+| `bootstrap.sh` 从零安装 1–3 步 | 干净 `ubuntu:24.04` 容器 | 通过 |
+| `bootstrap.sh --skip-runner` 从零安装 | 全新的 Ubuntu 24.04 云主机 | 2026-10-19 第一次跑出几处问题，已修；修复后 10-19 和 10-25 各跑通一次，退出码 0 |
+| 全新机器上的注册和 `verify.sh` | 第二台 runner（全新 Ubuntu 24.04，2026-10-25；2026-10-26 部署新版后） | 注册后立刻接到排队的 job；`verify.sh` 33 PASS / 0 FAIL；新版 37 PASS / 0 FAIL（当时有 job，2 项 SKIP） |
 | `machine-check.sh` | 在现有 runner 和三台候选机上实跑 | 两台 Intel Skylake 是现有 runner 的 1.7–1.9 倍，判不合格；一台 AMD EPYC-Rome 1.16 倍，判合格 |
 | `hetzner-pick.py` | 模拟的 Hetzner API 加一台真机（真实 SSH 和验机） | 合格停止、不合格删除、机房开不出来时换机房、随机等待、Ctrl-C / SIGTERM / SIGHUP 时清理，都按预期 |
-| `preflight.sh` | 第一台实跑 | 13 PASS，2 WARN |
-| `verify.sh` | 第一台实跑（2026-10-16 重启后） | 34 PASS，0 FAIL |
+| `preflight.sh` | 第一台实跑 | 13 PASS / 2 WARN |
+| `verify.sh` | 第一台实跑（2026-10-16 重启后；2026-10-26 部署新版后） | 34 PASS / 0 FAIL；37 PASS / 0 FAIL（当时有 job，2 项 SKIP） |
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
-| `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`，桩加本地假 webhook，36 组 121 项 | 通过；还没部署到 runner 上，也没往真的飞书群发过 |
+| `ci-health.sh` 的 listener 检查、磁盘 WARN 在 job 之间量（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里用假的 `Runner.Listener`、`Runner.Worker` 进程测了 10 种情况；心跳示例在第一台用临时 systemd 单元实跑 | 通过：listener 不在、反复崩溃时报，刚启动后稳定时不报；job 结束后才量、一直忙时不判 WARN（上一次有 WARN 就沿用，不推「已恢复」）、低于 CRIT 时不等 |
+| `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`：渲染出的脚本整段实跑，系统命令换成桩，推送打到本地假 webhook，36 组 121 项 | 通过：结构、颜色、标题（带级别）与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除（含没配 token、定长任务没跑出结果，只剩这种时不发恢复卡）、恢复卡列出当时的先做什么、先做什么以「以下在这台上用 root 跑」开头、`verify.sh` 的路径、401 单独写、采样出错时日志带原因且不带 token、限流重发、卡片被拒（11246、9499，含 HTTP 400）或超长时改发文本、失败不写状态、日志里不带推送地址和密钥、手册链接的锚点。还没部署到 runner 上，也没往真的飞书群发过 |
+| `ci-cleanup.sh` 第 8 步（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里 24 项用例；两台 runner 空闲时各用真实镜像和 `/tmp` 目录实跑一次 | 通过：只删同时带两种标签的镜像和匹配的 runner 目录，对照对象、编译缓存、别的用户的同名目录都在 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。实跑用的都是 2026-10-25 这一轮修订之前的脚本。这一轮的修改（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl、verify 和 ci-health 从 `/etc/ci-runner.env` 读回参数等）还没在机器上整体跑过。
 
