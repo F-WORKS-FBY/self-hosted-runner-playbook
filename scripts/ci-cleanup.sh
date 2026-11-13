@@ -49,12 +49,13 @@ trap 'exit 0' EXIT    # 兜底：连 set -u 触发的中止也吃掉，让末尾
 # 每日 timer（systemd）、verify.sh（sudo 会清环境）、手工执行这三条路径两样都没有。
 #   · runner 自己调的：本机只有它自己这一个 job 时放行；
 #   · 其他路径：本机没有任何 job 时才放行。
-# 一台机器装了多个 runner 实例时，另一个实例的 job 也算「别的 job」，这时整段跳过：不会误删，
-# 但清理基本不跑。同机多实例要先把清理改成只动本 job 的资源，见 10 章 10.6。
+# 只数本钩子属主名下的 Runner.Worker（按 $0 的属主取用户）。同机另装的「轻任务」实例用的是另一个
+# 系统用户、不起容器（scripts/add-light-runner.sh），它的 job 不算「别的 job」，不挡这里的清理。
+# 同一个用户下装多个会起容器的实例仍然整段跳过：不会误删，但清理基本不跑，见 10 章 10.6。
 # 用 `pgrep -x`（按进程名精确匹配）而不是 `-f`：-f 匹配整条命令行，有人在跑
 # `grep Runner.Worker` 或编辑器里开着含这个词的文件时会误判成「有 job」。
 # 副作用：在 workflow 的某一步里显式调用本脚本，会清掉当前 job 自己的 CI 容器，那是调用者的选择。
-n=$(pgrep -cx Runner.Worker 2>/dev/null); n=${n:-0}
+n=$(pgrep -cx -u "$(stat -c %U "$0" 2>/dev/null || id -un)" Runner.Worker 2>/dev/null); n=${n:-0}
 if [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = "Runner.Worker" ] || { [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${GITHUB_RUN_ID:-}" ]; }; then
   [ "$n" -le 1 ] || { echo "ci-cleanup: 本机有 $n 个 job 在跑（多个 runner？），跳过"; exit 0; }
 else
