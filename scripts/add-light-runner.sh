@@ -22,8 +22,10 @@
 # （不删的话 ci-health 每小时报一次「轻任务 runner 没在接任务」）。workflow 那边怎么切回托管见 10 章 10.6。
 set -euo pipefail
 
-NAME="${1:?用法：add-light-runner.sh <runner 名，如 metta-ci-hetzner-light>（注册 token 从标准输入读）}"
-GH_REPO="${GH_REPO:-Antiheroism/metta-app}"
+NAME="${1:?用法：add-light-runner.sh <runner 名，如 ci-1-light>（注册 token 从标准输入读）}"
+# 仓库沿用重实例装机时记下的（/etc/ci-runner.env 的 GH_REPO），也可以用环境变量传
+GH_REPO="${GH_REPO:-$(sed -n 's/^GH_REPO=//p' "${CI_RUNNER_ENV:-/etc/ci-runner.env}" 2>/dev/null | head -1)}"
+: "${GH_REPO:?没读到仓库名：用 GH_REPO=<owner>/<repo> 传，或先确认 /etc/ci-runner.env 里有 GH_REPO=}"
 LIGHT_USER="${LIGHT_USER:-runner-light}"
 LIGHT_HOME="${LIGHT_HOME:-/opt/actions-runner-light}"
 LIGHT_LABELS="${LIGHT_LABELS:-metta-ci-light}"
