@@ -16,7 +16,8 @@
 # 核：卡片结构、颜色、标题与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除（含没配 token、
 # 定长任务没跑出结果）、恢复、先做什么以「以下在这台上用 root 跑」开头、verify.sh 的路径、401 单独写、采样出错时日志带原因
 # 且不带 token、限流重试、卡片被拒或超长改发文本、失败不写状态、所有日志和输出里不出现地址和密钥、手册链接的锚点、
-# 轻任务实例（没装时采样行和原来逐字相同、正常、服务不是 active、listener 不在或反复崩溃、重实例的 listener 不在而轻实例的在）。
+# 轻任务实例（没装时不多出 light 的键、正常、服务不是 active、listener 不在或反复崩溃、重实例的 listener 不在而轻实例的在）、
+# 进程被内存上限杀掉的次数（假的 cgroup 目录下放 memory.events：不变不报、变多报一次、下一轮不重复也不发恢复卡、归零不报、读不到不报）。
 # 名字可换：TEST_RUNNER_NAME、TEST_HOST、TEST_REPO（默认 ci-1、ubuntu-4gb-hel1-1、owner/repo）。
 # 样张里的路径换成机器上的：日志 /var/log/ci-health.log、凭据 /etc/ci-health.env、runner /opt/actions-runner，
 # 手册仓库目录用 SAMPLE_PLAYBOOK_DIR（默认 /root/self-hosted-runner-playbook）。
@@ -54,6 +55,8 @@ case "$1" in
   is-active) if [ "$light" = 1 ]; then echo "${FAKE_LIGHT_STATE:-active}"; else echo "${FAKE_SVC_STATE:-active}"; fi ;;
   show) case "$*" in
       *"-p User"*) if [ "$light" = 1 ]; then echo "${FAKE_LIGHT_USER-runner-light}"; else echo "${FAKE_SVC_USER-runner}"; fi ;;
+      *"-p ControlGroup"*) echo "/system.slice/$2" ;;
+      *"-p MemoryMax"*) if [ "$light" = 1 ]; then echo 1610612736; else echo 6442450944; fi ;;
       *) if [ "$light" = 1 ]; then echo "${FAKE_LIGHT_MEM_PEAK:-1615474688}"; else echo 2147483648; fi ;;
     esac ;;
 esac; exit 0'
@@ -147,8 +150,12 @@ run_health(){
   env -i HOME="$T" PATH="$T/bin:/usr/bin:/bin" FAKE_DIR="$T/fake" FAKE_HOST="$HOST_T" \
     FAKE_FIXEDWORK=2.100 FAKE_JOBS=streak=0 FAKE_LISTENER_AGE=3600 \
     CI_HEALTH_LOG="$T/ci-health.log" CI_HEALTH_STATE_DIR="$T/state" CI_HEALTH_ENV="$T/ci-health.env" \
-    CI_RUNNER_ENV="$T/ci-runner.env" CI_HEALTH_IDLE_WAIT=1 "$@" bash "$SCRIPT"
+    CI_RUNNER_ENV="$T/ci-runner.env" CI_HEALTH_CGROUP_ROOT="$T/cg" CI_HEALTH_IDLE_WAIT=1 "$@" bash "$SCRIPT"
 }
+# oom_kills <服务名> [次数]：在假的 cgroup 目录下写这个服务的 memory.events；不给次数就删掉（读不到）
+oom_kills(){ local d="$T/cg/system.slice/$1"; rm -rf "$d"; [ -z "${2:-}" ] && return 0; mkdir -p "$d"
+  printf 'low 0\nhigh 0\nmax 16895\noom %s\noom_kill %s\noom_group_kill 0\n' "$2" "$2" > "$d/memory.events"; }
+oom_base(){ cat "$T/state/light_oom_kill" 2>/dev/null; }   # 状态目录里记下的上一次次数
 nreq(){ find "$T/srv" -name 'req.*.json' | wc -l | tr -d ' '; }
 keys(){ cat "$T/state/keys" 2>/dev/null; }
 # check <请求序号> <说明> <python 表达式>：b 是请求体，c 是卡片，m 是卡片正文，h 是头部，raw 是原始字节，
@@ -521,11 +528,11 @@ grep -q 's#__RUNNER_SVC__#${SVC:-none}#' "$HERE/../bootstrap.sh" && grep -q 's#_
 last_sample(){ grep ' fixedwork=' "$LOG_T" | tail -1; }
 pgrep_users(){ sort -u "$T/fake/pgrep_users" 2>/dev/null | tr '\n' ' '; }
 
-echo "== 33. 没装轻任务实例：采样行和原来逐字相同，listener 只看 runner 用户名下的"
+echo "== 33. 没装轻任务实例：采样行没有 light 的键，listener 只看 runner 用户名下的"
 reset_state; runner_env
 run_health
-last_sample | grep -q ' listener=3600s avail_between_jobs=n/a$' && ! grep -q 'light' "$LOG_T" \
-  && ok "采样行到 avail_between_jobs 为止，没有 light 的键" || no "采样行不对：$(last_sample)"
+last_sample | grep -q ' listener=3600s avail_between_jobs=n/a oom_kill=n/a$' && ! grep -q 'light' "$LOG_T" \
+  && ok "采样行到 oom_kill 为止，没有 light 的键" || no "采样行不对：$(last_sample)"
 [ "$(nreq)" = 0 ] && ok "不告警" || no "发了 $(nreq) 个请求"
 [ "$(pgrep_users)" = "runner " ] && ok "pgrep 带 -u runner（服务单元的 User=）" || no "pgrep 查的用户是「$(pgrep_users)」"
 
@@ -533,7 +540,7 @@ echo "== 34. 没登记轻实例，但机器上有它的进程；重实例的 lis
 reset_state
 run_health FAKE_LISTENER_AGE= FAKE_LIGHT_LISTENER_AGE=7200
 check 1 "报重实例的 listener 不在" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT runner 没在接 job" and "进程不在" in m'
-last_sample | grep -q ' listener=none avail_between_jobs=n/a$' && ok "采样行 listener=none" || no "采样行不对：$(last_sample)"
+last_sample | grep -q ' listener=none avail_between_jobs=n/a oom_kill=n/a$' && ok "采样行 listener=none" || no "采样行不对：$(last_sample)"
 
 echo "== 35. 服务单元读不到 User=：退回不分用户，和原来一样"
 reset_state
@@ -541,11 +548,11 @@ run_health FAKE_SVC_USER=
 last_sample | grep -q ' listener=3600s ' && [ "$(pgrep_users)" = "<不分用户> " ] && [ "$(nreq)" = 0 ] \
   && ok "不带 -u 查到 listener，不告警" || no "采样行：$(last_sample)；pgrep 查的用户「$(pgrep_users)」；请求 $(nreq) 个"
 
-echo "== 36. 装了轻任务实例、都正常：采样行多记三项，不告警"
+echo "== 36. 装了轻任务实例、都正常：采样行多记四项，不告警"
 reset_state; runner_env "$LSVC_T"
 run_health FAKE_LIGHT_LISTENER_AGE=7200
-last_sample | grep -q ' listener=3600s avail_between_jobs=n/a light=active light_listener=7200s light_mem_peak=1540M$' \
-  && ok "采样行末尾是 light=active light_listener=7200s light_mem_peak=1540M" || no "采样行不对：$(last_sample)"
+last_sample | grep -q ' listener=3600s avail_between_jobs=n/a oom_kill=n/a light=active light_listener=7200s light_mem_peak=1540M light_oom_kill=n/a$' \
+  && ok "采样行末尾是 light=active light_listener=7200s light_mem_peak=1540M light_oom_kill=n/a" || no "采样行不对：$(last_sample)"
 [ "$(nreq)" = 0 ] && ok "不告警" || no "发了 $(nreq) 个请求"
 [ "$(pgrep_users)" = "runner runner-light " ] && ok "两个实例的 listener 各按自己的用户查" || no "pgrep 查的用户是「$(pgrep_users)」"
 
@@ -560,7 +567,7 @@ check 1 "先做什么：root 那句在前，看日志、重启用的是轻实例
 check 1 "退路：删掉仓库变量，小任务回到托管机；只有 3 步" '"\n3. 退路，不用登机：别的机器上的轻任务 runner 也没在接、一时又修不好时，在 GitHub 仓库 Settings → Secrets and variables → Actions → Variables 里删掉 `CI_CONTROL_RUNNER`（先记下它的值），这些小任务就回到 GitHub 托管机上跑；修好后按原值加回来\n" in m and "\n4. " not in m'
 check 1 "去哪看链到 10 章的轻实例一节" '"('"$DOC_T"'/10-%E6%8C%89%E6%9C%BA%E5%99%A8%E8%A7%84%E6%A0%BC%E5%AE%9A%E5%8F%82%E6%95%B0.md#%E5%8F%AA%E6%8E%A5%E5%B0%8F%E4%BB%BB%E5%8A%A1%E7%9A%84%E8%BD%BB%E5%AE%9E%E4%BE%8B)" in m'
 check 1 "不报重实例的两条" '"runner 服务当前是" not in m and "runner 没在接 job" not in h["title"]["content"]'
-last_sample | grep -q ' runner=active .* listener=3600s avail_between_jobs=n/a light=failed light_listener=n/a light_mem_peak=1540M$' \
+last_sample | grep -q ' runner=active .* listener=3600s avail_between_jobs=n/a oom_kill=n/a light=failed light_listener=n/a light_mem_peak=1540M light_oom_kill=n/a$' \
   && ok "采样行 light=failed light_listener=n/a，重实例照常" || no "采样行不对：$(last_sample)"
 grep -q "CRIT 轻任务 runner 服务不是 active（当前 failed），这台的轻任务 runner 没在接任务。PR 的预检、描述检查会排队。先看 journalctl -u $LSVC_T 最后几行，再 systemctl restart $LSVC_T；.*删掉仓库变量 CI_CONTROL_RUNNER" "$LOG_T" \
   && ok "日志那一行也带先做什么和退路" || no "日志里没有那一行"
@@ -574,7 +581,7 @@ reset_state
 run_health FAKE_LIGHT_LISTENER_AGE=
 check 1 "情况：进程不在，带上它的用户" '"- 这台机器上的轻任务 runner 没在接任务\n- 它的服务是 active，但接任务的 `Runner.Listener` 进程（用户 `runner-light`）不在\n- 隔 90 秒再看还是不在\n" in m and h["title"]["content"].endswith("：CRIT 轻任务 runner 没在接任务")'
 check 1 "先做什么里核对 listener 的命令带用户" '"`pgrep -x -u runner-light Runner.Listener` 有输出就好了" in m and root_ok()'
-last_sample | grep -q ' listener=3600s avail_between_jobs=n/a light=active light_listener=none ' && ok "采样行 light=active light_listener=none，重实例的 listener 照常" || no "采样行不对：$(last_sample)"
+last_sample | grep -q ' listener=3600s avail_between_jobs=n/a oom_kill=n/a light=active light_listener=none ' && ok "采样行 light=active light_listener=none，重实例的 listener 照常" || no "采样行不对：$(last_sample)"
 
 echo "== 39. 轻任务实例的 listener 反复崩溃"
 reset_state
@@ -587,7 +594,7 @@ reset_state
 run_health FAKE_LISTENER_AGE= FAKE_LIGHT_LISTENER_AGE=7200
 check 1 "标题是重实例的 listener，只有 1 条" 'h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：CRIT runner 没在接 job" and sub == "CRIT 1 条 · 新出现" and "轻任务" not in m'
 check 1 "命令里是重实例的服务名" '"`journalctl -u '"$SVC_T"' -n 50`" in m and "'"$LSVC_T"'" not in m'
-last_sample | grep -q ' listener=none avail_between_jobs=n/a light=active light_listener=7200s ' && ok "采样行 listener=none、light_listener=7200s" || no "采样行不对：$(last_sample)"
+last_sample | grep -q ' listener=none avail_between_jobs=n/a oom_kill=n/a light=active light_listener=7200s ' && ok "采样行 listener=none、light_listener=7200s" || no "采样行不对：$(last_sample)"
 [ "$(keys)" = "listener " ] && ok "状态文件只有 listener" || no "状态文件是「$(keys)」"
 
 echo "== 41. 两个实例的服务都不是 active：两条 CRIT，重实例的在前"
@@ -608,9 +615,86 @@ reset_state
 run_health FAKE_LIGHT_USER= FAKE_LIGHT_LISTENER_AGE=
 last_sample | grep -q ' light=active light_listener=n/a ' && [ "$(nreq)" = 0 ] && [ "$(pgrep_users)" = "runner " ] \
   && ok "light_listener=n/a，不告警，没有不分用户地查" || no "采样行：$(last_sample)；pgrep 查的用户「$(pgrep_users)」；请求 $(nreq) 个"
-runner_env
 
-echo "== 44. 轻任务实例的服务名怎么到 ci-health：add-light-runner 登记、bootstrap 重跑时带回、服务名不取错"
+echo "== 44. 被内存上限杀掉的次数：第一次采样只记下，次数不变不报"
+reset_state; oom_kills "$LSVC_T" 2; oom_kills "$SVC_T" 7
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+last_sample | grep -q ' avail_between_jobs=n/a oom_kill=7 light=active .* light_oom_kill=2$' && ok "采样行 oom_kill=7、light_oom_kill=2" || no "采样行不对：$(last_sample)"
+[ "$(nreq)" = 0 ] && [ "$(oom_base)" = 2 ] && ok "没有上一次可比：不报，记下 2" || no "请求 $(nreq) 个，记下的是「$(oom_base)」"
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+[ "$(nreq)" = 0 ] && [ "$(oom_base)" = 2 ] && ok "次数没变：不报" || no "请求 $(nreq) 个，记下的是「$(oom_base)」"
+oom_kills "$SVC_T" 9
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+last_sample | grep -q ' oom_kill=9 ' && [ "$(nreq)" = 0 ] && ! grep -q '被杀' "$LOG_T" && ok "重实例的次数变多：只记进采样行，不告警" || no "重实例那一项不对：$(last_sample)，请求 $(nreq) 个"
+
+echo "== 45. 轻任务实例的次数变多：报一条 WARN（样张），下一轮不重复报、也不发恢复卡"
+oom_kills "$LSVC_T" 5
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+check 1 "橙色，标题带次数" 'h["template"] == "orange" and h["title"]["content"] == "[CI runner 告警] '"$RUNNER_NAME_T"'：WARN 轻任务 runner 有进程超内存被杀 3 次" and sub == "WARN 1 条 · 新出现"'
+check 1 "单条四节" 'heads == ["#### 1. 情况", "#### 2. 影响", "#### 3. 先做什么", "#### 4. 去哪看"]'
+check 1 "情况：被杀了几次、上限多少、启动以来共几次" '"#### 1. 情况\n- 这台机器上的轻任务 runner 有进程因为内存超过上限（1536M）被杀了 **3 次**\n- 这是上一次整点检查到现在新增的；这个服务启动以来一共 5 次\n\n" in m'
+check 1 "影响：那个 job 失败，到 PR 页面点 Re-run" '"#### 2. 影响\n被杀的那个 job 会失败：是哪个 PR 的预检、描述检查或文档检查，就要在那个 PR 页面点 Re-run。轻任务 runner 还在接别的任务\n" in m'
+check 1 "先做什么：root 那句在前，先在内核日志里找 oom 记录" '"#### 3. 先做什么\n'"$ROOT_T"'：\n\n1. `journalctl -k --since -2h | grep -iE '"'"'out of memory|oom-kill'"'"'` 找最近的 oom 记录，看被杀的是哪个进程、几点\n2. 不用登机：按那个时间在下面的 GitHub Actions 里找落在轻任务 runner 上、失败的那个 job，到它的 PR 页面点 Re-run\n" in m and root_ok()'
+check 1 "老是出现：调高上限（写出 drop-in 的位置）或把检查改回重实例跑；只有 3 步" '"\n3. 老是出现：把内存上限调高（`/etc/systemd/system/'"$LSVC_T"'.d/override.conf` 里的 `MemoryMax=`，怎么改见下面手册），或者在 workflow 里把占内存多的那类检查（比如纯文档 PR 的检查）改回由跑完整检查的 runner 跑\n" in m and "\n4. " not in m'
+check 1 "去哪看：Actions 链接和 10 章轻实例一节" '"(https://github.com/'"$REPO_T"'/actions)" in m and "#%E5%8F%AA%E6%8E%A5%E5%B0%8F%E4%BB%BB%E5%8A%A1%E7%9A%84%E8%BD%BB%E5%AE%9E%E4%BE%8B)" in m'
+grep -q "WARN 轻任务 runner 上有进程因为内存超过上限（1536M）被杀了 3 次（这个服务启动以来共 5 次）。那次 PR 的预检、描述检查或文档检查会失败，在 PR 页面点 Re-run。journalctl -k 里找最近的 oom 记录" "$LOG_T" \
+  && ok "日志那一行也写了次数、影响和先做什么" || no "日志里没有那一行"
+[ -z "$(keys)" ] && [ -f "$T/state/keys" ] && [ "$(oom_base)" = 5 ] && ok "这一条不记进告警状态；次数前移到 5" || no "状态文件是「$(keys)」，记下的次数是「$(oom_base)」"
+save_sample 1 pb-warn-light-oom.json
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+[ "$(nreq)" = 1 ] && ok "下一轮次数没再多：不重复报，也不发恢复卡" || no "又发了（共 $(nreq) 个）"
+oom_kills "$LSVC_T" 6
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+check 2 "再多 1 次：按新出现再报一次" 'h["title"]["content"].endswith("：WARN 轻任务 runner 有进程超内存被杀 1 次") and sub == "WARN 1 条 · 新出现" and "一共 6 次" in m'
+
+echo "== 46. 次数归零（服务重启过）：不报，也不发恢复卡；重启以后又被杀，按这几次报"
+reset_state; mkdir -p "$T/state"; printf 5 > "$T/state/light_oom_kill"; oom_kills "$LSVC_T" 0
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+[ "$(nreq)" = 0 ] && [ "$(oom_base)" = 0 ] && ! grep -q '被杀' "$LOG_T" && ok "5 变 0：不报，记下 0" || no "请求 $(nreq) 个，记下的是「$(oom_base)」"
+printf 5 > "$T/state/light_oom_kill"; oom_kills "$LSVC_T" 1
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+check 1 "5 变 1：重启以后被杀了 1 次，报 1 次" 'h["title"]["content"].endswith("：WARN 轻任务 runner 有进程超内存被杀 1 次") and "被杀了 **1 次**" in m and "一共 1 次" in m'
+
+echo "== 47. 读不到次数（服务没在跑、没有 memory.events）：不报，上一次记下的留着"
+reset_state; mkdir -p "$T/state"; printf 5 > "$T/state/light_oom_kill"; oom_kills "$LSVC_T"; oom_kills "$SVC_T"
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+last_sample | grep -q ' oom_kill=n/a light=active .* light_oom_kill=n/a$' && [ "$(nreq)" = 0 ] && [ "$(oom_base)" = 5 ] \
+  && ok "两项都记 n/a，不报，记下的还是 5" || no "采样行：$(last_sample)；请求 $(nreq) 个；记下的是「$(oom_base)」"
+mkdir -p "$T/cg/system.slice/$LSVC_T"; echo "oom_kill 垃圾" > "$T/cg/system.slice/$LSVC_T/memory.events"
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+last_sample | grep -q ' light_oom_kill=n/a$' && [ "$(nreq)" = 0 ] && ok "文件里不是数字：也记 n/a，不报" || no "采样行：$(last_sample)；请求 $(nreq) 个"
+
+echo "== 48. 推送没成功：次数不前移，下一小时再报一次"
+reset_state; mkdir -p "$T/state"; printf 2 > "$T/state/light_oom_kill"; oom_kills "$LSVC_T" 4; echo "19021" > "$T/srv/codes"
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+grep -q '告警推送失败：飞书返回 19021' "$LOG_T" && [ "$(oom_base)" = 2 ] && ok "推送失败，记下的还是 2" || no "记下的是「$(oom_base)」"
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+check 2 "下一小时再报，还是 2 次" 'h["title"]["content"].endswith("：WARN 轻任务 runner 有进程超内存被杀 2 次")'
+[ "$(oom_base)" = 4 ] && ok "推出去以后前移到 4" || no "记下的是「$(oom_base)」"
+
+echo "== 49. 和一直在的告警一起出现：那一条照旧记着，下一轮不重复推"
+reset_state; mkdir -p "$T/state"; printf 'disk_warn ' > "$T/state/keys"; printf 0 > "$T/state/light_oom_kill"; oom_kills "$LSVC_T" 1
+run_health FAKE_AVAIL=21300 FAKE_LIGHT_LISTENER_AGE=7200
+check 1 "两节，被杀那条标（新）" 'heads == ["#### 1. WARN 根分区可用空间偏低", "#### 2. WARN 轻任务 runner 有进程超内存被杀 1 次（新）"] and sub == "WARN 2 条 · 新出现 1 条"'
+[ "$(keys)" = "disk_warn " ] && ok "状态文件还是 disk_warn" || no "状态文件是「$(keys)」"
+run_health FAKE_AVAIL=21300 FAKE_LIGHT_LISTENER_AGE=7200
+[ "$(nreq)" = 1 ] && ok "下一轮只剩磁盘那条：不重复推，不报消除" || no "又发了（共 $(nreq) 个）"
+
+echo "== 50. 没配推送地址：被杀照样记进日志，次数照样前移"
+write_env; reset_state; mkdir -p "$T/state"; printf 1 > "$T/state/light_oom_kill"; oom_kills "$LSVC_T" 2
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+grep -q 'WARN 轻任务 runner 上有进程因为内存超过上限（1536M）被杀了 1 次' "$LOG_T" && [ "$(nreq)" = 0 ] && [ "$(oom_base)" = 2 ] \
+  && ok "日志有一行，不发请求，记下 2" || no "请求 $(nreq) 个，记下的是「$(oom_base)」"
+write_env "$HOOK" "$SECRET_T"
+
+echo "== 51. 没装轻任务实例：不比次数，不写 light_oom_kill，没配推送时连状态目录都不建"
+write_env; reset_state; runner_env; oom_kills "$LSVC_T" 9; oom_kills "$SVC_T" 3
+run_health FAKE_LIGHT_LISTENER_AGE=7200
+last_sample | grep -q ' avail_between_jobs=n/a oom_kill=3$' && [ ! -e "$T/state" ] && ! grep -q 'light\|被杀' "$LOG_T" \
+  && ok "采样行只多一个 oom_kill=3，没有状态目录，没有 light 的东西" || no "采样行：$(last_sample)；状态目录：$(ls "$T/state" 2>&1)"
+write_env "$HOOK" "$SECRET_T"; oom_kills "$LSVC_T"; oom_kills "$SVC_T"
+
+echo "== 52. 轻任务实例的服务名怎么到 ci-health：add-light-runner 登记、bootstrap 重跑时带回、服务名不取错"
 grep -q 'K=LIGHT_SVC V="\$SVC" awk' "$HERE/../add-light-runner.sh" && grep -q 'ENVF="\${CI_RUNNER_ENV:-/etc/ci-runner.env}"' "$HERE/../add-light-runner.sh" \
   && ok "add-light-runner.sh 把 LIGHT_SVC= 写进 /etc/ci-runner.env" || no "add-light-runner.sh 没有登记 LIGHT_SVC"
 grep -q '^PERSIST_VARS=".* LIGHT_SVC"$' "$HERE/../bootstrap.sh" && grep -q '^LIGHT_SVC="\${LIGHT_SVC:-}"$' "$HERE/../bootstrap.sh" \
@@ -620,7 +704,7 @@ grep -q 'RUNNER_HOME|CI_FIXEDWORK_BASELINE|CI_DISK_WARN_MB|CI_DISK_CRIT_MB|LIGHT
 grep -q '\[ -r "\$RUNNER_HOME/.service" \] && SVC=' "$HERE/../bootstrap.sh" && grep -q '\[ -r "\$RUNNER_HOME/.service" \] && SVC=' "$HERE/../verify.sh" \
   && ok "bootstrap 和 verify 的服务名先读 RUNNER_HOME 下的 .service，不会取到轻实例的" || no "bootstrap 或 verify 还是取第一个 actions.runner.* 单元"
 
-echo "== 45. 全程的日志、journal 和输出里没有推送地址、密钥和 token"
+echo "== 53. 全程的日志、journal 和输出里没有推送地址、密钥和 token"
 reset_state
 if grep -rqF -e "$SECRET_T" -e "test-hook-id" -e "$BAD_HOOK_ID" -e "$TOK_A" -e "$TOK_B" "$T/all.log" "$T/fake/journal" "$T"/out.*.txt 2>/dev/null; then
   no "出现了地址或密钥"; else ok "没有地址和密钥（$(wc -l < "$T/all.log") 行日志）"; fi

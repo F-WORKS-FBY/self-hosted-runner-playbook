@@ -56,6 +56,11 @@
 #     没有这一行的机器，采样行和告警都和原来一样。
 #     同机有两个实例就有两个 Runner.Listener，所以 listener 按服务单元的用户（User=）分开查：
 #     不分的话，一个实例的 listener 崩了，会被另一个实例的盖住。
+#  ⑪ 记下进程被内存上限杀掉的次数（服务所在 cgroup 的 memory.events 里的 oom_kill）。mem_peak 含页缓存，
+#     轻实例装上几个小时就贴着上限，看不出有没有进程被杀；被杀的 job 只是变红，没人知道是内存的事。
+#     采样行多记 oom_kill=（重实例，只记录不告警），装了轻实例的再多记 light_oom_kill=。
+#     轻实例的次数比上一次采样多了就报一条 WARN。这是「这一小时发生过」的事，不是一直在的状态：
+#     下一小时没再多就不报，也不发恢复卡。服务重启后次数从 0 起，变少不算。
 set -uo pipefail
 LOG="${CI_HEALTH_LOG:-/var/log/ci-health.log}"
 SVC="__RUNNER_SVC__"                      # 由 bootstrap.sh 替换；--skip-runner 装的机器上是 none
@@ -174,6 +179,14 @@ fi
 svc_mem_peak(){ local p; p=$(systemctl show "$1" -p MemoryPeak --value 2>/dev/null); case "$p" in ''|*[!0-9]*) echo "n/a" ;; *) echo "$((p / 1048576))M" ;; esac; }
 mem_peak="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && mem_peak=$(svc_mem_peak "$SVC")
 light_mem_peak="n/a"; [ -n "$LIGHT_SVC" ] && light_mem_peak=$(svc_mem_peak "$LIGHT_SVC")
+# 进程被内存上限杀掉的次数：服务所在 cgroup 的 memory.events 里的 oom_kill，服务这次启动以来的累计，重启后从 0 起。
+# 读不到（服务没在跑所以没有 cgroup、不是 cgroup v2）记 n/a。
+svc_oom_kill(){ local cg n; cg=$(systemctl show "$1" -p ControlGroup --value 2>/dev/null | head -1)
+  case "$cg" in /?*) ;; *) echo "n/a"; return 0 ;; esac
+  n=$(awk '$1 == "oom_kill" { print $2; exit }' "${CI_HEALTH_CGROUP_ROOT:-/sys/fs/cgroup}${cg}/memory.events" 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) echo "n/a" ;; *) echo "$n" ;; esac; }
+oom_kill="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && oom_kill=$(svc_oom_kill "$SVC")
+light_oom_kill="n/a"; [ -n "$LIGHT_SVC" ] && light_oom_kill=$(svc_oom_kill "$LIGHT_SVC")
 mem_avail="$(awk '/^MemAvailable:/{printf "%dM", $2/1024}' /proc/meminfo 2>/dev/null)"
 
 # 可用空间落在 WARN 和 CRIT 之间、又正好有 job 在跑时，等到本机没有 job 的那一刻再量一次，WARN 以那次为准。
@@ -281,9 +294,9 @@ case "$jobs" in
 esac
 
 fw=${t:+${t}s}; fw=${fw:-n/a}   # 有秒数写「2.100s」，没跑出结果写「n/a」
-# 装了轻任务实例的机器，采样行末尾多三项；没装的不写，和原来逐字相同
-light_kv=""; [ -n "$LIGHT_SVC" ] && light_kv=" light=${light} light_listener=${light_listener} light_mem_peak=${light_mem_peak}"
-echo "$(date -Is) fixedwork=${fw} root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}${light_kv}" >> "$LOG"
+# 装了轻任务实例的机器，采样行末尾多四项 light 开头的；没装的不写
+light_kv=""; [ -n "$LIGHT_SVC" ] && light_kv=" light=${light} light_listener=${light_listener} light_mem_peak=${light_mem_peak} light_oom_kill=${light_oom_kill}"
+echo "$(date -Is) fixedwork=${fw} root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a} oom_kill=${oom_kill}${light_kv}" >> "$LOG"
 # 定长任务没跑出结果时另记一行原因：采样行里只有 fixedwork=n/a
 [ -n "$t" ] || echo "$(date -Is) WARN 定长任务没跑出结果（${t_why}），这一小时不判 vCPU 争抢" >> "$LOG"
 
@@ -350,6 +363,26 @@ if [ -n "$LIGHT_SVC" ]; then
       restarting*) warn light "CRIT 轻任务 runner 服务是 active，但它的 Runner.Listener 进程（用户 $lu）两次查看都是刚启动（${light_listener#restarting}），在反复崩溃重启，这台的轻任务 runner 没在接任务。${light_do}" \
               mode=restarting wait="${CI_HEALTH_LISTENER_WAIT:-90}" age="${light_listener//[!0-9]/}" lsvc="$LIGHT_SVC" user="$lu" ;;
     esac
+  fi
+fi
+# 轻任务实例上有进程被内存上限杀掉：次数比上一次采样多了才报，WARN。上一次的次数记在状态目录的 light_oom_kill 里。
+#   · 第一次采样没有上一次可比，只记下；这次读不到就不比，上一次的照旧留着；
+#   · 比上一次少，是服务重启过、次数从 0 起：回到 0 不报，重启以后又被杀过（大于 0）按这几次报。
+# 记下的次数在文件末尾才前移（见那里）：配了推送而这次没推出去，就不前移，下一小时接着报。
+light_oom_alert=0; light_oom_store=""
+if [ -n "$LIGHT_SVC" ] && [ "$light_oom_kill" != "n/a" ]; then
+  light_oom_store=$light_oom_kill
+  prev_oom=$(cat "$STATE_DIR/light_oom_kill" 2>/dev/null)
+  case "$prev_oom" in ''|*[!0-9]*) prev_oom="" ;; esac
+  if [ -n "$prev_oom" ]; then
+    [ "$light_oom_kill" -lt "$prev_oom" ] && prev_oom=0
+    if [ "$light_oom_kill" -gt "$prev_oom" ]; then
+      light_max=$(systemctl show "$LIGHT_SVC" -p MemoryMax --value 2>/dev/null | head -1)
+      case "$light_max" in ''|*[!0-9]*) light_max="" ;; *) light_max="$((light_max / 1048576))M" ;; esac
+      warn light_oom "WARN 轻任务 runner 上有进程因为内存超过上限${light_max:+（$light_max）}被杀了 $((light_oom_kill - prev_oom)) 次（这个服务启动以来共 ${light_oom_kill} 次）。那次 PR 的预检、描述检查或文档检查会失败，在 PR 页面点 Re-run。journalctl -k 里找最近的 oom 记录看是哪个进程；老是出现就把 $LIGHT_SVC 的 MemoryMax 调高，或者把占内存多的检查改回由重实例跑（10 章 10.6）" \
+        n="$((light_oom_kill - prev_oom))" total="$light_oom_kill" max="$light_max" lsvc="$LIGHT_SVC"
+      light_oom_alert=1
+    fi
   fi
 fi
 # 产出告警：服务 active 但 job 连红，正是 2026-09-07 那种「假绿」的唯一信号
@@ -462,9 +495,9 @@ FIXED_BACK = "`fixedwork=` 变回秒数就好了：" + code("grep -o 'fixedwork=
 
 NAMES = {"contention": "CPU 变慢", "disk_crit": "根分区快满了", "disk_warn": "根分区可用空间偏低",
          "config": "磁盘阈值配置无效", "runner": "runner 服务没在运行", "listener": "runner 没在接 job",
-         "light": "轻任务 runner 没在接任务", "streak": "本机 job 连续失败", "jobsprobe": "读不到本机 job 结果"}
+         "light": "轻任务 runner 没在接任务", "light_oom": "轻任务 runner 有进程超内存被杀", "streak": "本机 job 连续失败", "jobsprobe": "读不到本机 job 结果"}
 LEVELS = {"contention": "WARN", "disk_crit": "CRIT", "disk_warn": "WARN", "config": "WARN",
-          "runner": "CRIT", "listener": "CRIT", "light": "CRIT", "streak": "CRIT", "jobsprobe": "WARN"}
+          "runner": "CRIT", "listener": "CRIT", "light": "CRIT", "light_oom": "WARN", "streak": "CRIT", "jobsprobe": "WARN"}
 # 这几条在另一条出现时量不到：上次在报、这次没报，不能算消除。写在那一条的情况里
 BLOCKED_BY = {"streak": ("jobsprobe", ""), "listener": ("runner", "服务不是 active 时不查这一项")}
 def label(key):   # 「WARN 根分区可用空间偏低」：恢复、已消除、看不到了里用
@@ -472,7 +505,7 @@ def label(key):   # 「WARN 根分区可用空间偏低」：恢复、已消除�
 def headline(key, lv, f, md=False):   # 标题和多条时每节的标题：级别、名字，连续失败带次数
     if key not in NAMES:
         return "%s %s" % (lv, code(key) if md else plain(key))
-    n = num(f.get("n")) if key == "streak" else "?"
+    n = num(f.get("n")) if key in ("streak", "light_oom") else "?"
     return "%s %s%s" % (lv, NAMES[key], " %s 次" % n if n != "?" else "")
 def counts(lvs):
     parts = ["%s %d 条" % (lv, lvs.count(lv)) for lv in ("CRIT", "WARN") if lv in lvs]
@@ -589,6 +622,25 @@ def t_light(f):   # 同机的轻任务实例：PR 的预检、描述检查这类
         impact="PR 的预检、描述检查这类小任务会排队：别的机器上的轻任务 runner 还在接，就只是慢一些；都没在接，就一直排着，PR 过不了预检",
         pre=pre, steps=steps, links=[L_LIGHT])
 
+def t_light_oom(f):   # 轻任务实例上有进程被内存上限杀掉。只在次数变多的那一小时报，不进恢复卡
+    svc, n, total = f.get("lsvc") or LIGHT_SVC or "?", num(f.get("n")), num(f.get("total"))
+    cap = f.get("max") if re.fullmatch(r"\d{1,9}M", f.get("max") or "") else ""
+    repo, links = REPO, []
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
+        links.append("[GitHub Actions 运行记录](https://github.com/%s/actions)" % repo)
+    return dict(
+        facts=["这台机器上的轻任务 runner 有进程因为内存超过上限%s被杀了 **%s 次**" % ("（%s）" % cap if cap else "", n),
+               "这是上一次整点检查到现在新增的；这个服务启动以来一共 %s 次" % total],
+        impact="被杀的那个 job 会失败：是哪个 PR 的预检、描述检查或文档检查，就要在那个 PR 页面点 Re-run。轻任务 runner 还在接别的任务",
+        pre=ROOT_PRE,
+        steps=["%s 找最近的 oom 记录，看被杀的是哪个进程、几点" % code("journalctl -k --since -2h | grep -iE 'out of memory|oom-kill'"),
+               "不用登机：按那个时间在%s GitHub Actions 里找落在轻任务 runner 上、失败的那个 job，到它的 PR 页面点 Re-run" % (
+                   "下面的" if links else ""),
+               "老是出现：把内存上限调高（%s 里的 `MemoryMax=`，怎么改见下面手册），"
+               "或者在 workflow 里把占内存多的那类检查（比如纯文档 PR 的检查）改回由跑完整检查的 runner 跑" % code(
+                   "/etc/systemd/system/%s.d/override.conf" % svc, 200)],
+        links=links + [L_LIGHT])
+
 def t_streak(f):
     repo, links = f.get("repo") or REPO, []
     if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
@@ -650,7 +702,7 @@ def t_unseen(key, why):   # 上次报过、这次量不到的一条，没有别�
                 pre=ROOT_PRE, steps=steps, links=links)
 
 TEMPLATES = {"contention": t_contention, "disk_crit": t_disk_crit, "disk_warn": t_disk_warn, "config": t_config,
-             "runner": t_runner, "listener": t_listener, "light": t_light, "streak": t_streak, "jobsprobe": t_jobsprobe}
+             "runner": t_runner, "listener": t_listener, "light": t_light, "light_oom": t_light_oom, "streak": t_streak, "jobsprobe": t_jobsprobe}
 def items(key, f):
     t = TEMPLATES.get(key)
     return t(f) if t else dict(facts=[txt(f.get("text") or key)], impact="", steps=[], links=[])
@@ -825,14 +877,19 @@ PY
   echo "$(date -Is) WARN 告警推送失败：$resp" >> "$LOG"; return 1
 }
 # 量不到的检查交给卡片：每行「key<TAB>原因代号」
+pushed=none   # 这一轮的推送：none 没推（没配地址，或告警集合没变），ok 推出去了，fail 没推出去
 unseen_kv=$(for u in "${UNSEEN[@]+"${UNSEEN[@]}"}"; do k=${u%%|*}; r=${u#*|}; printf '%s\t%s\n' "$k" "${r%%|*}"; done)
 if [ -n "${CI_ALERT_WEBHOOK:-}" ]; then
   mkdir -p "$STATE_DIR"
   keys=$(for a in "${ALERTS[@]+"${ALERTS[@]}"}"; do printf '%s\n' "${a%%|*}"; done | sort -u | tr '\n' ' ')
+  # light_oom 是「这一小时发生过」的事，不是一直在的状态，不记进状态文件：下一小时它不在了不算消除、不发恢复卡，
+  # 再发生一次按新出现再报。没有这条时 keys_keep 和 keys 相同
+  keys_keep=${keys//light_oom /}
   prev=$(cat "$STATE_DIR/keys" 2>/dev/null)
   last=$(stat -c %Y "$STATE_DIR/keys" 2>/dev/null || echo 0)
   now=$(date +%s)
   if [ "$keys" != "$prev" ] || { [ -n "$keys" ] && [ $((now - last)) -ge 86400 ]; }; then
+    pushed=fail
     # 卡片标题用 runner 注册名（GitHub 上 job 页面「Set up job」和 Settings → Runners 里显示的就是它），读不到才用主机名。
     # 几台机器推到同一个群时，只看主机名分不清哪台是哪台：云上的默认主机名常常是一串编号。
     rn=$(RUNNER_FILE="$RUNNER_HOME/.runner" python3 -c 'import json,os;print(json.load(open(os.environ["RUNNER_FILE"],encoding="utf-8-sig")).get("agentName",""))' 2>/dev/null)
@@ -852,7 +909,11 @@ if [ -n "${CI_ALERT_WEBHOOK:-}" ]; then
       notify alert "$body"
     else
       notify recover "[CI runner 恢复] $host：之前的告警已全部消除"
-    fi && printf '%s' "$keys" > "$STATE_DIR/keys"
+    fi && { printf '%s' "$keys_keep" > "$STATE_DIR/keys"; pushed=ok; }
   fi
+fi
+# 轻实例被杀次数前移到这次的值。这次报了 light_oom、配了推送却没推出去时不前移，下一小时照旧比出「变多」再报一次
+if [ -n "$light_oom_store" ] && ! { [ "$light_oom_alert" = 1 ] && [ "$pushed" = fail ]; }; then
+  mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s' "$light_oom_store" > "$STATE_DIR/light_oom_kill" 2>/dev/null
 fi
 exit 0

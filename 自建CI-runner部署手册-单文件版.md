@@ -2184,8 +2184,10 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
 - 同机装了轻实例（10 章 10.6）时，ci-health 多查它在不在接任务：服务是不是 active、它的 `Runner.Listener` 在不在。PR 的预检、描述检查都在它上面跑，它不接任务，这些小任务就排队。
   - 不正常报 CRIT「轻任务 runner 没在接任务」。卡片写明影响、先做什么（看 `journalctl -u <轻实例的服务>`，再 `systemctl restart <轻实例的服务>`）和退路：别的机器上的轻实例也没在接、一时又修不好时，删掉给小任务选 runner 的仓库变量，小任务回到 GitHub 托管机上跑。恢复卡提醒把删过的变量加回来。
   - 变量名写在 `ci-health.sh` 的 `LIGHT_VAR`，默认是参考项目用的 `CI_CONTROL_RUNNER`，你的 workflow 用别的名字就改它。
-  - 采样行末尾多记三项：`light=`（服务状态）、`light_listener=`（listener 活了多少秒）、`light_mem_peak=`（内存峰值，怎么读见 10 章 10.7）。
+  - 采样行末尾多记四项：`light=`（服务状态）、`light_listener=`（listener 活了多少秒）、`light_mem_peak=`（内存峰值，怎么读见 10 章 10.7）、`light_oom_kill=`（进程被内存上限杀掉的次数）。
+  - `light_oom_kill` 比上一次采样多了，报 WARN「轻任务 runner 有进程超内存被杀 N 次」：被杀的那个 job 会失败，要到它的 PR 页面点 Re-run；卡片让人先在 `journalctl -k` 里找 oom 记录，老是出现就调高上限或者把那类检查改回由重实例跑（10 章 10.6）。这条只在变多的那一小时报，下一小时没再多就不报，也不发恢复卡。服务重启后次数从 0 起，回到 0 不报；这次读不到也不报。上一次的次数记在 `/var/lib/ci-health/light_oom_kill`；配了推送而没推出去时不更新它，下一小时再报。
   - 轻实例的服务名从 `/etc/ci-runner.env` 的 `LIGHT_SVC=` 读，由 `add-light-runner.sh` 登记。没有这一行的机器不查，采样行和告警都不变。
+- 进程被内存上限杀掉的次数也记进采样行：`oom_kill=` 是跑完整检查的那个实例的，取自它 cgroup 的 `memory.events`，是服务这次启动以来的累计，读不到记 `n/a`。它只记录不告警，查某个 job 为什么红的时候拿来对时间。
 - 除了水位，也要看增量。日增超过预期两倍时，检查是不是哪个构建的层序坏了。
 
 > 注意：开发工具（VS Code 远程服务端、Claude Code、Codex 等）在 CI 机上同时占磁盘和内存。磁盘方面，VS Code 远程服务端每次客户端升级就多留一份，参考机上一份约 650 MB，一个月攒了 5 份，要在每月巡检时删（8.6）。内存方面后果更重，参考项目在 8 GB 的 CI 机上开发了两天，出了 11 次全局 OOM。最好不在 CI 机上开发；一定要开发，按 04 章 4.8 配置。
@@ -3390,11 +3392,17 @@ gh variable set CI_CONTROL_RUNNER --repo OWNER/REPO --body '["self-hosted","<轻
 要盯什么：
 
 - 在不在接任务。ci-health 每小时查轻实例的服务和它的 `Runner.Listener`，不正常报 CRIT「轻任务 runner 没在接任务」，卡片里有先做什么和上面第 1 条退路（08 章 8.2）。verify.sh 只查重实例，重启机器之后用 `systemctl is-active <轻实例的服务>` 另看一眼。
-- 小任务有没有被杀。进程树实际占的内存顶到 1536M 时，内核会杀掉 job 里的进程，这个 job 变红，要手动重跑。看轻实例 cgroup 的 `memory.events`，`oom_kill` 在涨就是被杀过；反复出现，说明这类 job 不适合放在轻实例上。采样行里的 `light_mem_peak` 含页缓存，装上几个小时就会贴着上限，不说明有问题：参考项目两台都是这样，`max` 计数一万多次，`oom_kill` 是 0。
+- 小任务有没有被杀。进程树实际占的内存顶到 1536M 时，内核会杀掉 job 里的进程，这个 job 变红，要在它的 PR 页面点 Re-run。被杀的次数是轻实例 cgroup 的 `memory.events` 里的 `oom_kill`，ci-health 每小时把它记进采样行的 `light_oom_kill=`，比上一次多了就报一条 WARN「轻任务 runner 有进程超内存被杀 N 次」（08 章 8.2）。采样行里的 `light_mem_peak` 含页缓存，装上几个小时就会贴着上限，不说明有问题：参考项目两台都是这样，`max` 计数一万多次，`oom_kill` 是 0。
+  - 是哪个进程、几点被杀的，看内核日志：`journalctl -k --since -2h | grep -iE 'out of memory|oom-kill'`。
+  - 老是出现，一条路是调高上限。上限写在 `/etc/systemd/system/<轻实例的服务>.d/override.conf` 的 `MemoryMax=`，这个文件由 `add-light-runner.sh` 生成，所以用它改，不要手改：
 
-  ```bash
-  cat "/sys/fs/cgroup$(systemctl show <轻实例的服务> -p ControlGroup --value)/memory.events"
-  ```
+    ```bash
+    GH_REPO=OWNER/REPO LIGHT_MEM_MAX=2G bash /root/add-light-runner.sh <轻实例的 runner 名>   # 已注册过，不用 token
+    cat "/sys/fs/cgroup$(systemctl show <轻实例的服务> -p ControlGroup --value)/memory.max"   # 应是新值的字节数
+    ```
+
+    第二行还是旧值的话，等轻实例上没有任务在跑时 `systemctl restart <轻实例的服务>`。以后重跑这个脚本都要带同一个 `LIGHT_MEM_MAX`，不带会写回 1536M。调之前看整机放不放得下：上面算过，6G 加 1536M 已经贴着 7.6 GiB。
+  - 另一条路是在 workflow 里把占内存多的那类检查（比如纯文档 PR 的检查）改回由重实例跑。
 - 磁盘。每台多占约 3–4 GB：参考项目实测程序和工作区 1.7 GB，用户主目录下的工具缓存 1.8 GB。算进 10.4 的固定占用 F。
 
 ### 10.7 上线后看哪些数、什么时候复核
@@ -3404,11 +3412,11 @@ gh variable set CI_CONTROL_RUNNER --repo OWNER/REPO --body '["self-hosted","<轻
 | 看什么 | 怎么看 | 正常 | 不正常时 |
 |---|---|---|---|
 | 全局 OOM | `journalctl -k --since -1d \| grep 'Out of memory: Killed'` | 0 次 | J 或 D 估小了，或者 k 定大了，按 10.1 重新量 |
-| runner 撞上自己的上限 | runner 单元 cgroup 下 `memory.events` 里的 `max` 和 `oom_kill` | 都不涨 | `max` 在涨，说明进程树顶到了上限，在靠回收页缓存撑着；`oom_kill` 在涨，说明 job 被杀了，看 P 是不是变大了 |
+| runner 撞上自己的上限 | runner 单元 cgroup 下 `memory.events` 里的 `max` 和 `oom_kill`；`oom_kill` 也记在 `ci-health.log` 的 `oom_kill=` 里，服务重启后从 0 起 | 都不涨 | `max` 在涨，说明进程树顶到了上限，在靠回收页缓存撑着；`oom_kill` 在涨，说明 job 被杀了，看 P 是不是变大了 |
 | 容器撞上自己的上限 | 内核日志里 `oom_memcg=` 指向 `docker-<id>.scope` 的记录 | 没有 | 容器自己的 `--memory` 设小了。这归 workflow 管，和机器规格无关 |
 | `mem_avail` | `ci-health.log`，每小时一个快照 | k 个 job 在跑时也不低于 10.2 的余量 max(1 GiB, T × 10%) | 快照只记整点那一刻，通常比真实的最低值高，所以快照里出现低值就要查 |
 | `mem_peak` | `ci-health.log`，runner 进程树自上次启动以来的峰值 | 含页缓存，接近 `RUNNER_MEM_MAX` 不一定有问题 | 以 `memory.events` 的 `oom_kill` 为准 |
-| `light`、`light_listener`、`light_mem_peak` | `ci-health.log`，装了轻实例的机器才有这三项（10.6） | `light=active`，`light_listener` 是秒数；`light_mem_peak` 贴着轻实例的内存上限是常态 | 前两项不正常时 ci-health 会报 CRIT；小任务有没有被杀，看轻实例 `memory.events` 的 `oom_kill` |
+| `light`、`light_listener`、`light_mem_peak`、`light_oom_kill` | `ci-health.log`，装了轻实例的机器才有这四项（10.6） | `light=active`，`light_listener` 是秒数；`light_mem_peak` 贴着轻实例的内存上限是常态；`light_oom_kill` 不涨 | 前两项不正常时 ci-health 会报 CRIT；`light_oom_kill` 涨了是有小任务被杀，ci-health 报 WARN，做法见 10.6 |
 | `fixedwork` | `ci-health.log`，定长任务耗时 | 不超过基线的 1.4 倍 | 邻居在抢核，或者突发性能规格的 CPU 积分用完了（08 章 8.3）；k 大于 1 时也可能是自己的 job 占满了核，说明 k 定大了 |
 | `root_avail`、`containerd`、`volumes` | `ci-health.log`（08 章 8.2） | `containerd` 涨到 Max Used 加镜像后停住；`volumes` 接近 0 | 见 08 章 8.2 |
 | job 耗时 | 02 章 2.7 的 gh 查询 | 每个 job 都满足超时余量 | 先查 R 是不是变了 |
@@ -3461,7 +3469,7 @@ gh variable set CI_CONTROL_RUNNER --repo OWNER/REPO --body '["self-hosted","<轻
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 | `ci-health.sh` 的 listener 检查、磁盘 WARN 在 job 之间量（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里用假的 `Runner.Listener`、`Runner.Worker` 进程测了 10 种情况；心跳示例在第一台用临时 systemd 单元实跑 | 通过：listener 不在、反复崩溃时报，刚启动后稳定时不报；job 结束后才量、一直忙时不判 WARN（上一次有 WARN 就沿用，不推「已恢复」）、低于 CRIT 时不等 |
 | `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`：渲染出的脚本整段实跑，系统命令换成桩，推送打到本地假 webhook，38 组 123 项；2026-11-11 两台逐文件部署后看了第一次整点检查 | 通过：结构、颜色、标题（带级别）与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除（含没配 token、定长任务没跑出结果，只剩这种时不发恢复卡）、恢复卡列出当时的先做什么、先做什么以「以下在这台上用 root 跑」开头、`verify.sh` 的路径、401 单独写、采样出错时日志带原因且不带 token、限流重发、卡片被拒（11246、9499，含 HTTP 400）或超长时改发文本、失败不写状态、日志里不带推送地址和密钥、手册链接的锚点。两台部署后的第一次整点检查：采样行照常、没有推送失败；当时两台都没有告警，真实卡片要等下一次告警或恢复时才在群里见到 |
-| `ci-health.sh` 认同机的轻实例、listener 按用户分开看（2026-11-13） | 同一套用例加到 50 组 163 项；另把 listener 改回不分用户跑了一遍，新加的用例能抓出来 | 通过：没登记轻实例时采样行和原来逐字相同；登记了且正常时多记三项、不告警；服务不是 active、listener 不在、listener 反复崩溃各报一条 CRIT，卡片有影响、先做什么和退路；重实例的 listener 不在而轻实例的在，报的是重实例那一条；恢复卡提醒把删过的变量加回来 |
+| `ci-health.sh` 认同机的轻实例、listener 按用户分开看、记被内存上限杀掉的次数（2026-11-13） | 同一套用例加到 58 组 190 项；另把 listener 改回不分用户、把被杀次数的三处判断去掉又跑了一遍，新加的用例都能抓出来 | 通过：没登记轻实例时采样行只多一项 `oom_kill=`，没有 light 的键；登记了且正常时再多记四项、不告警；服务不是 active、listener 不在、listener 反复崩溃各报一条 CRIT，卡片有影响、先做什么和退路；重实例的 listener 不在而轻实例的在，报的是重实例那一条；恢复卡提醒把删过的变量加回来；轻实例被杀次数不变不报、变多报一条 WARN、下一轮不重复报也不发恢复卡、归零和读不到不报、推送没成功下一小时再报 |
 | `add-light-runner.sh`（2026-11-13） | 两台 runner 上各装了一个轻实例；末尾登记 `LIGHT_SVC=` 的那一步和「只删别的用户留下的 `/tmp/pr*.json`」在临时文件上单独测 | 两台的轻实例服务 active、用户不在 docker 组、`MemoryMax` 1536M、listener 在跑；登记那一步重跑不重复加行、别的行不动 |
 | `deploy-ci-health.sh`（2026-11-13） | 临时目录里造 `/etc/ci-runner.env` 和现行那份，系统命令换成桩，跑了 9 种情况 | 通过：正常替换并留备份、已是新版不动、现行那份被手改过不换、有 job 在跑不换、第 13 分前后不换、新版内嵌 python 有语法错不换、没登记轻实例照常换；用两台真机现行那份的服务名和目录渲染上一版，校验值和真机上的一致 |
 | `ci-cleanup.sh` 第 8 步（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里 24 项用例；两台 runner 空闲时各用真实镜像和 `/tmp` 目录实跑一次 | 通过：只删同时带两种标签的镜像和匹配的 runner 目录，对照对象、编译缓存、别的用户的同名目录都在 |
