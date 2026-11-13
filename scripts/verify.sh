@@ -47,7 +47,10 @@ no(){ printf '  \033[31mFAIL\033[0m  %s\n' "$*"; F=$((F+1)); }
 sk(){ printf '  \033[90mSKIP\033[0m  %s\n' "$*"; }
 hdr(){ printf '\n\033[1m%s\033[0m\n' "$*"; }
 
-SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)" 2>/dev/null || echo "")
+# 服务名先读 svc.sh 写在 RUNNER_HOME 下的 .service：同机加了轻任务实例（10 章 10.6）以后单元不止一个，
+# 按名字排第一个的是轻实例的。读不到才取第一个。
+SVC=""; [ -r "$RUNNER_HOME/.service" ] && SVC=$(head -1 "$RUNNER_HOME/.service" | tr -d '[:space:]')
+[ -n "$SVC" ] || SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)" 2>/dev/null || echo "")
 NSVC=$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | wc -l)
 # 有 job 在跑吗？按进程名精确匹配（-f 会被任何含这个词的命令行误触发）
 BUSY=0; pgrep -x Runner.Worker >/dev/null 2>&1 && BUSY=1
@@ -67,12 +70,13 @@ done
 [ -n "$SVC" ] || no "找不到 runner 服务单元。还没注册？用 --skip-runner 装的机器注册前就是这样，注册后再跑一次"
 # 服务 active 不代表 listener 在跑：listener 崩了由 runsvc.sh 在里面重新拉起，systemd 看不到（09 章 A23）
 if [ -n "$SVC" ] && [ "$(systemctl is-active "$SVC" 2>/dev/null)" = active ]; then
-  lp=$(pgrep -xo Runner.Listener 2>/dev/null); la=""; [ -n "$lp" ] && la=$(ps -o etimes= -p "$lp" 2>/dev/null | tr -dc 0-9)
+  # 只看 runner 用户名下的：同机的轻任务实例也有一个 Runner.Listener，不分用户会被它盖住
+  lp=$(pgrep -xo -u "$RUNNER_USER" Runner.Listener 2>/dev/null); la=""; [ -n "$lp" ] && la=$(ps -o etimes= -p "$lp" 2>/dev/null | tr -dc 0-9)
   if [ -z "$la" ]; then no "runner 服务是 active，但没有 Runner.Listener 进程，这台没在接 job。journalctl -u $SVC 看原因（09 章 A23）"
   elif [ "$la" -lt 60 ]; then sk "Runner.Listener 刚启动 ${la} 秒。刚重启过服务就正常；过一分钟再跑还是这样，说明它在反复崩溃（09 章 A23）"
   else ok "Runner.Listener 在跑（已运行 ${la} 秒）"; fi
 fi
-[ "$NSVC" -gt 1 ] && sk "本机有 $NSVC 个 runner 服务，本脚本只检查第一个（$SVC）。同机多实例的前提见 10 章 10.6"
+[ "$NSVC" -gt 1 ] && sk "本机有 $NSVC 个 runner 服务，本脚本只检查 $RUNNER_HOME 的那个（$SVC）。轻任务实例和同机多实例的前提见 10 章 10.6"
 
 hdr "runner 加固"
 if [ -n "$SVC" ]; then

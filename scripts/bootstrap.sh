@@ -44,7 +44,7 @@ set -euo pipefail
 #    有人哪天直接重跑 bootstrap.sh，清理钩子就换成默认标签（按标签清理全部落空）、
 #    孤儿端口清理被关掉、争抢告警归零，而且什么都不报错。
 CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
-PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_UID RUNNER_HOME RUNNER_MEM_MAX RUNNER_OOM_ADJ BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_PER_RUN_IMAGE_LABEL CI_TMP_GLOBS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB METADATA_IP"
+PERSIST_VARS="GH_REPO RUNNER_NAME RUNNER_LABELS RUNNER_USER RUNNER_UID RUNNER_HOME RUNNER_MEM_MAX RUNNER_OOM_ADJ BUILDKIT_RESERVED BUILDKIT_MAX_USED BUILDKIT_MIN_FREE CI_LABEL CI_APP_PORTS CI_PER_RUN_IMAGE_LABEL CI_TMP_GLOBS CI_FIXEDWORK_BASELINE CI_DISK_WARN_MB CI_DISK_CRIT_MB METADATA_IP LIGHT_SVC"
 if [ -r "$CI_RUNNER_ENV" ]; then
   # 「显式传入」按变量是否设置过判断（${!k+x}），所以 CI_APP_PORTS= 这样的空值也能覆盖文件里的值
   while IFS= read -r line || [ -n "$line" ]; do
@@ -84,6 +84,9 @@ CI_PER_RUN_IMAGE_LABEL="${CI_PER_RUN_IMAGE_LABEL:-}"   # 每次运行用唯一 t
 CI_TMP_GLOBS="${CI_TMP_GLOBS:-}"          # 项目工具在 /tmp 下建的临时目录，空格分隔的模式。例：myproj-scratch-*
 CI_FIXEDWORK_BASELINE="${CI_FIXEDWORK_BASELINE:-0}"   # preflight --with-load 给的 p50；0 = 只记录不告警
 METADATA_IP="${METADATA_IP:-169.254.169.254}"
+# 同机轻任务实例的服务名（10 章 10.6）。这一行由 add-light-runner.sh 写进 /etc/ci-runner.env，ci-health.sh 读到才查轻实例。
+# bootstrap 不装轻实例，这里只负责重跑时把它原样写回去：下面是整个文件重写，不带上就丢了。
+LIGHT_SVC="${LIGHT_SVC:-}"
 APT_LOCK_WAIT="${APT_LOCK_WAIT:-600}"     # apt/dpkg 锁被占用时最多等几秒（新机器刚开机时常见）
 # 磁盘告警阈值从 BuildKit 的 Min Free 推出来。缓存长到 Max Used 就停（参考机上此时可用约 23 GiB，
 # 那是设计稳态，不该告警）；可用空间被 Docker 以外的增长挤到 Min Free 附近时，GC 开始为保底而驱逐缓存，
@@ -367,8 +370,12 @@ if [ "$SKIP_RUNNER" = 0 ]; then
   # 原来在这里就 start：新注册的 runner 一上线就去接排队的 job，第 6 步紧接着 restart 会把它打断；
   # 而且钩子要到第 7 步才写进 .env，runner 只在启动时读 .env，那一轮跑的 job 没有清理钩子（09 章 A17）。
   ( cd "$RUNNER_HOME" && ./svc.sh install "$RUNNER_USER" >/dev/null 2>&1 || true )
+  # 服务名先读 svc.sh 装服务时写在 RUNNER_HOME 下的 .service。同机加了轻任务实例以后 actions.runner.* 不止一个，
+  # 按名字排在第一个的是轻实例的（「-light」排在「.service」前面），取它的话下面的加固和 ci-health 都会套到轻实例上。
+  # 读不到才按列表取第一个。
+  [ -r "$RUNNER_HOME/.service" ] && SVC=$(head -1 "$RUNNER_HOME/.service" | tr -d '[:space:]')
   # --plain：不加的话，failed 状态的单元前面会多一列「●」，awk 取到的就是它
-  SVC=$(systemctl list-units --type=service --all --no-legend --plain 'actions.runner.*' 2>/dev/null | awk '{print $1}' | head -1)
+  [ -z "$SVC" ] && SVC=$(systemctl list-units --type=service --all --no-legend --plain 'actions.runner.*' 2>/dev/null | awk '{print $1}' | head -1)
   [ -z "$SVC" ] && SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)" 2>/dev/null || echo "")
   info "服务单元：${SVC:-<未找到>}"
   # config.sh 生成的 .credentials / .runner 是 0664（只有 RSA 私钥文件是 0600）。收紧到属主可读写。

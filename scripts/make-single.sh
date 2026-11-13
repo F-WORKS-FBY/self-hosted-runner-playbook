@@ -117,11 +117,14 @@ cat <<'TAIL'
 | `scripts/verify.sh` | 装完或重启后自检，输出 PASS / FAIL 表。会试跑一次清理钩子，有 job 在跑时这一项自动跳过 |
 | `scripts/ci-cleanup.sh` | 清理钩子，由 bootstrap 装到 runner 的 `hooks/` 目录 |
 | `scripts/ci-health.sh` | 每小时健康采点，由 bootstrap 装到 `/usr/local/bin/` |
+| `scripts/add-light-runner.sh` | 在已装好的机器上再加一个只接小任务的轻实例：单独的用户、不进 docker 组、不挂清理钩子（10 章 10.6）。可以重复跑，已注册就不再注册 |
+| `scripts/deploy-cleanup-hook.sh` | 只把清理钩子换成仓库里的新版，不重跑 bootstrap：确认现行那份没被手改，试跑通过才替换（08 章 8.7） |
+| `scripts/deploy-ci-health.sh` | 只把 `ci-health.sh` 换成仓库里的新版，不重跑 bootstrap：确认现行那份没被手改，查语法、试跑、备份后替换（08 章 8.7） |
 | `scripts/ssh-guard.sh` | SSH 加固的安全网：一条 SSH 会话都不剩时才回滚配置（04 章 4.6） |
 | `scripts/tests/ci-health-notify.sh` | ci-health 推送卡片的用例：桩加本地假 webhook，不要 root、不联网 |
 | `scripts/analysis/` | 调研期的测量工具：连通性采样、排队仿真、单步资源画像、整机内存采样 |
 
-现在的脚本一台机器只装一个 runner 实例。同机多实例的前提见 10 章 10.6。
+跑完整检查的 runner 实例一台机器只装一个，同机多个的前提见 10 章 10.6；只接小任务的轻实例可以另加，也在 10.6。
 
 ## 附：脚本验证到什么程度
 

@@ -47,6 +47,15 @@
 #     才知道多严重、先做什么。现在标题带级别和最严重那条，每条拆成情况、影响、先做什么、去哪看，
 #     CRIT 红、WARN 橙、恢复绿，章节号换成手册链接（08 章 8.2「监控要点」）。卡片里要人跑 verify.sh 时
 #     写出这台上手册仓库的完整路径，路径由 bootstrap 渲染进来。本机日志和 journal 里仍是单行文本。
+#
+# 2026-11-13 补的一条：
+#
+#  ⑩ 认同机的轻任务实例（scripts/add-light-runner.sh 装的，10 章 10.6）。PR 的预检、描述检查这类小任务都在它上面跑，
+#     它不接任务，所有 PR 都卡在预检。/etc/ci-runner.env 里有 LIGHT_SVC= 才查：服务是不是 active、它的
+#     Runner.Listener 在不在，不正常报一条 CRIT；采样行多记 light=、light_listener=、light_mem_peak=。
+#     没有这一行的机器，采样行和告警都和原来一样。
+#     同机有两个实例就有两个 Runner.Listener，所以 listener 按服务单元的用户（User=）分开查：
+#     不分的话，一个实例的 listener 崩了，会被另一个实例的盖住。
 set -uo pipefail
 LOG="${CI_HEALTH_LOG:-/var/log/ci-health.log}"
 SVC="__RUNNER_SVC__"                      # 由 bootstrap.sh 替换；--skip-runner 装的机器上是 none
@@ -62,10 +71,12 @@ CI_RUNNER_ENV="${CI_RUNNER_ENV:-/etc/ci-runner.env}"
 if [ -r "$CI_RUNNER_ENV" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
     line=${line%$'\r'}; k=${line%%=*}; v=${line#*=}
-    case "$k" in RUNNER_HOME|CI_FIXEDWORK_BASELINE|CI_DISK_WARN_MB|CI_DISK_CRIT_MB) [ -z "${!k+x}" ] && printf -v "$k" '%s' "$v" ;; esac
+    case "$k" in RUNNER_HOME|CI_FIXEDWORK_BASELINE|CI_DISK_WARN_MB|CI_DISK_CRIT_MB|LIGHT_SVC) [ -z "${!k+x}" ] && printf -v "$k" '%s' "$v" ;; esac
   done < "$CI_RUNNER_ENV"
 fi
 RUNNER_HOME="${RUNNER_HOME:-/opt/actions-runner}"
+# 同机轻任务实例的服务名，由 add-light-runner.sh 写进 /etc/ci-runner.env；没装就是空，下面带 light 的都不做
+LIGHT_SVC="${LIGHT_SVC:-}"; [ "$LIGHT_SVC" = none ] && LIGHT_SVC=""
 BASELINE_S="${CI_FIXEDWORK_BASELINE:-0}"  # preflight 给的 p50；为 0 则只记录不告警
 WARN_MB="${CI_DISK_WARN_MB:-21504}"       # bootstrap 按 BUILDKIT_MIN_FREE + 1 GiB 写进 cron.d 和 /etc/ci-runner.env
 CRIT_MB="${CI_DISK_CRIT_MB:-10240}"
@@ -74,6 +85,10 @@ STATE_DIR="${CI_HEALTH_STATE_DIR:-/var/lib/ci-health}"
 CFG_ERR=""
 case "$WARN_MB" in ''|*[!0-9]*) CFG_ERR+=" CI_DISK_WARN_MB=$WARN_MB"; WARN_MB=21504 ;; esac
 case "$CRIT_MB" in ''|*[!0-9]*) CFG_ERR+=" CI_DISK_CRIT_MB=$CRIT_MB"; CRIT_MB=10240 ;; esac
+
+# workflow 里给小任务选 runner 的仓库变量名（10 章 10.6）。轻任务实例的告警里写「删掉它，小任务回到托管机上跑」；
+# 你的 workflow 用的是别的名字就改这里。
+LIGHT_VAR="CI_CONTROL_RUNNER"
 
 # 凭据与推送地址单独放一个 0600 的文件，不写进 /etc/cron.d/（那是 0644，全局可读）。
 #   GH_REPO=owner/repo
@@ -129,22 +144,36 @@ tmpm=$(du -sxBM /tmp 2>/dev/null | cut -f1 | tr -dc 0-9)
 used=$(df --output=used -BM / 2>/dev/null | tail -1 | tr -dc 0-9)
 vol=$(du -sBM /var/lib/docker/volumes 2>/dev/null | cut -f1 | tr -dc 0-9)
 run="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && run=$(systemctl is-active "$SVC" 2>/dev/null)
-# listener 进程活了多少秒；不在就输出空。按进程名精确匹配（-x），取最老的那个（-o）
-listener_age(){ local p; p=$(pgrep -xo Runner.Listener 2>/dev/null) || return 0; ps -o etimes= -p "$p" 2>/dev/null | tr -dc 0-9; }
+# 服务单元的系统用户（User=）。同机有轻任务实例时两个实例各有一个 Runner.Listener，靠用户分开
+svc_user(){ systemctl show "$1" -p User --value 2>/dev/null | head -1 | tr -dc 'A-Za-z0-9_.-'; }
+light="n/a"; light_user=""
+if [ -n "$LIGHT_SVC" ]; then light=$(systemctl is-active "$LIGHT_SVC" 2>/dev/null); light_user=$(svc_user "$LIGHT_SVC"); fi
+# listener 进程活了多少秒；不在就输出空。按进程名精确匹配（-x），取最老的那个（-o）。
+# $1 是用户：只看这个用户名下的；空着就不分用户（服务单元读不到 User= 时，和只有一个实例的机器上一样）
+listener_age(){ local p; p=$(pgrep -xo ${1:+-u "$1"} Runner.Listener 2>/dev/null) || return 0; ps -o etimes= -p "$p" 2>/dev/null | tr -dc 0-9; }
+listener_state(){ if [ -z "$1" ]; then echo none; elif [ "$1" -lt 60 ]; then echo "restarting(${1}s)"; else echo "${1}s"; fi; }
 # 不在、或者活了不到 60 秒时隔一会儿再看一次：刚重启服务、runner 自更新时第一次会不正常，再看就好了；
-# 反复崩溃时（参考项目上是几秒一次）两次都不正常。只有不正常时才多等这一下。
-listener="n/a"
+# 反复崩溃时（参考项目上是几秒一次）两次都不正常。只有不正常时才多等这一下，两个实例都不正常也只等一次。
+listener="n/a"; light_listener="n/a"; la=""; lla=""; ru=""; lu=""; la_bad=0; lla_bad=0
 if [ "$run" = active ]; then
-  la=$(listener_age)
-  if [ "${la:-0}" -lt 60 ]; then sleep "${CI_HEALTH_LISTENER_WAIT:-90}"; la=$(listener_age); fi
-  if [ -z "$la" ]; then listener=none; elif [ "$la" -lt 60 ]; then listener="restarting(${la}s)"; else listener="${la}s"; fi
+  ru=$(svc_user "$SVC"); la=$(listener_age "$ru"); [ "${la:-0}" -lt 60 ] && la_bad=1
 fi
+# 轻实例的 listener 只在读得到它的用户、又和重实例不是同一个用户时查：分不开的话，查到的可能是重实例的那个
+if [ "$light" = active ]; then
+  lu=$light_user; [ "$lu" = "$ru" ] && lu=""
+  if [ -n "$lu" ]; then lla=$(listener_age "$lu"); [ "${lla:-0}" -lt 60 ] && lla_bad=1; fi
+fi
+if [ $((la_bad + lla_bad)) -gt 0 ]; then
+  sleep "${CI_HEALTH_LISTENER_WAIT:-90}"
+  [ "$la_bad" = 1 ] && la=$(listener_age "$ru")
+  [ "$lla_bad" = 1 ] && lla=$(listener_age "$lu")
+fi
+[ "$run" = active ] && listener=$(listener_state "$la")
+[ -n "$lu" ] && light_listener=$(listener_state "$lla")
 # 内存只记录不告警：runner cgroup 自上次启动以来的峰值（含页缓存，比进程实际占用高），以及整机可用内存
-mem_peak="n/a"
-if [ "$SVC" != "none" ] && [ -n "$SVC" ]; then
-  p=$(systemctl show "$SVC" -p MemoryPeak --value 2>/dev/null)
-  case "$p" in ''|*[!0-9]*) ;; *) mem_peak="$((p / 1048576))M" ;; esac
-fi
+svc_mem_peak(){ local p; p=$(systemctl show "$1" -p MemoryPeak --value 2>/dev/null); case "$p" in ''|*[!0-9]*) echo "n/a" ;; *) echo "$((p / 1048576))M" ;; esac; }
+mem_peak="n/a"; [ "$SVC" != "none" ] && [ -n "$SVC" ] && mem_peak=$(svc_mem_peak "$SVC")
+light_mem_peak="n/a"; [ -n "$LIGHT_SVC" ] && light_mem_peak=$(svc_mem_peak "$LIGHT_SVC")
 mem_avail="$(awk '/^MemAvailable:/{printf "%dM", $2/1024}' /proc/meminfo 2>/dev/null)"
 
 # 可用空间落在 WARN 和 CRIT 之间、又正好有 job 在跑时，等到本机没有 job 的那一刻再量一次，WARN 以那次为准。
@@ -252,7 +281,9 @@ case "$jobs" in
 esac
 
 fw=${t:+${t}s}; fw=${fw:-n/a}   # 有秒数写「2.100s」，没跑出结果写「n/a」
-echo "$(date -Is) fixedwork=${fw} root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}" >> "$LOG"
+# 装了轻任务实例的机器，采样行末尾多三项；没装的不写，和原来逐字相同
+light_kv=""; [ -n "$LIGHT_SVC" ] && light_kv=" light=${light} light_listener=${light_listener} light_mem_peak=${light_mem_peak}"
+echo "$(date -Is) fixedwork=${fw} root_avail=${avail}M containerd=${ctr}M volumes=${vol}M runner=${run} jobs=${jobs} mem_peak=${mem_peak} mem_avail=${mem_avail} tmp=${tmpm}M listener=${listener} avail_between_jobs=${avail_idle:-n/a}${light_kv}" >> "$LOG"
 # 定长任务没跑出结果时另记一行原因：采样行里只有 fixedwork=n/a
 [ -n "$t" ] || echo "$(date -Is) WARN 定长任务没跑出结果（${t_why}），这一小时不判 vCPU 争抢" >> "$LOG"
 
@@ -305,6 +336,22 @@ case "$listener" in
   restarting*) warn listener "CRIT runner 服务是 active，但 Runner.Listener 两次查看都是刚启动（${listener#restarting}），在反复崩溃重启，这台实际没在接 job。先看 journalctl -u $SVC 最后几行，常见原因是根分区满了（09 章 A23）" \
           mode=restarting wait="${CI_HEALTH_LISTENER_WAIT:-90}" age="${listener//[!0-9]/}" svc="$SVC" ;;
 esac
+# 轻任务实例没在接任务：服务不是 active、listener 不在、listener 反复崩溃，都归到 light 这一条。
+# 小任务排在它后面，别的机器上也没有轻任务实例在接时，所有 PR 都卡在预检；退路是删掉 workflow 给小任务选 runner 的仓库变量。
+if [ -n "$LIGHT_SVC" ]; then
+  light_do="PR 的预检、描述检查会排队。先看 journalctl -u $LIGHT_SVC 最后几行，再 systemctl restart $LIGHT_SVC；别的机器上的轻任务 runner 也没在接、一时又修不好，就删掉仓库变量 $LIGHT_VAR，小任务回到 GitHub 托管机上跑（10 章 10.6）"
+  if [ "$light" != active ]; then
+    warn light "CRIT 轻任务 runner 服务不是 active（当前 $light），这台的轻任务 runner 没在接任务。${light_do}" \
+      mode=inactive state="$light" lsvc="$LIGHT_SVC" user="$light_user"
+  else
+    case "$light_listener" in
+      none) warn light "CRIT 轻任务 runner 服务是 active，但隔了一会儿再看，它的 Runner.Listener 进程（用户 $lu）还是不在，这台的轻任务 runner 没在接任务。${light_do}" \
+              mode=none wait="${CI_HEALTH_LISTENER_WAIT:-90}" lsvc="$LIGHT_SVC" user="$lu" ;;
+      restarting*) warn light "CRIT 轻任务 runner 服务是 active，但它的 Runner.Listener 进程（用户 $lu）两次查看都是刚启动（${light_listener#restarting}），在反复崩溃重启，这台的轻任务 runner 没在接任务。${light_do}" \
+              mode=restarting wait="${CI_HEALTH_LISTENER_WAIT:-90}" age="${light_listener//[!0-9]/}" lsvc="$LIGHT_SVC" user="$lu" ;;
+    esac
+  fi
+fi
 # 产出告警：服务 active 但 job 连红，正是 2026-09-07 那种「假绿」的唯一信号
 case "$jobs" in
   streak=[3-9]|streak=[0-9][0-9]*)
@@ -336,7 +383,7 @@ notify(){   # notify alert|recover <文本消息>：文本消息只在卡片发�
   resp=$(CARD_KIND="$1" CARD_TEXT="$2" CARD_ALERTS="$(printf '%s\n' "${FACTS[@]+"${FACTS[@]}"}")" \
     CARD_PREV="$prev" CARD_RUNNER="$rn" CARD_HOST="$hn" CARD_SVC="$SVC" CARD_REPO="${GH_REPO:-}" \
     CARD_RUNNER_HOME="$RUNNER_HOME" CARD_VERIFY="$verify" CARD_UNSEEN="$unseen_kv" \
-    CARD_LOG="$LOG" CARD_ENV="$CI_HEALTH_ENV" CARD_DOC="$DOC_URL" \
+    CARD_LOG="$LOG" CARD_ENV="$CI_HEALTH_ENV" CARD_DOC="$DOC_URL" CARD_LIGHT_SVC="$LIGHT_SVC" CARD_LIGHT_VAR="$LIGHT_VAR" \
     CI_ALERT_WEBHOOK="$CI_ALERT_WEBHOOK" CI_ALERT_SECRET="${CI_ALERT_SECRET:-}" python3 - <<'PY' 2>&1
 import base64, hashlib, hmac, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 
@@ -378,6 +425,7 @@ KIND, TEXT = E.get("CARD_KIND", "alert"), E.get("CARD_TEXT", "")
 RUNNER, HOST = plain(E.get("CARD_RUNNER")), plain(E.get("CARD_HOST"))
 SVC, REPO, RUNNER_HOME = E.get("CARD_SVC", ""), E.get("CARD_REPO", ""), E.get("CARD_RUNNER_HOME", "")
 LOG, ENVF = E.get("CARD_LOG", ""), E.get("CARD_ENV", "")
+LIGHT_SVC, LIGHT_VAR = E.get("CARD_LIGHT_SVC", ""), E.get("CARD_LIGHT_VAR", "") or "CI_CONTROL_RUNNER"
 DOC = E.get("CARD_DOC", "").rstrip("/")
 PREV = (E.get("CARD_PREV") or "").split()
 VERIFY = E.get("CARD_VERIFY", "")
@@ -407,15 +455,16 @@ L_HOOK = doc("为什么要实跑一次钩子", "07-验证.md", "为什么要实�
 L_MON = doc("监控要点", "08-运维与容量.md", "监控要点")
 L_TOKEN = doc("job 采样为什么只给只读 token", "09-踩坑记录.md", "b12-把管理员-token-落在了-ci-机上2026-09-14-修-a11-时引入")
 L_UPDATE = doc("更新已部署的机器", "08-运维与容量.md", "更新已部署的机器")
+L_LIGHT = doc("只接小任务的轻实例", "10-按机器规格定参数.md", "只接小任务的轻实例")
 LOG_LINE = "这台的采样记录：" + code("tail -20 " + LOG)
 JOBS_BACK = "`jobs=` 变回 `streak=数字` 就好了：" + code("grep -o 'jobs=[^ ]*' %s | tail -3" % LOG)
 FIXED_BACK = "`fixedwork=` 变回秒数就好了：" + code("grep -o 'fixedwork=[^ ]*' %s | tail -3" % LOG)
 
 NAMES = {"contention": "CPU 变慢", "disk_crit": "根分区快满了", "disk_warn": "根分区可用空间偏低",
          "config": "磁盘阈值配置无效", "runner": "runner 服务没在运行", "listener": "runner 没在接 job",
-         "streak": "本机 job 连续失败", "jobsprobe": "读不到本机 job 结果"}
+         "light": "轻任务 runner 没在接任务", "streak": "本机 job 连续失败", "jobsprobe": "读不到本机 job 结果"}
 LEVELS = {"contention": "WARN", "disk_crit": "CRIT", "disk_warn": "WARN", "config": "WARN",
-          "runner": "CRIT", "listener": "CRIT", "streak": "CRIT", "jobsprobe": "WARN"}
+          "runner": "CRIT", "listener": "CRIT", "light": "CRIT", "streak": "CRIT", "jobsprobe": "WARN"}
 # 这几条在另一条出现时量不到：上次在报、这次没报，不能算消除。写在那一条的情况里
 BLOCKED_BY = {"streak": ("jobsprobe", ""), "listener": ("runner", "服务不是 active 时不查这一项")}
 def label(key):   # 「WARN 根分区可用空间偏低」：恢复、已消除、看不到了里用
@@ -512,6 +561,34 @@ def t_listener(f):
                "处理完再%s，要有一行 `Runner.Listener 在跑`" % VERIFY_RUN],
         links=[L_LISTENER])
 
+def t_light(f):   # 同机的轻任务实例：PR 的预检、描述检查这类小任务在它上面跑
+    svc, user, wait, mode = f.get("lsvc") or LIGHT_SVC or "?", f.get("user") or "", num(f.get("wait")), f.get("mode")
+    who = "（用户 %s）" % code(user) if user else ""
+    if mode == "restarting":
+        detail = ["它的服务是 active，但接任务的 `Runner.Listener` 进程%s在反复崩溃重启" % who,
+                  "隔 %s 秒看了两次，都是刚启动（第二次 %s 秒）" % (wait, num(f.get("age")))]
+    elif mode == "none":
+        detail = ["它的服务是 active，但接任务的 `Runner.Listener` 进程%s不在" % who, "隔 %s 秒再看还是不在" % wait]
+    else:
+        detail = ["它的服务当前是 %s，不是 active" % code(f.get("state"))]
+    var = code(LIGHT_VAR)
+    if f.get("_recover"):   # 恢复卡：服务已经回来了，只剩把删过的变量加回去
+        pre, steps = "", ["告警期间删过仓库变量 %s 的话，现在按原来的值加回来，小任务才回到自建机上跑" % var]
+    else:
+        # 核对 listener 的命令要带轻实例的用户：不带的话，查到的可能是同机重实例的那个
+        listening = "、%s 有输出" % code("pgrep -x -u %s Runner.Listener" % user) if user else ""
+        pre, steps = ROOT_PRE, [
+            "%s 看最后几行" % code("journalctl -u %s -n 50" % svc),
+            "%s，过一分钟 %s 是 active%s就好了" % (
+                code("systemctl restart %s" % svc), code("systemctl is-active %s" % svc), listening),
+            "退路，不用登机：别的机器上的轻任务 runner 也没在接、一时又修不好时，在 GitHub 仓库 "
+            "Settings → Secrets and variables → Actions → Variables 里删掉 %s（先记下它的值），"
+            "这些小任务就回到 GitHub 托管机上跑；修好后按原值加回来" % var]
+    return dict(
+        facts=["这台机器上的轻任务 runner 没在接任务"] + detail,
+        impact="PR 的预检、描述检查这类小任务会排队：别的机器上的轻任务 runner 还在接，就只是慢一些；都没在接，就一直排着，PR 过不了预检",
+        pre=pre, steps=steps, links=[L_LIGHT])
+
 def t_streak(f):
     repo, links = f.get("repo") or REPO, []
     if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
@@ -573,7 +650,7 @@ def t_unseen(key, why):   # 上次报过、这次量不到的一条，没有别�
                 pre=ROOT_PRE, steps=steps, links=links)
 
 TEMPLATES = {"contention": t_contention, "disk_crit": t_disk_crit, "disk_warn": t_disk_warn, "config": t_config,
-             "runner": t_runner, "listener": t_listener, "streak": t_streak, "jobsprobe": t_jobsprobe}
+             "runner": t_runner, "listener": t_listener, "light": t_light, "streak": t_streak, "jobsprobe": t_jobsprobe}
 def items(key, f):
     t = TEMPLATES.get(key)
     return t(f) if t else dict(facts=[txt(f.get("text") or key)], impact="", steps=[], links=[])

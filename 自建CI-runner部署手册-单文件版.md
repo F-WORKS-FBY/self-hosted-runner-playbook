@@ -635,6 +635,15 @@ bin/RunnerService.js:  "Runner listener exit with 0 return code, stop the servic
 /etc/ci-health.env            监控用的只读 token 和告警地址（0600）
 ```
 
+同机另加了只接小任务的轻实例（`scripts/add-light-runner.sh`，10 章 10.6）的机器，还多这几样：
+
+```text
+/opt/actions-runner-light/    轻实例的 runner 本体和工作区，属于单独的用户 runner-light（不在 docker 组里）
+├── .env                      只有一行 LANG，不挂清理钩子
+└── .runner .credentials*     轻实例自己的注册信息，同样别备份、别进快照
+/etc/ci-runner.env            多一行 LIGHT_SVC=<轻实例的服务名>，ci-health.sh 读到才查轻实例
+```
+
 注意：`.runner` 和 `.credentials*` 是注册信息，不要备份，也不要放进快照。`.credentials` 和 `.credentials_rsaparams` 里是这台 runner 的身份凭据（含 RSA 私钥）：拿到这两个文件的人可以冒充这台 runner 去领 job，而 job 能读到仓库的 secrets；把快照恢复到另一台机器上，还会出现两台机器用同一个身份抢 job 的情况。
 
 `/etc/ci-runner.env` 也不要跟着快照或拷贝走。它存着 `RUNNER_NAME`，用快照克隆或拷文件做出第二台时，新机器会带着同一个名字去注册。bootstrap 查到同名会停下（3.4），但加了 `FORCE_REPLACE=1` 或者手工注册时，第一台的注册就被顶掉了。新机器照 3.0 从头装，参数重新定。
@@ -2022,7 +2031,7 @@ bash scripts/verify.sh
 
 本章讲上线之后的长期工作：怎么估算排队和容量、磁盘和 CPU 怎么监控、构建缓存怎么优化、什么时候该扩容、日常和每月的巡检步骤，以及有多台机器时怎么加、怎么撤、怎么更新。一台机器该跑几个实例、参数按规格怎么取，见 10 章。
 
-本章的 N 指整个仓库的 runner 实例总数，k 指一台机器上的实例数。现有脚本每台机器只装一个实例，所以眼下 N 就是机器台数。
+本章的 N 指整个仓库的 runner 实例总数，k 指一台机器上的实例数。现有脚本每台机器只装一个跑完整检查的实例，所以眼下 N 就是机器台数。同机另加的只接小任务的轻实例（10 章 10.6）不算在 N 和 k 里。
 
 ### 8.1 容量：用仿真，别套公式
 
@@ -2171,7 +2180,12 @@ Min Free 是另一条线。只有在盘更小、或者 Docker 以外的增长把
   - 卡片拼不出来、超过 19000 字节，或者飞书以卡片格式不对拒收（返回码 11246、9499）时，改发原来的文本消息，并在 `ci-health.log` 记一行。被限流（11232）等 5 秒重发一次。其余失败只记日志，下一小时重推。日志里的推送结果不带推送地址和密钥，地址写错时也一样。
   - 卡片的用例在 `scripts/tests/ci-health-notify.sh`，不要 root、不联网，改了文案或推送逻辑要跑一遍。
 - 失败连续计数只看落在本机上的 job，按本机的 runner 名匹配。按整个 run 的结论统计会有两种误报：GitHub 托管的检查（PR 标题之类）失败会被算进来；多台机器共用一套标签时，同一个 run 的 job 会分到几台机器上，别的机器上的 job 红了，这台也会报连续失败。读不到本机的 runner 名时，这一项报采样失败，不会退回去统计全仓库；用 `--skip-runner` 装、还没注册的机器上，这一项跳过。被取消的 run 整个不算：新推送顶掉旧 run 时，写了 `if: always()` 的汇总 job 会因为前面的 job 被取消而判失败，不跳过的话 PR 推得勤时很快就凑满 3 次（09 章 B11）。
-- runner 服务是 active，不代表它在接 job。listener 崩了由 `runsvc.sh` 在里面重新拉起，systemd 看不到。ci-health 另看 `Runner.Listener` 进程，不在或者一直是刚启动就报 CRIT（09 章 A23）。
+- runner 服务是 active，不代表它在接 job。listener 崩了由 `runsvc.sh` 在里面重新拉起，systemd 看不到。ci-health 另看 `Runner.Listener` 进程，不在或者一直是刚启动就报 CRIT（09 章 A23）。同机有轻实例时两个实例各有一个 `Runner.Listener`，ci-health 按服务单元的用户分开看，一个崩了不会被另一个盖住。
+- 同机装了轻实例（10 章 10.6）时，ci-health 多查它在不在接任务：服务是不是 active、它的 `Runner.Listener` 在不在。PR 的预检、描述检查都在它上面跑，它不接任务，这些小任务就排队。
+  - 不正常报 CRIT「轻任务 runner 没在接任务」。卡片写明影响、先做什么（看 `journalctl -u <轻实例的服务>`，再 `systemctl restart <轻实例的服务>`）和退路：别的机器上的轻实例也没在接、一时又修不好时，删掉给小任务选 runner 的仓库变量，小任务回到 GitHub 托管机上跑。恢复卡提醒把删过的变量加回来。
+  - 变量名写在 `ci-health.sh` 的 `LIGHT_VAR`，默认是参考项目用的 `CI_CONTROL_RUNNER`，你的 workflow 用别的名字就改它。
+  - 采样行末尾多记三项：`light=`（服务状态）、`light_listener=`（listener 活了多少秒）、`light_mem_peak=`（内存峰值，怎么读见 10 章 10.7）。
+  - 轻实例的服务名从 `/etc/ci-runner.env` 的 `LIGHT_SVC=` 读，由 `add-light-runner.sh` 登记。没有这一行的机器不查，采样行和告警都不变。
 - 除了水位，也要看增量。日增超过预期两倍时，检查是不是哪个构建的层序坏了。
 
 > 注意：开发工具（VS Code 远程服务端、Claude Code、Codex 等）在 CI 机上同时占磁盘和内存。磁盘方面，VS Code 远程服务端每次客户端升级就多留一份，参考机上一份约 650 MB，一个月攒了 5 份，要在每月巡检时删（8.6）。内存方面后果更重，参考项目在 8 GB 的 CI 机上开发了两天，出了 11 次全局 OOM。最好不在 CI 机上开发；一定要开发，按 04 章 4.8 配置。
@@ -2259,13 +2273,13 @@ ARG APP_FILTER          # 需要的话放到 install 之后
 
 资源够了也不能马上在一台机器上跑多个实例。参考项目的 workflow 给服务容器发布了固定的宿主端口，清理钩子也是按一台机器一个 job 写的，两个实例同时跑会抢端口。钩子现在发现本机有别的 job 就整段跳过，不会误删，但清理基本不再执行；去掉这道守卫，又会删掉对方的容器、杀掉对方的进程。要等 workflow 不再发布固定宿主端口、钩子只清自己这个 job 的资源、脚本能按实例分别安装之后，才能换一台大机器跑 k 个实例。完整的前提和扩容路线见 10 章 10.6。
 
-还有一个折中做法：第二个实例打独立的标签，只接秒级、不用数据库、不跑 docker build 的轻 job。它省的只是 CPU 和内存，端口、钩子和按实例安装这几条照样要先满足。
+有一种同机的第二个实例现在就能装：只接小任务的轻实例。它打独立的标签，只接几十秒到几分钟、不起容器、不占宿主端口的 job（预检、PR 描述检查、纯文档 PR 的检查），用单独的系统用户，不挂清理钩子，所以不用等上面那几条。它解决的是小任务排在重检查后面，不增加重检查的并发。装法、回退和要盯的数见 10 章 10.6「只接小任务的轻实例」。
 
 参考项目现在选的是两台 4 核 8 GB 的机器，每台一个实例。等 workflow 和钩子按 10.6 改完，再考虑换成一台大机器跑多个实例。
 
 ### 8.6 日常巡检
 
-日常巡检用下面四条命令；另有几项工作每月做一次。有多台机器时每台各做一遍。
+日常巡检用下面四条命令；另有几项工作每月做一次。有多台机器时每台各做一遍。装了轻实例的机器，采样行末尾还有 `light=` 开头的三项；verify.sh 只查跑完整检查的那个实例，轻实例用 `systemctl is-active <轻实例的服务>` 另看。
 
 ```bash
 bash scripts/verify.sh                    # 全面自检（有 job 在跑时部分项会 SKIP，空闲时再跑拿完整结果）
@@ -2280,7 +2294,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 
 1. 重启机器。
    - 原因：needrestart 已经豁免了 runner（4.2 节），安全更新装上了，但 runner 还在用旧库；内核更新更是必须重启才生效。参考机上线 5 周没重启过，期间来过 3 个新内核（自动只保留最新一个）和一次 libc6，全都没生效。
-   - 做法：先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job。`live-restore` 与 `Restart=always` 会让一切自己恢复。有多台机器时一次只重启一台，这台回来、`verify.sh` 通过、GitHub 上显示 online 之后再动下一台（8.7）。
+   - 做法：先 `systemctl stop <runner 服务>` 再重启，免得刚好接到一个 job；装了轻实例的，它的服务也一起停。`live-restore` 与 `Restart=always` 会让一切自己恢复。有多台机器时一次只重启一台，这台回来、`verify.sh` 通过、GitHub 上显示 online 之后再动下一台（8.7）。
    - 确认：恢复后跑 `verify.sh`，再看一眼 `lscpu` 的 CPU 型号。有的云上关机再开或者被厂商迁移后会换宿主机，型号变了按 10 章 10.7 重测。
    - 旧内核不用手动删。Ubuntu 会把重启前在用的那个内核保留作回退，`apt autoremove` 这时不会删它，等下次装新内核时才会标记为可删除。参考机 2026-10-16 重启后就是这样。
 2. 退役旧镜像。workflow 换了 pin 之后，旧版本不会被自动删除（钩子只删悬空的和打了 CI 标签的）：
@@ -2294,7 +2308,7 @@ systemctl list-timers | grep ci-          # 清理与监控 timer 还活着吗
 
 ### 8.7 多台机器
 
-几台机器注册同一套标签时，GitHub 会把排队的 job 派给空闲的那台，workflow 和 `CI_RUNNER` 变量都不用改。每台机器各装各的，参数按各自的规格定。现有脚本每台只装一个实例，一台机器跑多个实例的前提见 10 章 10.6。
+几台机器注册同一套标签时，GitHub 会把排队的 job 派给空闲的那台，workflow 和 `CI_RUNNER` 变量都不用改。每台机器各装各的，参数按各自的规格定。现有脚本每台只装一个跑完整检查的实例，一台机器跑多个的前提见 10 章 10.6；只接小任务的轻实例可以另加，也在 10.6。
 
 #### 哪些必须不同，哪些必须相同
 
@@ -2340,7 +2354,7 @@ done | sort | uniq -c
 
 #### 重启和升级：一次只动一台
 
-等这台空闲（`pgrep -x Runner.Worker` 没有输出），`systemctl stop` 它的 runner 服务，再重启或升级。等它回来、`verify.sh` 通过、GitHub 上显示 online，再动下一台。动手前先确认别的机器在线，不然这段时间没有机器接 job。
+等这台空闲（`pgrep -x Runner.Worker` 没有输出），`systemctl stop` 它的 runner 服务，再重启或升级。等它回来、`verify.sh` 通过、GitHub 上显示 online，再动下一台。动手前先确认别的机器在线，不然这段时间没有机器接 job。装了轻实例的机器，两个服务都停，回来以后两个都要是 active；动手前别的机器上的轻实例也要在线，不然这段时间 PR 的预检没有机器接。
 
 #### 更新已部署的机器
 
@@ -2356,39 +2370,29 @@ bash <手册仓库目录>/scripts/verify.sh
 
 一定要先停 runner 服务。bootstrap 只在开头查一次有没有 job，跑的几分钟里接到的 job 会被它末尾的重启打断；daemon.json 有变化时，它还会重启 docker。脚本最后会重新启动 runner。
 
-也可以只换一个文件。清理钩子按 04 章 4.4 的做法换：先写到 `.new`，试跑通过再替换，同样先停 runner 服务。`ci-health.sh` 不影响正在跑的 job，不用停服务。它有两个占位符，bootstrap 渲染时换成这台的 runner 服务名和手册仓库目录：
+也可以只换一个文件，清理钩子和 `ci-health.sh` 各有一个脚本。两个脚本都先确认机器上现行那份等于上一版源文件的渲染结果，不相等说明机器上被人手改过，停下不换；确认了再渲染新版、检查、备份、替换。
+
+- `scripts/deploy-cleanup-hook.sh` 换清理钩子：按 `/etc/ci-runner.env` 里的参数渲染成 `.new`，以 runner 的调用方式（`bash -e`）试跑通过才替换（04 章 4.4）。有 job 在跑时它不换。
+- `scripts/deploy-ci-health.sh` 换 `ci-health.sh`。`ci-health.sh` 不影响正在跑的 job，不用停 runner 服务。它有两个占位符，runner 服务名和手册仓库目录，脚本沿用现行那份里的值，不重新探测：同机有轻实例时 `actions.runner.*` 单元不止一个，按名字取第一个会取到轻实例的。渲染后查 bash 和内嵌 python 的语法，再用不带推送地址和 token 的临时配置试跑一次，要有一行采样；登记了轻实例的机器，采样行里要有 `light=`。试跑要量一遍 containerd，所以有 job 在跑时不换；每小时第 13 分 cron 会跑 `ci-health.sh`，第 10～20 分不换，它正在跑时也不换。
+
+在手册仓库里执行，`<上一版的提交>` 是机器上现行那份所在的提交：
 
 ```bash
-cd <手册仓库目录>                       # 装机时跑 bootstrap.sh 的那个；目录名只能有字母、数字和 _./-
-git pull --ff-only
-SVC=$(grep -o '^SVC="[^"]*"' /usr/local/bin/ci-health.sh | cut -d'"' -f2)
-echo "SVC=$SVC"                         # 沿用已装那份的服务名，应是 actions.runner.….service
+scp scripts/ci-health.sh <机器>:/root/ci-health.src.sh
+git show <上一版的提交>:scripts/ci-health.sh | ssh <机器> 'cat > /root/ci-health.prev.sh'
+scp scripts/deploy-ci-health.sh <机器>:/root/ && ssh <机器> 'bash /root/deploy-ci-health.sh'
 ```
 
-`SVC` 是空的（已装那份太老，没有这一行），下面两行按 bootstrap 的取法再取一次；已经取到了，这两行不会动它。还是空的、或者是 `none` 而这台明明注册过，就停下来查：带着空的服务名渲染，runner、listener、连续失败三项检查会悄悄关掉，后面的比对照样显示一致。
+换清理钩子时把文件名换成 `ci-cleanup`、脚本换成 `deploy-cleanup-hook.sh`，其余一样。两个脚本最后一行都打印备份的路径，回退就是把备份拷回去。
 
-```bash
-[ -n "$SVC" ] || SVC=$(systemctl list-units --type=service --all --no-legend --plain 'actions.runner.*' | awk '{print $1}' | head -1)
-[ -n "$SVC" ] || SVC=$(basename "$(ls /etc/systemd/system/actions.runner.*.service 2>/dev/null | head -1)")
-echo "SVC=$SVC"
-```
-
-服务名对了，再渲染、查语法、换上，最后和仓库渲染出来的逐字节比对：
-
-```bash
-render(){ sed -e "s#__RUNNER_SVC__#$SVC#" -e "s#__PLAYBOOK_DIR__#$PWD#" scripts/ci-health.sh; }
-render > /usr/local/bin/ci-health.sh.new && chmod 0755 /usr/local/bin/ci-health.sh.new \
-  && bash -n /usr/local/bin/ci-health.sh.new && mv -f /usr/local/bin/ci-health.sh.new /usr/local/bin/ci-health.sh
-render | cmp - /usr/local/bin/ci-health.sh && echo 一致
-grep -c '__RUNNER_SVC__\|__PLAYBOOK_DIR__' /usr/local/bin/ci-health.sh   # 应是 0
-```
+`deploy-ci-health.sh` 开头打印它沿用的服务名。是 `none` 而这台明明注册过，就停下来查：带着 `none` 渲染，runner、listener、连续失败三项检查是关着的。现行那份太老、里面没有服务名那一行时脚本会停下。这两种情况都重跑 bootstrap 整体更新，它会重新渲染。
 
 换完下一个整点（第 13 分）自然会跑一次，不用手工跑；告警集合没变就不推送。
 
 #### 撤掉一台机器
 
 1. 如果这是最后一台自建机器，先按 06 章把 job 切回托管。
-2. 等它空闲，执行 `systemctl disable --now <runner 服务>`。job 会落到剩下的机器上，标签和变量都不用改。
+2. 等它空闲，执行 `systemctl disable --now <runner 服务>`。job 会落到剩下的机器上，标签和变量都不用改。装了轻实例的，它的服务也这样停掉；它是最后一个轻实例时，先删掉给小任务选 runner 的仓库变量，让小任务回到托管机上跑（10 章 10.6）。
 3. 删掉 `/etc/cron.d/ci-health`。不删的话，ci-health 每小时都会记一条「runner 服务不是 active」，配了推送的还会每 24 小时提醒一次。
 4. 停掉心跳 timer（`systemctl disable --now ci-heartbeat.timer`），再到心跳服务上删掉这台的检查，否则心跳服务会一直告警。
 5. 处理 GitHub 上的注册。撤掉的机器在列表里显示 offline，离线超过 14 天的注册 GitHub 会自动删掉。想马上删，在仓库的 Settings → Actions → Runners 里删，或者执行 `gh api -X DELETE repos/OWNER/REPO/actions/runners/<id>`（要 Administration 写权限）。
@@ -3276,10 +3280,12 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 
 ### 10.6 一台多实例的前提（扩容路线）
 
-现有脚本和参考项目的 workflow 都按每台机器一个实例写。一台机器上跑不了多个实例，原因有两个：
+现有脚本和参考项目的 workflow，跑完整检查的实例都按每台机器一个写。同一台机器上跑不了第二个这样的实例，原因有两个：
 
 - 参考项目的 workflow 给 services 容器和步骤里 `docker run` 起的容器发布了固定的宿主端口（127.0.0.1 上的 5433、6379、9000），e2e 在宿主上起的进程也用固定端口（3100、3101）。两个实例同时跑，后起的那个会撞端口（02 章 2.3）。
 - 清理钩子按一台机器一个 job 写。它删全部带 CI 标签的容器、对 `CI_APP_PORTS` 执行 `fuser -k`、执行不带过滤的 `docker volume prune`，这些都是整机范围的。为了不误伤别的 job，它发现本机有不止一个 job 在跑时就整段跳过（04 章 4.4）。所以多实例下它不会误删，但清理基本不跑。去掉这道守卫又不改清理范围，才会删掉另一个 job 的容器、杀掉它的进程。
+
+只接小任务、不起容器的实例不受这两条限制，现在就可以和它装在同一台机器上，见本节最后的「只接小任务的轻实例」。
 
 #### 前提
 
@@ -3296,10 +3302,10 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 
 | 文件 | 现状 | 多实例要改成 |
 |---|---|---|
-| `bootstrap.sh` | `RUNNER_NAME`、`RUNNER_HOME` 各只有一个；服务单元取第一个；钩子、`ci-cleanup.service`、`ci-health.sh` 都按一个实例渲染；`/etc/ci-runner.env` 只存一套参数 | 按实例循环注册、装服务、写 override 和 `.env`；参数按实例存 |
-| `ci-cleanup.sh` | 本机 job 数大于 1 就跳过；删全部带 CI 标签的容器；按端口 `fuser -k`；卷不带过滤 | 只删本实例或本 job 的容器；端口按实例分；卷按标签清 |
-| `ci-health.sh` | 只有一个服务名、一个 runner 名 | 逐个实例采 `mem_peak` 和服务状态；连续失败按本机所有实例的名字统计 |
-| `verify.sh` | 只查第一个服务单元，多于一个时打一行提示 | 逐个实例检查 |
+| `bootstrap.sh` | `RUNNER_NAME`、`RUNNER_HOME` 各只有一个；服务单元只认 `RUNNER_HOME` 下 `.service` 记的那一个；钩子、`ci-cleanup.service`、`ci-health.sh` 都按一个实例渲染；`/etc/ci-runner.env` 只存一套参数 | 按实例循环注册、装服务、写 override 和 `.env`；参数按实例存 |
+| `ci-cleanup.sh` | 本用户名下的 job 数大于 1 就跳过；删全部带 CI 标签的容器；按端口 `fuser -k`；卷不带过滤 | 只删本实例或本 job 的容器；端口按实例分；卷按标签清 |
+| `ci-health.sh` | 跑完整检查的实例只有一个服务名、一个 runner 名；轻实例另认一个服务名，只查它在不在接任务 | 逐个实例采 `mem_peak` 和服务状态；连续失败按本机所有实例的名字统计 |
+| `verify.sh` | 只查 `RUNNER_HOME` 的那个服务单元，多于一个时打一行提示 | 逐个实例检查 |
 | workflow | 端口固定 | 见前提第 1、2 条 |
 
 #### 加机器还是同机多实例
@@ -3328,6 +3334,69 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 - 做法：k 按 10.2 算。大机器的单核同样要先和现有机器比（02 章 2.7）。它可以和小机器混用，标签相同，GitHub 会把 job 派给空闲的实例。
 - 上线条件：按前提第 6 条做完并发实验再接真实 job。上线后出现随机红叉或 OOM，就把 k 降回 1，查清原因再加。
 
+#### 只接小任务的轻实例
+
+同一台机器上可以再装一个只接小任务的 runner 实例，下面叫轻实例；跑完整检查的那个叫重实例。它不用等上面的前提：它的 job 不起容器、不占宿主端口、不留下要清理的东西，和重实例的 job 撞不到一起。参考项目的两台机器各装了一个。
+
+为什么要它：预检、PR 描述检查、纯文档 PR 的检查，每个只要几十秒到几分钟。和重检查共用一个实例，它们要排在最长一小时的重检查后面；放到 GitHub 托管机上跑，又要花托管分钟。轻实例用自己的标签，和重实例各接各的。它解决的是小任务排队，不增加重检查的并发。
+
+和重实例的区别：
+
+| | 重实例 | 轻实例 |
+|---|---|---|
+| 用哪个脚本装 | `bootstrap.sh` | `scripts/add-light-runner.sh` |
+| 系统用户 | `runner`，在 docker 组里 | `runner-light`，不在 docker 组里：PR 的代码在它上面碰不到 docker |
+| 目录 | `/opt/actions-runner` | `/opt/actions-runner-light` |
+| 标签 | 项目的 CI 标签 | 单独一个标签，参考项目是 `metta-ci-light` |
+| 清理钩子 | job 开始和结束各跑一次 | 不挂。重实例的钩子只数自己用户名下的 job，轻实例有 job 在跑不挡它清理 |
+| 内存上限（`MemoryMax`） | `RUNNER_MEM_MAX`，参考项目 6G | 1536M |
+| CPU | 不限 | `CPUQuota=100%`，一个核 |
+| OOM 分值 | `RUNNER_OOM_ADJ`，默认 800 | 1000 |
+
+资源上它不算进 10.2 的 k，也没有给它单独留内存：参考项目的机器约 7.6 GiB，重实例的上限 6G 加上它的 1536M 约 7.5 GiB，已经贴着整机内存。OOM 分值 1000 让内核优先杀它的进程，被杀的小任务手动重跑。这不是保证：按 10.3 的式子，重实例里某个进程占的内存比轻实例的进程多出 (1000 − `RUNNER_OOM_ADJ`) ÷ 1000 × T 以上时，内核先杀的是重实例那个进程；默认 800、7.6 GiB 的机器上，这个差是约 1.5 GiB。它限在一个核以内，重检查把核用满时小任务会慢一些。
+
+哪些 job 能放上去：不用 docker、不占宿主端口、进程树的内存远低于 1536M、几分钟内跑完。要起数据库、要 `docker build` 的都不行，这个用户没有 docker 权限。
+
+怎么装。先装好重实例，再在有仓库管理权限的机器上执行。注册 token 走标准输入，不进命令行参数和 shell 历史：
+
+```bash
+scp scripts/add-light-runner.sh <机器>:/root/add-light-runner.sh
+gh api -X POST repos/OWNER/REPO/actions/runners/registration-token -q .token \
+  | ssh <机器> 'GH_REPO=OWNER/REPO LIGHT_LABELS=<轻实例的标签> bash /root/add-light-runner.sh <轻实例的 runner 名>'
+```
+
+- runner 名每台不同。注册不带 `--replace`，和已有的注册同名时直接失败，不会顶掉另一台。
+- 脚本建用户、下载并校验 runner 程序（版本和校验值写在脚本开头，和重实例用同一个版本）、注册、装服务并写上面那几项限制、启动，最后在 `/etc/ci-runner.env` 里登记一行 `LIGHT_SVC=<轻实例的服务名>`。ci-health 读到这一行才查轻实例，重跑 bootstrap 时这一行会原样带回。
+- 重跑安全：已经注册过就不再注册、不用给 token，只补服务配置和登记那一行。
+- 它不动重实例的服务和钩子，不重启 docker。
+
+workflow 用一个单独的仓库变量给小任务选 runner，写法和 06 章的 `CI_RUNNER` 一样，变量没设就在托管机上跑。参考项目的变量叫 `CI_CONTROL_RUNNER`：
+
+```yaml
+runs-on: ${{ fromJSON(vars.CI_CONTROL_RUNNER || '"ubuntu-latest"') }}
+```
+
+```bash
+gh variable set CI_CONTROL_RUNNER --repo OWNER/REPO --body '["self-hosted","<轻实例的标签>"]'
+```
+
+变量设上以后，轻实例就在合并路径上：几台的轻实例都不接任务时，所有 PR 都卡在预检。
+
+怎么回退：
+
+1. 小任务切回托管：`gh variable delete CI_CONTROL_RUNNER --repo OWNER/REPO`，或者在仓库的 Settings → Secrets and variables → Actions → Variables 里删。删之前记下它的值。新的 run 立刻在托管机上跑，已经在排队的按 06 章 6.3 的步骤取消后重跑。只坏了一台、别的机器上的轻实例还在接时，不用动变量。
+2. 拆掉一台上的轻实例：`systemctl disable --now <轻实例的服务>`，再删掉 `/etc/ci-runner.env` 里 `LIGHT_SVC=` 那一行，不删的话 ci-health 每小时报一次「轻任务 runner 没在接任务」。GitHub 上的注册在 Settings → Actions → Runners 里删。目录 `/opt/actions-runner-light` 和用户 `runner-light` 确定不再用了再删。
+
+要盯什么：
+
+- 在不在接任务。ci-health 每小时查轻实例的服务和它的 `Runner.Listener`，不正常报 CRIT「轻任务 runner 没在接任务」，卡片里有先做什么和上面第 1 条退路（08 章 8.2）。verify.sh 只查重实例，重启机器之后用 `systemctl is-active <轻实例的服务>` 另看一眼。
+- 小任务有没有被杀。进程树实际占的内存顶到 1536M 时，内核会杀掉 job 里的进程，这个 job 变红，要手动重跑。看轻实例 cgroup 的 `memory.events`，`oom_kill` 在涨就是被杀过；反复出现，说明这类 job 不适合放在轻实例上。采样行里的 `light_mem_peak` 含页缓存，装上几个小时就会贴着上限，不说明有问题：参考项目两台都是这样，`max` 计数一万多次，`oom_kill` 是 0。
+
+  ```bash
+  cat "/sys/fs/cgroup$(systemctl show <轻实例的服务> -p ControlGroup --value)/memory.events"
+  ```
+- 磁盘。每台多占约 3–4 GB：参考项目实测程序和工作区 1.7 GB，用户主目录下的工具缓存 1.8 GB。算进 10.4 的固定占用 F。
+
 ### 10.7 上线后看哪些数、什么时候复核
 
 上线后头两周，每天看一次下面这几项：
@@ -3339,6 +3408,7 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 | 容器撞上自己的上限 | 内核日志里 `oom_memcg=` 指向 `docker-<id>.scope` 的记录 | 没有 | 容器自己的 `--memory` 设小了。这归 workflow 管，和机器规格无关 |
 | `mem_avail` | `ci-health.log`，每小时一个快照 | k 个 job 在跑时也不低于 10.2 的余量 max(1 GiB, T × 10%) | 快照只记整点那一刻，通常比真实的最低值高，所以快照里出现低值就要查 |
 | `mem_peak` | `ci-health.log`，runner 进程树自上次启动以来的峰值 | 含页缓存，接近 `RUNNER_MEM_MAX` 不一定有问题 | 以 `memory.events` 的 `oom_kill` 为准 |
+| `light`、`light_listener`、`light_mem_peak` | `ci-health.log`，装了轻实例的机器才有这三项（10.6） | `light=active`，`light_listener` 是秒数；`light_mem_peak` 贴着轻实例的内存上限是常态 | 前两项不正常时 ci-health 会报 CRIT；小任务有没有被杀，看轻实例 `memory.events` 的 `oom_kill` |
 | `fixedwork` | `ci-health.log`，定长任务耗时 | 不超过基线的 1.4 倍 | 邻居在抢核，或者突发性能规格的 CPU 积分用完了（08 章 8.3）；k 大于 1 时也可能是自己的 job 占满了核，说明 k 定大了 |
 | `root_avail`、`containerd`、`volumes` | `ci-health.log`（08 章 8.2） | `containerd` 涨到 Max Used 加镜像后停住；`volumes` 接近 0 | 见 08 章 8.2 |
 | job 耗时 | 02 章 2.7 的 gh 查询 | 每个 job 都满足超时余量 | 先查 R 是不是变了 |
@@ -3367,11 +3437,14 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 | `scripts/verify.sh` | 装完或重启后自检，输出 PASS / FAIL 表。会试跑一次清理钩子，有 job 在跑时这一项自动跳过 |
 | `scripts/ci-cleanup.sh` | 清理钩子，由 bootstrap 装到 runner 的 `hooks/` 目录 |
 | `scripts/ci-health.sh` | 每小时健康采点，由 bootstrap 装到 `/usr/local/bin/` |
+| `scripts/add-light-runner.sh` | 在已装好的机器上再加一个只接小任务的轻实例：单独的用户、不进 docker 组、不挂清理钩子（10 章 10.6）。可以重复跑，已注册就不再注册 |
+| `scripts/deploy-cleanup-hook.sh` | 只把清理钩子换成仓库里的新版，不重跑 bootstrap：确认现行那份没被手改，试跑通过才替换（08 章 8.7） |
+| `scripts/deploy-ci-health.sh` | 只把 `ci-health.sh` 换成仓库里的新版，不重跑 bootstrap：确认现行那份没被手改，查语法、试跑、备份后替换（08 章 8.7） |
 | `scripts/ssh-guard.sh` | SSH 加固的安全网：一条 SSH 会话都不剩时才回滚配置（04 章 4.6） |
 | `scripts/tests/ci-health-notify.sh` | ci-health 推送卡片的用例：桩加本地假 webhook，不要 root、不联网 |
 | `scripts/analysis/` | 调研期的测量工具：连通性采样、排队仿真、单步资源画像、整机内存采样 |
 
-现在的脚本一台机器只装一个 runner 实例。同机多实例的前提见 10 章 10.6。
+跑完整检查的 runner 实例一台机器只装一个，同机多个的前提见 10 章 10.6；只接小任务的轻实例可以另加，也在 10.6。
 
 ## 附：脚本验证到什么程度
 
@@ -3388,6 +3461,9 @@ WARN 在两个 job 之间量（08 章 8.2），所以 WARN 线不用给单 job �
 | `ci-cleanup.sh` / `ci-health.sh` | 以 runner 用户实跑 | 通过 |
 | `ci-health.sh` 的 listener 检查、磁盘 WARN 在 job 之间量（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里用假的 `Runner.Listener`、`Runner.Worker` 进程测了 10 种情况；心跳示例在第一台用临时 systemd 单元实跑 | 通过：listener 不在、反复崩溃时报，刚启动后稳定时不报；job 结束后才量、一直忙时不判 WARN（上一次有 WARN 就沿用，不推「已恢复」）、低于 CRIT 时不等 |
 | `ci-health.sh` 推送改成飞书卡片（2026-11-11） | `scripts/tests/ci-health-notify.sh`：渲染出的脚本整段实跑，系统命令换成桩，推送打到本地假 webhook，38 组 123 项；2026-11-11 两台逐文件部署后看了第一次整点检查 | 通过：结构、颜色、标题（带级别）与副标题、分节、转义、签名、去重、24 小时提醒、部分消除、量不到的不算消除（含没配 token、定长任务没跑出结果，只剩这种时不发恢复卡）、恢复卡列出当时的先做什么、先做什么以「以下在这台上用 root 跑」开头、`verify.sh` 的路径、401 单独写、采样出错时日志带原因且不带 token、限流重发、卡片被拒（11246、9499，含 HTTP 400）或超长时改发文本、失败不写状态、日志里不带推送地址和密钥、手册链接的锚点。两台部署后的第一次整点检查：采样行照常、没有推送失败；当时两台都没有告警，真实卡片要等下一次告警或恢复时才在群里见到 |
+| `ci-health.sh` 认同机的轻实例、listener 按用户分开看（2026-11-13） | 同一套用例加到 50 组 163 项；另把 listener 改回不分用户跑了一遍，新加的用例能抓出来 | 通过：没登记轻实例时采样行和原来逐字相同；登记了且正常时多记三项、不告警；服务不是 active、listener 不在、listener 反复崩溃各报一条 CRIT，卡片有影响、先做什么和退路；重实例的 listener 不在而轻实例的在，报的是重实例那一条；恢复卡提醒把删过的变量加回来 |
+| `add-light-runner.sh`（2026-11-13） | 两台 runner 上各装了一个轻实例；末尾登记 `LIGHT_SVC=` 的那一步和「只删别的用户留下的 `/tmp/pr*.json`」在临时文件上单独测 | 两台的轻实例服务 active、用户不在 docker 组、`MemoryMax` 1536M、listener 在跑；登记那一步重跑不重复加行、别的行不动 |
+| `deploy-ci-health.sh`（2026-11-13） | 临时目录里造 `/etc/ci-runner.env` 和现行那份，系统命令换成桩，跑了 9 种情况 | 通过：正常替换并留备份、已是新版不动、现行那份被手改过不换、有 job 在跑不换、第 13 分前后不换、新版内嵌 python 有语法错不换、没登记轻实例照常换；用两台真机现行那份的服务名和目录渲染上一版，校验值和真机上的一致 |
 | `ci-cleanup.sh` 第 8 步（2026-10-26 新增） | 一次性 ubuntu:24.04 容器里 24 项用例；两台 runner 空闲时各用真实镜像和 `/tmp` 目录实跑一次 | 通过：只删同时带两种标签的镜像和匹配的 runner 目录，对照对象、编译缓存、别的用户的同名目录都在 |
 
 上表的真机都在同一家厂商（参考项目用的 Hetzner Cloud）上，别的厂商没有实测过。2026-10-25 这一轮修订里，`verify.sh`、`ci-health.sh` 已在两台上逐文件换上并实跑（见上表）；只在装机时用到的部分（等 apt 锁、检查架构、`RUNNER_UID`、token 经标准输入传给 curl）还没用 `bootstrap.sh` 从零装一台整体跑过。
